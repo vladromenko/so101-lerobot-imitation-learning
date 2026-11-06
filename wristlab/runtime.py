@@ -243,6 +243,10 @@ class Runtime:
                 self.stop(forward=False,reason='native STOP event '+str(token))
 
     def tick(self, record):
+        # A native tick follows the actual goal write, including a tick that
+        # fails the camera/geometry guard. Preserve that physical fact on error.
+        if self.robot.first_command_at is None:
+            self.robot.first_command_at = time.monotonic()
         self.check_cancel()
         self.cameras.check()
         self.robot.read_motor_health()
@@ -255,8 +259,6 @@ class Runtime:
         self.parked = False
         self.monitor_motors()
         self.cameras.record_state(stamp,self.robot.from_native(record['pos']),record['pos']['gripper'])
-        if self.robot.first_command_at is None:
-            self.robot.first_command_at = time.monotonic()
 
     def monitor_motors(self):
         warnings,critical = [],[]
@@ -306,9 +308,9 @@ class Runtime:
         self.preparing_scene = True
         try:
             if payload.get('mode')=='RECOVERY_FROM_INVALID_START':
-                if payload.get('dry') is not True:
-                    raise ValueError('recovery requires a checked proposal and fresh explicit execution approval; STOP is retained')
-                self.results = [self.preview_invalid_start()]
+                self.started = time.monotonic()
+                self.robot.first_command_at = None
+                self.results = [self.preview_invalid_start() if payload.get('dry') is True else self.execute_invalid_start(payload)]
                 return
             self.check_cancel()
             self.cameras.check()
@@ -369,10 +371,17 @@ class Runtime:
         """Read-only recovery diagnosis is permitted with the STOP latch set."""
         import pickle
         generation = self.stop_generation
+        last_feedback = 0.
         def planning_cancel():
+            nonlocal last_feedback
             if generation!=self.stop_generation or not self.robot.owns_lease():
                 raise RuntimeError('new STOP or lost hardware ownership during recovery calculation')
             self.cameras.check()
+            if time.monotonic()-last_feedback>=self.config['poll_interval_s']:
+                current = self.robot.read_state()
+                self.cameras.record_state(current['timestamp'],current['q'],current['gripper'])
+                self.monitor_motors()
+                last_feedback = time.monotonic()
         planning_cancel()
         with (self.output/'released-placement.pkl').open('rb') as handle:
             saved = pickle.load(handle)
@@ -389,21 +398,122 @@ class Runtime:
         self.motion.planner.command_sag = float(self.robot.arm.raw.sag)
         placed = next(p.placed_cube for p in reversed(saved['plan'].phases) if p.placed_cube is not None)
         self.report('checking','retreat recovery from fresh encoders; STOP retained; no motor commands')
+        self.preparing_scene = False
         begin = time.perf_counter()
         try:
             _,_,_,report = self.motion.plan_invalid_start(saved['native_scene'],state,placed,planning_cancel)
-        except ValueError as exc:
+        except (ValueError,RuntimeError) as exc:
             report = (self.motion.recovery_report or {})|{'status':'BLOCKED','reason':str(exc)}
         final = self.robot.read_state()
         if any(abs(final['positions'][j]-state['positions'][j])>self.robot.encoder_steps()[j] for j in state['positions']):
             report.update(status='BLOCKED',reason='encoders changed during read-only calculation; recalculate from actual state')
         report.update(feedback_timestamp=state['timestamp'],checked_at=time.time(),
             planning_s=time.perf_counter()-begin,stop_latched=self.stop_event.is_set(),
+            stop_generation=self.stop_generation,calibration_sha256=self.geometry.fingerprint,
+            attachment_sha256=None if self.motion.attachment is None else self.motion.attachment.fingerprint,
             success=False,physical_verified=False,actuator_commands_sent=False)
         self.recovery_proposal = report
         (self.output/'invalid-start-proposal.json').write_text(json.dumps(report,indent=2,ensure_ascii=False))
         self.report('blocked' if report['status']=='BLOCKED' else 'checked',report.get('reason',report['status']))
         return report
+
+    def execute_invalid_start(self, payload):
+        """Execute only a specifically approved, complete recovery proposal."""
+        import pickle
+        from dataclasses import replace
+        from so101_pick_place.experiments.box_extraction.planner import Phase
+        self.check_cancel()
+        self.cameras.check()
+        proposal = self.recovery_proposal or {}
+        if (payload.get('operator_at_stop') is not True or
+            payload.get('proposal_checked_at')!=proposal.get('checked_at') or
+            proposal.get('status')!='READY_FOR_ATTENDED_CONFIRMATION'):
+            raise ValueError('a complete checked Retreat/Park and explicit attended approval are required')
+        if proposal['stop_generation']!=self.stop_generation or proposal['calibration_sha256']!=self.geometry.fingerprint:
+            raise ValueError('STOP or calibration changed after the recovery calculation')
+        with (self.output/'released-placement.pkl').open('rb') as handle:
+            saved = pickle.load(handle)
+        state = self.robot.read_state()
+        self.robot.read_motor_health(force=True)
+        state['motor_health'] = self.robot.motor_health
+        if (self.scene.held is not None or abs(state['loads']['gripper']) or abs(state['currents']['gripper'])):
+            raise ValueError('recovery requires confirmed empty jaws')
+        synchronization = self.robot.synchronize_reference(state,self.robot.arm.raw.sag)
+        if (any(state['positions'][j]!=proposal['start'][j] for j in state['positions']) or
+            synchronization['hardware_goals']!=proposal['holding_hardware_goals']):
+            raise ValueError('actual encoders or powered holding goals changed; a fresh proposal is required')
+        self.geometry.grasp_mode = self.motion.grasp_mode = 'overhead_grasp'
+        self.motion.operator_observation = json.loads((self.output/'startup-trial.json').read_text())['attendance']
+        self.motion.qualification_blockers(self.geometry)
+        if self.motion.attachment.fingerprint!=proposal['attachment_sha256']:
+            raise ValueError('camera/mount geometry changed after the recovery calculation')
+        placed = next(p.placed_cube for p in reversed(saved['plan'].phases) if p.placed_cube is not None)
+        world = self.motion.recovery_world(saved['native_scene'],state['positions'])
+        self.motion.install_recovery_bounds(world,proposal['initial_gaps_with_execution_error_m'])
+        normal = self.motion.make_world(saved['native_scene'])
+        self.motion.recovery_mapping = synchronization
+        self.motion.recovery_report = proposal
+        self.motion.prepare_driver(self.cameras.check)
+        trial = json.loads((self.output/'contact-free-trial.json').read_text())
+        if not trial.get('passed') or trial['attachment_sha256']!=self.motion.attachment.fingerprint:
+            raise ValueError('matching contact-free attachment evidence is missing')
+        self.motion.contact_free_passed = True
+        self.motion.trial_attachment_sha256 = self.motion.attachment.fingerprint
+        self.scene.state.boxes = saved['boxes']
+        self.scene.metric_boxes = saved['boxes'].copy()
+        self.scene.boxes_semantically_seeded = True
+        self.scene.state.objects[saved['object'].id] = saved['object']
+        self.scene.track_memory[saved['object'].id] = saved['object']
+        self.scene.metric_objects.update(saved['native_scene'].cubes)
+        self.scene.pending_placement = saved['object'].id,saved['object'].color
+        self.preparing_scene = False
+        self.refresh()
+        phase = Phase('RECOVERY_FROM_INVALID_START',tuple(proposal['joint_path']),jaw_contact=True,placed_cube=placed)
+        plan = replace(saved['plan'],phases=(phase,))
+        self.robot.enable()
+        self.motion.execute_trajectory(phase,plan,world)
+        actual = self.robot.read_state()['positions']
+        refusal = normal.reason(actual,target=plan.target_id,placed_cube=placed)
+        frames = self.robot.backend.model.frames(actual)
+        heights = [self.robot.backend._transform_points(frames[link],self.robot.backend.meshes[link])[:,2].min()
+                   for link in ('gripper_link','moving_jaw_so101_v1_link')]
+        heights.extend(self.robot.backend._transform_points(frames[parent],vertices)[:,2].min()
+                       for name,parent,lo,hi,vertices in self.motion.attachment.parts)
+        rim = float((saved['native_scene'].box.base_from_box@np.r_[0.,0.,saved['native_scene'].box.obstacle_top_m,1.])[2])
+        if refusal or min(heights)<rim+self.robot.backend.model.gap:
+            raise RuntimeError('retreat endpoint: '+str(refusal or 'tool is not completely above the box rim'))
+        self.physical_progress.update(retreat_completed=True,retreat_actual=actual,retreat_at=time.time())
+        (self.output/'physical-progress.json').write_text(json.dumps(self.physical_progress,indent=2))
+        # Rebase from the newly measured endpoint; never jump back to a stale
+        # control reference at the boundary between retreat and Park.
+        state = self.robot.read_state()
+        self.robot.read_motor_health(force=True)
+        state['motor_health'] = self.robot.motor_health
+        self.motion.recovery_mapping = self.robot.synchronize_reference(state,self.robot.arm.raw.sag)
+        old_command = self.motion.planner._command_pose
+        self.motion.planner._command_pose = lambda q:self.robot.synchronized_command(q,self.motion.recovery_mapping)
+        try:
+            park = self.motion.plan_park(state['positions'],saved['plan'],normal,recovery=True)
+            self.motion.execute_trajectory(park,saved['plan'],normal)
+        finally:
+            self.motion.planner._command_pose = old_command
+        final = self.robot.read_state()['positions']
+        refusal = normal.reason(final,target=plan.target_id,placed_cube=placed)
+        if refusal or max(abs(final[j]-park.joints[-1][j]) for j in final if j!='gripper')>self.motion.planner.tracking_error_deg:
+            raise RuntimeError('Park endpoint: '+str(refusal or 'following error'))
+        self.parked = True
+        self.physical_progress.update(park_completed=True,park_actual=final,park_at=time.time())
+        (self.output/'physical-progress.json').write_text(json.dumps(self.physical_progress,indent=2))
+        self.motion.plan,self.motion.world = saved['plan'],normal
+        self.park_qualified_file.write_text(json.dumps({'passed':True,'path':park.joints,
+            'calibration_sha256':self.geometry.fingerprint,'attachment_sha256':self.motion.attachment.fingerprint,
+            'actual':final,'checked_at':time.time(),'attended':True},indent=2))
+        verified,pose = self.actions.verify_placement(saved['object'],saved['placement'])
+        if verified:
+            self.scene.detach_object(plan.target_id,pose)
+        self.report('completed','Retreat выполнен; PARKED; '+('зелёный кубик подтверждён камерой' if verified else 'метрическая проверка кубика пока не подтверждена'))
+        return {'success':True,'physical_verified':True,'retreat_completed':True,'parked':True,
+                'actual':final,'placement_verified':verified,'stop_reset':False}
 
     def park_arm(self, previous=None, world=None, *, dry=False, attended=False, expected_goal=None):
         """Shared Park entry: the STOP latch is checked before any planning or motion."""

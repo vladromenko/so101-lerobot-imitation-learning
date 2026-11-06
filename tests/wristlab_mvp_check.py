@@ -289,6 +289,64 @@ class GeometryPolicy(unittest.TestCase):
                 robot.arm.follow([recorded['pos'],recorded['pos']],lead=False)
         native_follow.assert_not_called()
 
+    def test_supported_stop_scope_is_removed_after_a_native_fault(self):
+        recorded=json.loads((ROOT/'runtime/retreat-park-before-restart.json').read_text())
+        robot=Robot('/home/jetsonnx/Projects/so101_autonomous_pick_place',ROOT/'runtime/unit')
+        state={'positions':recorded['pos'],'motor_health':recorded['motor_health']}
+        synchronization=robot.synchronize_reference(state,3.7)
+        synchronization['supported_stop_packet_checked']=True
+        support=Mock();follow=Mock(side_effect=RuntimeError('native stopped'))
+        robot.arm=NS(raw=NS(sag=3.7,supported_stop=support),follow=follow,move_joints=Mock())
+        robot.read_motor_health=Mock(return_value=recorded['motor_health'])
+        with self.assertRaisesRegex(RuntimeError,'native stopped'):
+            with robot.synchronized_follow(synchronization):
+                robot.arm.follow([recorded['pos'],recorded['pos']],lead=False)
+        self.assertEqual(support.call_args_list[0].args,(synchronization['offset'],))
+        self.assertEqual(support.call_args_list[-1].args,(None,))
+        self.assertIs(robot.arm.follow,follow)
+        self.assertEqual(robot.arm.raw.sag,3.7)
+
+    def test_recovery_execution_cannot_clear_or_bypass_stop(self):
+        rt=Runtime.__new__(Runtime);rt.stop_event=threading.Event();rt.stop_event.set()
+        rt.cameras=NS(check=Mock());rt.robot=NS(arm=None,enable=Mock())
+        with self.assertRaisesRegex(RuntimeError,'STOP'):
+            rt.execute_invalid_start({'operator_at_stop':True})
+        rt.cameras.check.assert_not_called();rt.robot.enable.assert_not_called()
+        self.assertTrue(rt.stop_event.is_set())
+
+    def test_recovery_execution_requires_approval_for_the_checked_proposal(self):
+        rt=Runtime.__new__(Runtime);rt.stop_event=threading.Event()
+        rt.cameras=NS(check=Mock());rt.robot=NS(arm=None,enable=Mock(),read_state=Mock())
+        rt.recovery_proposal={'status':'READY_FOR_ATTENDED_CONFIRMATION','checked_at':1.}
+        with self.assertRaisesRegex(ValueError,'explicit attended approval'):
+            rt.execute_invalid_start({'operator_at_stop':True,'proposal_checked_at':2.})
+        rt.robot.read_state.assert_not_called();rt.robot.enable.assert_not_called()
+
+    def test_measured_clearance_monitor_rejects_a_confirmed_decrease(self):
+        motion=Motion.__new__(Motion)
+        motion.robot=NS(health_interval_s=0.,encoder_steps=lambda:{'q':.1},backend=NS(model=NS(gap=.008)))
+        motion.recovery_feedback_at=0.;motion.recovery_observed_lower=None
+        motion.recovery_report={'initial_gaps_with_execution_error_m':{'native: pair':.003}}
+        motion.recovery_gaps=lambda world,q:{'native: pair':.004+q['q']*.001}
+        world=NS(scene=NS(box=NS(clearance_m=.006)),recovery_numeric_resolution=1e-7)
+        motion.check_recovery_feedback({'q':0.},world)
+        motion.check_recovery_feedback({'q':0.},world)
+        motion.recovery_gaps=lambda world,q:{'native: pair':.003+q['q']*.001}
+        with self.assertRaisesRegex(RuntimeError,'measured clearance decreases'):
+            motion.check_recovery_feedback({'q':0.},world)
+
+    def test_future_release_is_rejected_if_factory_stop_reaches_a_wall(self):
+        recorded=json.loads((ROOT/'runtime/retreat-park-before-restart.json').read_text())
+        robot=Robot('/home/jetsonnx/Projects/so101_autonomous_pick_place',ROOT/'runtime/unit')
+        motion=Motion(robot,lambda:None,lambda *args:None,ROOT/'runtime/qualification.json')
+        motion.planner.command_sag=3.7;q=recorded['pos']
+        phase=Phase('release',(q,),jaw_contact=True)
+        plan=NS(target_id='released',payload_local=None,phases=(phase,))
+        world=NS(reason=lambda pose,**policy:'camera: wall' if pose['shoulder_lift']>q['shoulder_lift']+.5 else None)
+        with self.assertRaisesRegex(ValueError,'native STOP settling: camera: wall'):
+            motion.check_path(plan,world)
+        self.assertIsNone(robot.arm)
+
     def test_recorded_stop_settling_is_rejected_before_path_search_or_motion(self):
         import pickle
         from wristlab.geometry import AttachmentGeometry

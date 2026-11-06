@@ -41,15 +41,18 @@ class RecoveryCollisionWorld(ExtractionCollisionWorld):
         points = self.backend._transform_points(frame,vertices)
         inverse = np.linalg.inv(self.scene.box.base_from_box)
         local = points@inverse[:3,:3].T+inverse[:3,3]
+        bounds_lo,bounds_hi = local.min(0),local.max(0)
         for lower,upper,label in self.scene.box.solid_parts():
-            if mesh_box_overlap(parts,frame,self.scene.box.base_from_box,lower,upper):
+            if np.all(bounds_hi>=lower) and np.all(bounds_lo<=upper):
                 minimum = self.minimums.get((name,label))
-                if minimum is None:
-                    return label
-                lo,hi = self.physical[label]
-                gap = float(np.max(np.maximum(lo-local.max(0),local.min(0)-hi)))
-                if gap<minimum:
-                    return 'recovery decreases '+label
+                gap = None
+                if minimum is not None:
+                    lo,hi = self.physical[label]
+                    gap = float(np.max(np.maximum(lo-bounds_hi,bounds_lo-hi)))
+                # A separating full-mesh bound proves every triangle clear.
+                # Otherwise retain the exact native triangle/box intersection.
+                if (minimum is None or gap<minimum) and mesh_box_overlap(parts,frame,self.scene.box.base_from_box,lower,upper):
+                    return label if minimum is None else 'recovery decreases '+label
         return None
 
 
@@ -276,8 +279,16 @@ class Motion:
         world.recovery_walls = walls
         world.recovery_link_walls = link_walls
         world.physical_walls = physical
-        scale = max(float(np.abs(frame[:3,3]).max()) for frame in frames.values())
-        world.recovery_numeric_resolution = float(abs(np.spacing(np.float32(scale))))
+        # Native BVH coordinates are float32 even though FK frames are double.
+        # Bound two homogeneous dot products and their subtraction (gamma_n),
+        # rather than comparing their results with an exact equality.
+        scale = max(float(np.max(np.abs(frame[:3,:3])@np.abs(self.robot.backend.meshes[name]).T+
+                                  np.abs(frame[:3,3,None])))
+                    for name,frame in frames.items() if name in self.robot.backend.meshes)
+        operations = 2*(2*next(iter(frames.values())).shape[0]-1)+1
+        unit = np.finfo(np.float32).eps/2
+        world.recovery_numeric_resolution = float(operations*unit/(1-operations*unit)*scale)
+        world.empty_recovery = True
         return world
 
     def recovery_gaps(self, world, joints):
@@ -295,6 +306,17 @@ class Motion:
             points = self.robot.backend._transform_points(frames[part[1]],part[4])@inverse[:3,:3].T+inverse[:3,3]
             result[name+': '+label] = float(np.max(np.maximum(bound['lower']-points.max(0),points.min(0)-bound['upper'])))
         return result
+
+    def install_recovery_bounds(self, world, lower):
+        comparison = {key:max(0.,value-world.recovery_numeric_resolution) for key,value in lower.items()}
+        for key in world.recovery_native_minimums:
+            world.recovery_native_minimums[key] = comparison['native: '+key]
+        for key in world.recovery_link_walls:
+            world.recovery_link_walls[key] = comparison[key[0]+': '+key[1]]
+        for key,bound in world.recovery_walls.items():
+            bound['minimum'] = comparison[key[0]+': '+key[1]]
+        world.native_checks.backend.model.minimums = world.recovery_native_minimums
+        world.cache.clear()
 
     def recovery_envelope(self, start, joints, holding_goals, settled=False):
         import itertools,inspect,re
@@ -323,6 +345,11 @@ class Motion:
             for sample in self.recovery_envelope(start,point,holding):
                 planning_cancel()
                 refusal = world.reason(sample,**policy)
+                if refusal is None:
+                    stop_command = self.robot.synchronized_command(sample,self.recovery_mapping)
+                    refusal = world.reason(stop_command,**policy)
+                    if refusal:
+                        refusal = 'load-supported STOP target: '+refusal
                 if refusal:
                     self.recovery_report.update(rejected_waypoint=index,rejected_nominal_pose=point,
                         rejected_response_pose=sample,rejected_response_gaps_m=self.recovery_gaps(world,sample))
@@ -335,6 +362,21 @@ class Motion:
             minima = {key:min(minima[key],bounds[key]) for key in bounds}
             previous = capped
         return minima
+
+    def recovery_candidate_is_valid(self, world, start, joints, holding, policy):
+        # Reject the established failure cheaply before native mesh search:
+        # a stopped compensated target may not cross the fixed finger plane.
+        placed = policy['placed_cube']
+        for sample in self.recovery_envelope(start,joints,holding):
+            command = self.robot.synchronized_command(sample,self.recovery_mapping)
+            for q in (sample,command):
+                if self.planner._fixed_jaw_clearance(q,placed)<0.:
+                    frame = self.robot.backend.model.frames(q)['gripper_link']
+                    points = self.robot.backend._transform_points(frame,self.robot.backend.meshes['gripper_link'])
+                    if np.all(points.max(0)>=placed.vertices_m.min(0)) and np.all(points.min(0)<=placed.vertices_m.max(0)):
+                        return False
+        return world.reason(joints,**policy) is None and world.reason(
+            self.robot.synchronized_command(joints,self.recovery_mapping),**policy) is None
 
     def plan_invalid_start(self, native_scene, state, placed, planning_cancel):
         """Calculate a finite native recovery; no actuation and no STOP reset."""
@@ -370,7 +412,13 @@ class Motion:
         self.recovery_report.update(native_stop_raw_goals=stop_goals,
             measured_hold_deflection=settling,stop_settling_scenario=stop_pose,stop_settling_gaps_m=stop_gaps)
         contact = next((key for key,value in stop_gaps.items() if value<=0.),None)
-        if contact:
+        supported = self.recovery_mapping.get('supported_stop_packet_checked') is True
+        if supported:
+            self.recovery_report.update(stop_policy='load_supported_hold',
+                default_freeze_rejected=contact is not None,
+                supported_stop_goals=self.recovery_mapping['supported_stop_goals'],
+                physical_supported_stop_tested=False)
+        if contact and not supported:
             self.recovery_report.update(status='BLOCKED',code='STOP_SETTLING_CLEARANCE',pair=contact,
                 reason='native STOP rewrites goals to encoders; observed hold deflection reaches '+contact)
             raise ValueError('RECOVERY_FROM_INVALID_START: '+self.recovery_report['reason'])
@@ -381,15 +429,10 @@ class Motion:
             lower = {key:min(lower[key],values[key]) for key in lower}
         if any(value<=0. for value in lower.values()):
             raise ValueError('initial execution uncertainty reaches physical contact: '+str(lower))
-        for key in world.recovery_native_minimums:
-            world.recovery_native_minimums[key] = lower['native: '+key]
-        for key in world.recovery_link_walls:
-            world.recovery_link_walls[key] = lower[key[0]+': '+key[1]]
-        for key,bound in world.recovery_walls.items():
-            bound['minimum'] = lower[key[0]+': '+key[1]]
-        world.native_checks.backend.model.minimums = world.recovery_native_minimums
-        world.cache.clear()
+        # Keep the physical bounds; account for native float32 arithmetic only.
+        self.install_recovery_bounds(world,lower)
         self.recovery_report['initial_gaps_with_execution_error_m'] = lower
+        self.recovery_report['floating_point_resolution_m'] = world.recovery_numeric_resolution
         for sample in initial_states:
             planning_cancel()
             refusal = world.reason(sample,**policy)
@@ -402,30 +445,70 @@ class Motion:
                 raise ValueError('RECOVERY_FROM_INVALID_START: initial native command response: '+refusal)
         source = inspect.getsource(ExistingArmDriver._move)
         arrival = float(re.search(r'follow\(poses,.*?within=([\d.]+)',source,re.S).group(1))
-        # Reuse native vertical IK, with the lift computed from the measured
-        # rim and the lowest finger mesh vertex. There is no recovery planner.
-        frames = self.robot.backend.model.frames(start)
-        frame = frames['gripper_frame_link']
-        vertices = np.concatenate([part.triangles.reshape(-1,3)
-                                   for part in world.collision_meshes['gripper_link']])
-        points = self.robot.backend._transform_points(frames['gripper_link'],vertices)
-        lowest = points[np.argmin(points[:,2])]
-        center_local = (lowest-frame[:3,3])@frame[:3,:3]
-        rim = float((native_scene.box.base_from_box@np.r_[0.,0.,native_scene.box.obstacle_top_m,1.])[2])
-        rise = max(0.,rim+self.robot.backend.model.gap-lowest[2])
+        previous_cancel = self.planner.check_cancel
+        previous_check = self.check_cancel
+        previous_command = self.planner._command_pose
+        self.planner.check_cancel = planning_cancel
+        self.check_cancel = planning_cancel
+        failures = []
+        selected = None
         try:
-            points = tuple(self.planner.vertical_center(start,rise,center_local,world,**policy))
-            minima = self.validate_recovery_envelope(world,start,points,holding,policy,planning_cancel)
-            for sample in self.recovery_envelope(start,points[-1],holding,settled=True):
-                planning_cancel()
-                refusal = normal.reason(sample,**policy)
-                if refusal:
-                    raise ValueError('ordinary endpoint envelope: '+refusal)
+            for label,goal,indices,limits in self.recovery_goals(start,world,normal,policy):
+                if selected is None:
+                    self.report('checking','recovery '+label)
+                    try:
+                        from so101_pick_place.experiments.box_extraction.search import rrt_connect
+                        names = tuple(start)
+                        def expand(values):
+                            q = dict(start)
+                            q.update({names[index]:float(value) for index,value in zip(indices,values)})
+                            return q
+                        route = rrt_connect([start[names[i]] for i in indices],
+                            [goal[names[i]] for i in indices],limits,
+                            lambda values:self.recovery_candidate_is_valid(world,start,expand(values),holding,policy),
+                            check_cancel=planning_cancel)
+                        points = tuple(expand(values) for values in route.points)
+                        minima = self.validate_recovery_envelope(world,start,points,holding,policy,planning_cancel)
+                        for sample in self.recovery_envelope(start,points[-1],holding,settled=True):
+                            refusal = normal.reason(sample,**policy)
+                            if refusal:
+                                raise ValueError('ordinary endpoint envelope: '+refusal)
+                        for q in points:
+                            reference = self.robot.control_reference(q,self.recovery_mapping)
+                            command = self.robot.synchronized_command(q,self.recovery_mapping)
+                            if self.robot.quantized_command(reference)==self.robot.quantized_command(command):
+                                raise ValueError('normal packet is not distinguishable from an uncompensated stop')
+                            refusal = world.reason(command,**policy)
+                            if refusal:
+                                raise ValueError('native compensated command: '+refusal)
+                        selected = points,minima
+                        self.recovery_report.update(route_family=label,rrt_iterations=route.trace['iterations'])
+                    except ValueError as exc:
+                        failures.append(label+': '+str(exc))
+                        self.recovery_report['candidate_failures'] = list(failures)
+                        self.report('rejected',failures[-1])
+                if selected is not None:
+                    break
+            if selected is None:
+                raise ValueError('; '.join(failures) or 'no goal outside the measured box is reachable')
+            points,minima = selected
+            self.planner._command_pose = lambda q:self.robot.synchronized_command(q,self.recovery_mapping)
+            previous = ExtractionPlan(native_scene.revision,target,(Phase('retract',points,placed_cube=placed),),
+                                      np.empty((0,3)),placed.center_m,())
+            self.report('checking','recovery Park from the calculated retreat endpoint')
+            park = self.plan_park(points[-1],previous,normal,recovery=True)
+            park_minima = self.validate_recovery_envelope(world,start,park.joints,holding,policy,planning_cancel)
+            minima = {key:min(minima[key],park_minima[key]) for key in minima}
         except ValueError as exc:
             self.recovery_report.update(status='BLOCKED',reason=str(exc))
             raise ValueError('RECOVERY_FROM_INVALID_START: '+str(exc)) from exc
+        finally:
+            self.planner.check_cancel = previous_cancel
+            self.check_cancel = previous_check
+            self.planner._command_pose = previous_command
         phase = Phase('RECOVERY_FROM_INVALID_START',points,jaw_contact=True,placed_cube=placed)
         report = self.recovery_report|{'goal':points[-1],'minimum_gaps_with_execution_error_m':minima,
+            'joint_path':points,'park_path':park.joints,'park_goal':park.joints[-1],
             'ordinary_native_gap_m':self.robot.backend.model.gap,
             'ordinary_wall_gap_m':native_scene.box.clearance_m,'encoder_steps':self.robot.encoder_steps(),
             'tracking_error_deg':self.planner.tracking_error_deg,'native_arrival_tolerance_deg':arrival,
@@ -433,6 +516,56 @@ class Motion:
             'actuator_commands_sent':False,'stop_reset':False,'endpoint_requires_fresh_encoder_confirmation':True}
         self.recovery_report = report
         return phase,world,normal,report
+
+    def recovery_goals(self, start, world, normal, policy):
+        """Derive lift goals from FK; use the existing native joint-space search."""
+        model = self.robot.backend.model
+        names = tuple(start)
+        steps = self.robot.encoder_steps()
+        rim = float((world.scene.box.base_from_box@np.r_[0.,0.,world.scene.box.obstacle_top_m,1.])[2])
+        def lowest(q):
+            frames = model.frames(q)
+            heights = [self.robot.backend._transform_points(frames[link],self.robot.backend.meshes[link])[:,2].min()
+                       for link in ('gripper_link','moving_jaw_so101_v1_link')]
+            heights.extend(self.robot.backend._transform_points(frames[parent],vertices)[:,2].min()
+                           for name,parent,lo,hi,vertices in world.attachment.parts)
+            return float(min(heights))
+        initial_height = lowest(start)
+        gradient = {}
+        for index in (1,2,3):
+            name = names[index]
+            gradient[index] = (lowest(dict(start,**{name:start[name]+steps[name]}))-initial_height)/steps[name]
+        cube = policy['placed_cube']
+        pan = names[0]
+        probe = dict(start,**{pan:start[pan]+steps[pan]})
+        outward = np.sign(self.planner._fixed_jaw_clearance(probe,cube)-self.planner._fixed_jaw_clearance(start,cube))
+        pan_range = (start[pan],model.ranges[0][1]-model.margin) if outward>=0 else (model.ranges[0][0]+model.margin,start[pan])
+        for label,axes in (('coordinated shoulder/elbow',(1,2)),('shoulder lift',(1,)),('elbow lift',(2,)),('wrist-assisted lift',(1,2,3))):
+            direction = {index:gradient[index] for index in axes}
+            peak = max(abs(value) for value in direction.values())
+            if peak>np.finfo(float).eps:
+                direction = {index:value/peak for index,value in direction.items()}
+                spans = [(model.ranges[index][1]-model.margin-start[names[index]])/value if value>0 else
+                         (model.ranges[index][0]+model.margin-start[names[index]])/value
+                         for index,value in direction.items() if value!=0.]
+                limit = min(spans)
+                far = dict(start,**{names[index]:start[names[index]]+value*limit for index,value in direction.items()})
+                goal = None
+                for q in self.robot.native_edge_samples(start,far):
+                    self.planner.check_cancel()
+                    if lowest(q)>=rim+model.gap and normal.reason(q,**policy) is None:
+                        reserve = self.planner.tracking_error_deg+max(steps[names[index]] for index in axes)
+                        candidate = dict(q,**{names[index]:q[names[index]]+value*reserve for index,value in direction.items()})
+                        if normal.reason(candidate,**policy) is None:
+                            goal = candidate
+                        break
+                if goal is not None:
+                    indices = (0,*axes)
+                    bounds = [pan_range]+[(min(start[names[index]],goal[names[index]]),max(start[names[index]],goal[names[index]])) for index in axes]
+                    if 3 in axes:
+                        bounds = [pan_range]+[(model.ranges[index][0]+model.margin,model.ranges[index][1]-model.margin) for index in axes]
+                    if all(lo<hi for lo,hi in bounds):
+                        yield label,goal,indices,np.asarray(bounds)
 
     def state_is_valid(self, q, phase, plan, world):
         return world.reason(q,target=plan.target_id,jaw_contact=phase.jaw_contact,
@@ -444,7 +577,7 @@ class Motion:
             raise ValueError('native gravity-compensation setting has not been read')
         for q in self.robot.native_edge_samples(start,goal):
             self.check_cancel()
-            command = self.robot.synchronized_command(q,self.recovery_mapping) if phase.name=='RECOVERY_FROM_INVALID_START' else self.planner._command_pose(q)
+            command = self.robot.synchronized_command(q,self.recovery_mapping) if phase.name.startswith('RECOVERY_') else self.planner._command_pose(q)
             for kind,pose in (('pose',q),('native command',command)):
                 reason = self.state_is_valid(pose,phase,plan,world)
                 intended = reason in {'gripper_link: cube '+plan.target_id,'moving_jaw_so101_v1_link: cube '+plan.target_id}
@@ -472,7 +605,22 @@ class Motion:
                     reason = self.edge_is_valid(start,goal,phase,plan,world)
                     if reason:
                         raise ValueError(f'{phase.name}: {reason}')
-                if phase.name in ('retract','safe_park'):
+                if not phase.name.startswith('RECOVERY_'):
+                    for q in phase.joints:
+                        self.check_cancel()
+                        command = self.robot.quantized_command(self.planner._command_pose(q))
+                        frozen = self.robot.quantized_command(q)
+                        # The factory STOP removes the position bias supporting
+                        # gravity. Check that transition before committing to
+                        # a grasp/release, rather than discovering it in a box.
+                        settled = {j:frozen[j]+q[j]-command[j] for j in q}
+                        reason = self.state_is_valid(settled,phase,plan,world)
+                        intended = reason in {'gripper_link: cube '+plan.target_id,'moving_jaw_so101_v1_link: cube '+plan.target_id}
+                        if intended and phase.name=='grasp' and phase.jaw_contact:
+                            reason = world.grasp_contact_reason(settled,plan.target_id)
+                        if reason:
+                            raise ValueError(phase.name+': native STOP settling: '+reason)
+                if phase.name in ('retract','safe_park','RECOVERY_PARK'):
                     for lag in self.planner._lagging_poses(phase.joints):
                         self.check_cancel()
                         for pose in (lag,self.planner._command_pose(lag)):
@@ -500,7 +648,7 @@ class Motion:
     def plan_direct_transfer(self, start, goal, world, **policy):
         return self.planner.transport(start,goal,world,**policy)
 
-    def plan_park(self, start, previous, world):
+    def plan_park(self, start, previous, world, recovery=False):
         """Select a low-load recorded working pose; verify its current transition."""
         placed = next((p.placed_cube for p in reversed(previous.phases) if p.placed_cube is not None),None)
         policy = {'target':previous.target_id,'placed_cube':placed}
@@ -530,7 +678,7 @@ class Motion:
             else:
                 try:
                     path,_ = self.planner.transport(start,goal,world,**policy)
-                    phase = Phase('safe_park',path,placed_cube=placed)
+                    phase = Phase('RECOVERY_PARK' if recovery else 'safe_park',path,placed_cube=placed)
                     self.check_path(replace(previous,phases=(phase,)),world)
                     return phase
                 except ValueError as exc:
@@ -619,13 +767,17 @@ class Motion:
         begin = time.perf_counter()
         try:
             world.release_origin = self.robot.arm.read()[0] if phase.name=='retract' and phase.placed_cube is not None else None
-            if phase.name=='RECOVERY_FROM_INVALID_START':
+            if phase.name.startswith('RECOVERY_'):
+                if self.recovery_mapping.get('supported_stop_packet_checked') is not True:
+                    raise RuntimeError('recovery requires a checked load-supported STOP packet')
                 import copy
                 original = self.driver.backend
                 backend = copy.copy(original)
                 backend.driver_command_goal = lambda q,sag:self.robot.synchronized_command(q,self.recovery_mapping)
                 self.driver.backend = backend
                 self.executing_recovery = True
+                self.recovery_feedback_at = 0.
+                self.recovery_observed_lower = None
                 try:
                     with self.robot.synchronized_follow(self.recovery_mapping):
                         self.driver.move_phase(phase,plan,world,self.check_cancel)
@@ -683,6 +835,27 @@ class Motion:
                 raise RuntimeError('release separation command: '+reason) from exc
             self.driver.previous['command'] = command
         self.release_phase,self.release_previous = phase,dict(record['goal'])
+        if self.executing_recovery and hasattr(self.driver.world,'recovery_native_minimums'):
+            self.check_recovery_feedback(record['pos'],self.driver.world)
+
+    def check_recovery_feedback(self, joints, world):
+        """Stop if measured, encoder-bounded deficient clearances worsen."""
+        import itertools
+        if time.monotonic()-self.recovery_feedback_at<self.robot.health_interval_s:
+            return
+        steps = self.robot.encoder_steps()
+        names = tuple(joints)
+        limits = [(joints[j]-steps[j]/2,joints[j]+steps[j]/2) for j in names]
+        samples = [self.recovery_gaps(world,dict(zip(names,values))) for values in itertools.product(*limits)]
+        low = {key:min(s[key] for s in samples) for key in samples[0]}
+        high = {key:max(s[key] for s in samples) for key in samples[0]}
+        previous = self.recovery_observed_lower or self.recovery_report['initial_gaps_with_execution_error_m']
+        for key,value in previous.items():
+            if high[key]<value-world.recovery_numeric_resolution:
+                raise RuntimeError('recovery measured clearance decreases: '+key)
+        self.recovery_observed_lower = {key:max(previous[key],min(value,
+            self.robot.backend.model.gap if key.startswith('native: ') else world.scene.box.clearance_m)) for key,value in low.items()}
+        self.recovery_feedback_at = time.monotonic()
 
     def separating_release(self,goal,previous,phase):
         if phase is None or phase.name!='retract' or phase.placed_cube is None or phase.carrying:
@@ -965,6 +1138,12 @@ class AccessoryWorld(ExtractionCollisionWorld):
         native = self.native_checks.reason(joints,**policy)
         target = policy.get('target')
         placed = policy.get('placed_cube')
+        if native is None and getattr(self,'empty_recovery',False) and placed is not None:
+            from so101_pick_place.experiments.box_extraction.mesh_collision import mesh_cube_overlap
+            frames = self.robot.backend.model.frames(joints)
+            for link in ('gripper_link','moving_jaw_so101_v1_link'):
+                if mesh_cube_overlap(self.collision_meshes[link],frames[link],placed,0.):
+                    return link+': new contact with released cube '+str(target)
         if native=='gripper_link: cube '+str(target) and placed is not None and self.release_origin is not None and policy.get('jaw_contact') and policy.get('payload_local') is None:
             from box_extract.driver import BoxArmDriver
             origin = self.release_origin
