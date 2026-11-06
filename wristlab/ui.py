@@ -26,6 +26,23 @@ def run(payload: dict):
         raise HTTPException(409,str(exc)) from exc
 
 
+@app.post('/api/task-plan')
+def task_plan(payload: dict):
+    try:
+        return runtime.preview(payload)
+    except (ValueError,KeyError) as exc:
+        raise HTTPException(409,str(exc)) from exc
+
+
+@app.get('/api/diagnostics')
+def diagnostics():
+    import json
+    path = root/'runtime/escape-proposal.json'
+    return {'current':None if runtime.robot.last_state is None else runtime.robot.audit_state(runtime.robot.last_state),
+            'escape_proposal':None if not path.exists() else json.loads(path.read_text()),
+            'robot_motion_commanded':runtime.robot.first_command_at is not None}
+
+
 @app.post('/api/stop')
 def stop():
     return runtime.stop()
@@ -44,7 +61,7 @@ def pause(payload: dict):
 def reset():
     try:
         runtime.reset()
-        return {'reset':True,'motion_started':False}
+        return {'reset_queued':True,'motion_started':False}
     except ValueError as exc:
         raise HTTPException(409,str(exc)) from exc
 
@@ -87,6 +104,7 @@ def snapshot(name: str):
         ok,data = cv2.imencode('.jpg',frame.image,[cv2.IMWRITE_JPEG_QUALITY,90])
         if not ok:
             raise RuntimeError('JPEG encoding failed')
+        runtime.frame_history.append({name:frame})
         return Response(data.tobytes(),media_type='image/jpeg',headers={
             'Cache-Control':'no-store','X-Frame-Id':frame.frame_id,'X-Captured-At':str(frame.timestamp),
             'X-Capture-Interval':','.join(map(str,frame.capture_interval))})

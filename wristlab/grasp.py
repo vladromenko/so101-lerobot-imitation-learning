@@ -1,6 +1,4 @@
 """One grasp candidate source for every task: existing measured jaw geometry."""
-import json
-from pathlib import Path
 import numpy as np
 from so101_pick_place.vision.wrist_servo import WristVisualServo, ServoCalibration, ServoLimits, WristObservation
 from so101_pick_place.experiments.box_extraction.planner import Phase
@@ -39,42 +37,57 @@ def choose_grasp(obj, scene, robot, planner, current, check_cancel, world):
     raise ValueError('no full-arm grasp/approach/lift/placement path: '+('; '.join(failures[-3:]) or 'no admissible opposing-face grasp'))
 
 
-def visual_alignment(object_state, cameras, robot, motion, plan, world, calibration_path):
-    record = json.loads(Path(calibration_path).read_text())
-    reference_q = np.asarray(record['reference_q_rad'])
-    current = robot.read_state()
-    if np.max(np.abs(current['q']-reference_q)) > float(record['validated_joint_radius_rad']):
-        raise ValueError('wrist image Jacobian does not cover this measured pose')
-    if record.get('current_mount_independently_validated') is not True:
-        raise ValueError('wrist servo was not qualified for this attachment')
-    servo = WristVisualServo(ServoCalibration.from_record(record),ServoLimits())
-    anchor = np.asarray(record['target_px'])
-    from .vision import detect_cubes
-    last_frame_id = None
-    for iteration in range(servo.limits.max_iterations+1):
-        motion.check_cancel()
-        frame = cameras.get_latest_frame('wrist')
-        if frame.frame_id == last_frame_id:
-            raise ValueError('wrist servo received a repeated frame')
-        last_frame_id = frame.frame_id
-        if frame.joints is None or frame.capture_interval[1]-frame.capture_interval[0] > .1:
-            raise ValueError('wrist frame is not paired with measured joints')
-        detections = [d for d in detect_cubes(frame) if d['color']==object_state.color]
-        detection = min(detections,key=lambda d:np.linalg.norm(np.asarray(d['center_px'])-anchor)) if detections else None
-        observation = WristObservation(int(frame.frame_id.rsplit('-',1)[-1]),time_age(frame),None if detection is None else tuple(detection['center_px']),0. if detection is None else detection['confidence'])
-        decision = servo.decide(observation,iteration)
-        if decision.state == 'ALIGNED':
-            return {'center_px':list(detection['center_px']),'frame_id':frame.frame_id}
-        if decision.state != 'CORRECT':
-            raise ValueError(decision.reason)
-        q = robot.arm.read()[0]
-        goal = motion.planner.translated(q,[*decision.correction_xy_m,0.])
-        path = motion.planner.edge(q,goal,world,target=object_state.id,jaw_contact=True)
-        phase = Phase('visual_align',path,jaw_contact=True)
-        motion.execute_trajectory(phase,plan,world)
-    raise ValueError('bounded wrist alignment exhausted')
-
-
-def time_age(frame):
+def visual_alignment(object_state, cameras, robot, motion, plan, world, geometry):
+    """Align at pregrasp, before fingers descend. No full-scene micro replans."""
     import time
-    return time.time()-frame.capture_interval[0]
+    import cv2
+    from .vision import detect_cubes
+    from so101_pick_place.vision.wrist_camera_geometry import camera_projection
+    if geometry.wrist is None:
+        raise ValueError('qualified wrist hand-eye calibration is required')
+    reference = next(p for p in plan.phases if p.name=='enter').joints[0]
+    top = object_state.pose[:3,3]+[0.,0.,object_state.dimensions[2]/2]
+    def project(q):
+        record = camera_projection(geometry.wrist,robot.backend.model,q)
+        camera = np.asarray(record['camera_from_robot'])
+        rotation,_ = cv2.Rodrigues(camera[:3,:3])
+        uv,_ = cv2.projectPoints(top[None],rotation,camera[:3,3],np.asarray(record['camera_matrix']),np.asarray(record['distortion']))
+        return uv.ravel()
+    desired = project(reference)
+    last_frame_id = None
+    after_motion = time.time()
+    for iteration in range(13):
+        motion.check_cancel()
+        before = robot.read_state();cameras.record_state(before['timestamp'],before['q'],before['gripper'])
+        cameras.wait_for_frame('wrist',after_motion,motion.check_cancel)
+        after = robot.read_state();cameras.record_state(after['timestamp'],after['q'],after['gripper'])
+        frame = cameras.get_latest_frame('wrist')
+        if frame.frame_id==last_frame_id or frame.joints is None or frame.motion_during_exposure_rad is None or frame.motion_during_exposure_rad>.002:
+            raise ValueError('wrist frame is repeated or not paired with stationary feedback')
+        last_frame_id = frame.frame_id
+        detections = [d for d in detect_cubes(frame) if d['color']==object_state.color]
+        matches = sorted(detections,key=lambda d:np.linalg.norm(np.asarray(d['center_px'])-desired))
+        if not matches or (len(matches)>1 and np.linalg.norm(np.asarray(matches[1]['center_px'])-desired)<20.):
+            raise ValueError('wrist target is missing or ambiguous')
+        measured = matches[0]
+        current = after['positions']
+        base = project(current)
+        jacobian = np.column_stack([(project(motion.planner.translated(current,delta))-base)/.001 for delta in ([.001,0.,0.],[0.,.001,0.])])
+        singular = np.linalg.svd(jacobian,compute_uv=False)
+        if singular[-1]<100. or singular[0]/singular[-1]>25.:
+            raise ValueError('wrist image Jacobian is ill-conditioned')
+        limits = ServoLimits(max_frame_age_s=max(.15,cameras.exposure_s.get('wrist',0.)+.2))
+        servo = WristVisualServo(ServoCalibration(tuple(desired),jacobian),limits)
+        observation = WristObservation(iteration,time.time()-frame.capture_interval[0],tuple(measured['center_px']),measured['confidence'])
+        decision = servo.decide(observation,iteration)
+        if decision.state=='ALIGNED':
+            ray = geometry.pixel_ray_in_base(measured['center_px'],frame,robot)
+            observed_top = geometry.intersect_ray_with_plane(ray,([0.,0.,1.],-top[2]))
+            return {'center_px':measured['center_px'],'frame_id':frame.frame_id,'observed_top_m':observed_top.tolist()}
+        if decision.state!='CORRECT':
+            raise ValueError(decision.reason)
+        goal = motion.planner.translated(current,[*decision.correction_xy_m,0.])
+        path = motion.planner.edge(current,goal,world,target=object_state.id)
+        motion.execute_trajectory(Phase('visual_align',path),plan,world)
+        after_motion = time.time()
+    raise ValueError('bounded wrist alignment exhausted')

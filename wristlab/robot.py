@@ -62,6 +62,8 @@ class Robot:
 
     def read_state(self):
         if self.arm is not None:
+            if not self.owns_lease():
+                raise RuntimeError('hardware lease was lost; no further bus reads')
             q, loads, currents = self.arm.read()
             state = {'positions': q, 'loads': loads, 'currents': currents}
         else:
@@ -74,14 +76,19 @@ class Robot:
         state['q'] = self.from_native(state['positions'])
         state['gripper'] = float(state['positions']['gripper'])
         self.last_state = state
+        if self.owns_lease():
+            record = json.loads(self.lease.read_text())
+            record.update(robot_joint_deg=state['positions'],feedback_time_unix_s=state['timestamp'],state='MONITORING' if not self.arm.torque else 'HOLDING')
+            temporary = self.lease.with_name('.wristlab-feedback-'+str(os.getpid())+'.tmp')
+            temporary.write_text(json.dumps(record))
+            temporary.replace(self.lease)
         return state
 
     def audit_state(self, state):
-        pose = self.backend.model.pose(state['positions'])
-        problems = self.backend.model.problems(pose)
-        collision = self.backend.model.collides(pose)
-        return {'valid': not problems and collision is None, 'problems': list(problems), 'collision': collision,
-                'tip_m': list(pose.tip), 'timestamp': state['timestamp']}
+        from .diagnostics import audit_pose
+        data = audit_pose(self,state)
+        return data | {'valid':data['planning_valid'],'problems':data['planning_margin_problems'],
+                       'collision':data['planning_clearance_collision']}
 
     def forward_kinematics(self, q):
         return self.link_pose(q, 'gripper_frame_link')

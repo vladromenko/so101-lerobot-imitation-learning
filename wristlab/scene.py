@@ -16,34 +16,110 @@ class Scene:
         self.next_id = 1
         self.reserved, self.reserved_slots = set(), set()
         self.held = None
+        self.pending_placement = None
         self.raw = {}
         self.frames = {}
+        self.track_memory = {}
+        self.reset_targets = {}
+        self.metric_objects = {}
+        self.metric_boxes = {}
+        self.measured_surfaces = []
+
+    def track_box_edges(self, frame):
+        previous = self.frames.get('overview')
+        if previous is None or not self.state.boxes:
+            return None
+        gray0 = cv2.cvtColor(previous.image,cv2.COLOR_BGR2GRAY)
+        gray1 = cv2.cvtColor(frame.image,cv2.COLOR_BGR2GRAY)
+        proposed = []
+        for box in self.state.boxes.values():
+            polygon = np.asarray(box.evidence['polygon'],np.float32)
+            mask = np.zeros(gray0.shape,np.uint8)
+            cv2.polylines(mask,[np.int32(polygon)],True,255,18)
+            points = cv2.goodFeaturesToTrack(gray0,40,.01,6,mask=mask)
+            if points is None or len(points)<6:
+                return None
+            tracked,status,error = cv2.calcOpticalFlowPyrLK(gray0,gray1,points,None,winSize=(21,21),maxLevel=2)
+            good = status.ravel()>0
+            if good.sum()<6:
+                return None
+            transform,inliers = cv2.estimateAffinePartial2D(points[good],tracked[good],method=cv2.RANSAC,ransacReprojThreshold=2.)
+            if transform is None or inliers.sum()<6:
+                return None
+            if np.max(np.abs(transform[:,:2]-np.eye(2)))>.03 or np.linalg.norm(transform[:,2])>20.:
+                return None
+            corners = polygon@transform[:,:2].T+transform[:,2]
+            proposed.append(dict(box.evidence,polygon=corners.tolist(),center_px=corners.mean(0).tolist(),
+                                 line_tracking_inliers=int(inliers.sum())))
+        return proposed
 
     def update_scene(self, frames):
         frame = frames['overview']
         detected = detect_cubes(frame)
+        wrist_detections = detect_cubes(frames['wrist'])
         objects, rejected = [], []
         for detection in detected:
             try:
-                objects.append(self.geometry.estimate_cube_pose(detection, frame))
+                support_z = self.geometry.table_z
+                for box in self.state.boxes.values():
+                    if box.evidence.get('metric_qualified') and cv2.pointPolygonTest(np.asarray(box.evidence['polygon'],np.float32),tuple(detection['center_px']),False)>0:
+                        measured = box.evidence['native_box']
+                        support_z = float((measured.base_from_box@np.r_[0.,0.,measured.floor_interval_m[1],1.])[2])
+                obj = self.geometry.estimate_cube_pose(detection,frame,support_z)
+                wrist = [d for d in wrist_detections if d['color']==obj.color]
+                if self.geometry.wrist is not None and self.robot is not None and len(wrist)==1:
+                    try:
+                        obj = self.geometry.localize_cube_centers(obj,[(frame,detection),(frames['wrist'],wrist[0])],self.robot)
+                    except ValueError as exc:
+                        obj.evidence['wrist_measurement_rejected'] = str(exc)
+                objects.append(obj)
             except ValueError as exc:
                 rejected.append({'color': detection['color'], 'reason': str(exc)})
-        old = list(self.state.objects.values())
+        for obj in objects:
+            matches = [] if obj.evidence.get('metric_qualified') else [(key,cube) for key,cube in self.metric_objects.items() if np.linalg.norm(cube.center_m[:2]-obj.pose[:2,3]) < .006]
+            if len(matches)==1:
+                key,cube = matches[0]
+                projected = self.geometry.project(cube.vertices_m)
+                expected = np.zeros(obj.mask.shape,np.uint8)
+                # Compare the coloured top face, never the full side silhouette.
+                top = cube.vertices_m[np.argsort(cube.vertices_m[:,2])[-4:]]
+                cv2.fillConvexPoly(expected,cv2.convexHull(np.int32(self.geometry.project(top))),1)
+                overlap = np.count_nonzero((expected>0)&(obj.mask>0))/max(1,np.count_nonzero((expected>0)|(obj.mask>0)))
+                if overlap > .85:
+                    obj.id = key
+                    obj.pose[:3,:3],obj.pose[:3,3] = cube.rotation,cube.center_m
+                    obj.dimensions = np.full(3,cube.side_m)
+                    obj.evidence.update(cube.evidence,metric_qualified=True,metric_confirmation_iou=overlap)
+        old = list({**{key:o for key,o in self.track_memory.items() if frame.timestamp-o.timestamp < 3.},**self.state.objects}.values())
         if old and objects:
             costs = np.array([[np.linalg.norm(a.pose[:3,3]-b.pose[:3,3]) + (0. if a.color == b.color else 10.) for b in objects] for a in old])
             rows, columns = linear_sum_assignment(costs)
             for row, column in zip(rows, columns):
-                if costs[row,column] < .04:
+                if costs[row,column] < .04 and not objects[column].id:
                     objects[column].id = old[row].id
         for obj in objects:
+            if self.held is not None and self.held[0] in self.state.objects and obj.color==self.state.objects[self.held[0]].color and sum(o.color==obj.color for o in objects)==1:
+                obj.id,obj.status = self.held[0],'held'
+            if self.pending_placement is not None and obj.color==self.pending_placement[1] and sum(o.color==obj.color for o in objects)==1:
+                obj.id = self.pending_placement[0]
             if not obj.id:
                 obj.id = f'cube-{self.next_id:03d}'
                 self.next_id += 1
             if obj.id in self.reserved:
                 obj.status = 'reserved'
-        # Edge proposals are expensive relative to HSV; refresh them once a second.
-        if not self.state.boxes or frame.timestamp-self.state.evidence.get('boxes_at',0.) > 5.:
-            proposals = detect_boxes(frame)
+        from so101_pick_place.geometry.cuboid_vision import cube_vertices
+        for obj in objects:
+            if obj.evidence.get('metric_qualified') and obj.status!='held':
+                yaw = np.arctan2(obj.pose[1,0],obj.pose[0,0])
+                vertices = cube_vertices(obj.pose[:2,3],obj.dimensions[0],yaw,obj.pose[2,3]-obj.dimensions[2]/2)
+                self.metric_objects[obj.id] = SpatialCube(obj.pose[:3,3],obj.dimensions[0],obj.pose[:3,:3],vertices,dict(obj.evidence))
+        self.track_memory.update({o.id:o for o in objects})
+        self.track_memory = {key:o for key,o in self.track_memory.items() if frame.timestamp-o.timestamp < 3.}
+        # Reuse box edges between periodic background measurements.
+        if frame.timestamp != self.state.timestamp:
+            proposals = self.track_box_edges(frame)
+            if proposals is None:
+                proposals = detect_boxes(frame)
             if self.robot is not None and self.robot.last_state is not None:
                 from box_extract.scene_builder import robot_mask
                 mask = robot_mask(self.robot.backend,self.robot.last_state['positions'],self.geometry.calibration,frame.image.shape[:2])
@@ -60,6 +136,14 @@ class Scene:
                 center = self.geometry.intersect_ray_with_plane(self.geometry.pixel_ray_in_base(proposal['center_px'], frame), ([0,0,1],-self.geometry.table_z))
                 pose = np.eye(4);pose[:3,3] = center
                 box = BoxState(f'box-{i+1}',pose,np.array([np.nan,np.nan,np.nan]),None,evidence=proposal | {'metric_qualified':False})
+                measured = self.metric_boxes.get(box.id)
+                if measured is not None:
+                    previous = np.asarray(measured.evidence['polygon'])
+                    if np.linalg.norm(previous.mean(0)-np.mean(proposal['polygon'],axis=0)) < 4.:
+                        box.evidence.update(measured.evidence,polygon=proposal['polygon'])
+                        box.pose = measured.pose.copy()
+                        box.inner_dimensions = measured.inner_dimensions.copy()
+                        box.wall_height = measured.wall_height
                 boxes[box.id] = box
             boxes_at = frame.timestamp
         else:
@@ -68,9 +152,9 @@ class Scene:
             polygon = np.array(box.evidence['polygon'],np.float32)
             box.occupied_slots = [o.id for o in objects if cv2.pointPolygonTest(polygon,tuple(np.mean(o.evidence['quad'],axis=0)),False) > 0]
         self.state = SceneState({o.id:o for o in objects},boxes,rejected,
-            [{'id':'table','height_m':self.geometry.table_z,'source':'native calibrated plane'}],self.state.version+1,frame.timestamp,
-            {'boxes_at':boxes_at,'coverage_verified':False,'metric_camera':'overview','wrist_metric_qualified':False})
-        self.raw = {'overview':detected,'wrist':detect_cubes(frames['wrist'])}
+            self.measured_surfaces or [{'id':'table','height_m':self.geometry.table_z,'source':'native calibrated plane'}],self.state.version+1,frame.timestamp,
+            {'boxes_at':boxes_at,'coverage_verified':bool(self.metric_boxes) and len(boxes)==len(self.metric_boxes) and all(o.evidence.get('metric_qualified') for o in objects) and not rejected,'metric_camera':'overview','wrist_metric_qualified':False})
+        self.raw = {'overview':detected,'wrist':wrist_detections}
         self.frames = dict(frames)
         return self.state
 
@@ -95,6 +179,7 @@ class Scene:
         self.state.objects[object_id].pose = np.asarray(observed_pose)
         self.state.objects[object_id].status = 'observed'
         self.held = None
+        self.pending_placement = None
         self.release_reservation(object_id)
 
     def find_free_box_slots(self, box_id, object_shape):
@@ -102,12 +187,28 @@ class Scene:
         if not box.evidence.get('metric_qualified'):
             raise ValueError('box opening, floor and wall height have no qualified metric survey')
         from box_extract.stow import box_floor_patches
-        native = box.evidence['native_scene']
         from box_extract.scene_builder import SceneParameters
+        from types import SimpleNamespace
+        cubes = {key:self.native_object(key) for key in self.state.objects if self.held is None or key!=self.held[0]}
+        native = SimpleNamespace(box=box.evidence['native_box'],cubes=cubes)
         return box_floor_patches(native,SceneParameters())
 
     def find_free_table_slots(self, object_shape):
-        return [s for s in self.state.surfaces if s.get('free_surface_verified') and s.get('patch') is not None]
+        from box_extract.stow import CUBE_KEEPOUT_LONG_M,CUBE_KEEPOUT_SHORT_M
+        slots = []
+        half = np.asarray(object_shape)[:2]/2
+        finger_space = max(CUBE_KEEPOUT_LONG_M,CUBE_KEEPOUT_SHORT_M)
+        for surface in self.state.surfaces:
+            patch = surface.get('patch')
+            if surface.get('free_surface_verified') and patch is not None:
+                center = np.mean(patch.polygon_xy_m,axis=0)
+                corners = center+np.array([[-1,-1],[1,-1],[1,1],[-1,1]])*half
+                blocked = any(np.all(np.abs(o.pose[:2,3]-center)<np.maximum(half+o.dimensions[:2]/2+.005,finger_space))
+                              for o in self.state.objects.values() if o.status!='held')
+                reserved = any(slot_id==surface['id'] for _,slot_id in self.reserved_slots)
+                if not blocked and not reserved and patch.contains(np.column_stack((corners,np.full(4,patch.height_m)))):
+                    slots.append(surface)
+        return slots
 
     def build_support_graph(self):
         objects = list(self.state.objects.values())
@@ -128,7 +229,7 @@ class Scene:
             raise ValueError('cube metric pose/support has not passed independent validation')
         yaw = np.arctan2(o.pose[1,0],o.pose[0,0])
         vertices = cube_vertices(o.pose[:2,3],float(o.dimensions[0]),yaw,o.pose[2,3]-o.dimensions[2]/2)
-        return SpatialCube(o.pose[:3,3],float(o.dimensions[0]),o.pose[:3,:3],vertices,o.evidence)
+        return SpatialCube(o.pose[:3,3],float(o.dimensions[0]),o.pose[:3,:3],vertices,o.evidence|{'object_id':object_id})
 
     def public(self):
         return {'version':self.state.version,'timestamp':self.state.timestamp,
@@ -145,11 +246,23 @@ class Scene:
         """Translate a qualified survey into the existing hollow-wall world."""
         from so101_pick_place.experiments.box_extraction.scene import ExtractionScene
         surface = next((s for s in self.state.surfaces if s['id']==placement.support_surface),None)
-        if placement.support_surface in self.state.boxes:
+        if placement.support_object_id is not None:
+            support = self.state.objects[placement.support_object_id]
+            if self.build_support_graph()[support.id]:
+                raise ValueError('support cube already carries another object')
+            cube = self.native_object(support.id)
+            patch = StackSupport(cube)
+            primary = next((b.evidence.get('native_box') for b in self.state.boxes.values() if b.evidence.get('metric_qualified')),None)
+            if primary is None:
+                raise ValueError('visible boxes still need measured collision geometry')
+        elif placement.support_surface in self.state.boxes:
             box = self.state.boxes[placement.support_surface]
             if not box.evidence.get('metric_qualified'):
                 raise ValueError('box floor/rim/walls are not independently measured')
-            patch = box.evidence['support_patch']
+            patches = self.find_free_box_slots(box.id,self.state.objects[object_id].dimensions)
+            if not patches:
+                raise ValueError('no box slot remains free')
+            patch = min(patches,key=lambda p:np.linalg.norm(np.mean(p.polygon_xy_m,axis=0)-placement.object_pose[:2,3]))
             primary = box.evidence['native_box']
         elif surface is not None and surface.get('patch') is not None:
             patch = surface['patch']
@@ -163,9 +276,71 @@ class Scene:
             raise ValueError('an unmeasured second box remains in the workspace')
         if not self.state.evidence.get('coverage_verified'):
             raise ValueError('workspace coverage and unknown obstacles are not qualified')
+        obj = self.state.objects[object_id]
+        expected_z = patch.height_m+obj.dimensions[2]/2
+        if abs(placement.object_pose[2,3]-expected_z) > .004:
+            raise ValueError('requested placement disagrees with measured support height')
+        if placement.support_object_id is None:
+            from so101_pick_place.experiments.box_extraction.scene import SupportPatch
+            half = obj.dimensions[:2]/2+.007
+            polygon = placement.object_pose[:2,3]+np.array([[-1,-1],[1,-1],[1,1],[-1,1]])*half
+            test = np.column_stack((polygon,np.full(4,patch.height_m)))
+            if not patch.contains(test,margin_m=0.):
+                raise ValueError('requested slot leaves the measured free support polygon')
+            patch = SupportPatch(polygon,patch.height_m,patch.uncertainty_m,dict(patch.evidence))
         cubes = {key:self.native_object(key) for key in self.state.objects}
         boxes = [b.evidence['native_box'] for b in self.state.boxes.values()]
         return ExtractionScene(str(self.state.version),self.state.timestamp,BoxUnion(primary,boxes),cubes,patch,(),True)
+
+
+    def remember_reset_layout(self):
+        if not self.reset_targets:
+            self.reset_targets = {o.id:Placement(o.pose.copy(),'table') for o in self.state.objects.values() if not any(o.id in b.occupied_slots for b in self.state.boxes.values())}
+        return len(self.reset_targets)
+
+    def install_metric_survey(self, surveys):
+        """Accept actual native WristSurveyBuilder results; no nominal substitutes."""
+        from scipy.optimize import linear_sum_assignment
+        measured_objects = {}
+        for box_id,native in surveys.items():
+            native.require_complete()
+            box = self.state.boxes[box_id]
+            box.evidence.update(metric_qualified=True,native_box=native.box)
+            box.pose = np.asarray(native.box.base_from_box).copy()
+            box.inner_dimensions = np.r_[native.box.inner_max_xy-native.box.inner_min_xy,native.box.obstacle_top_m-native.box.floor_interval_m[1]]
+            box.wall_height = float(box.inner_dimensions[2])
+            self.metric_boxes[box_id] = box
+            current = list(self.state.objects.values());cubes = list(native.cubes.values())
+            costs = np.array([[np.linalg.norm(o.pose[:2,3]-cube.center_m[:2]) for cube in cubes] for o in current])
+            if current and cubes:
+                rows,columns = linear_sum_assignment(costs)
+                if len(columns)!=len(cubes) or any(costs[i,j]>.012 for i,j in zip(rows,columns)):
+                    raise ValueError('wrist survey objects do not uniquely match current overview IDs')
+                measured_objects.update({current[i].id:cubes[j] for i,j in zip(rows,columns)})
+            self.measured_surfaces = [{'id':'table','height_m':native.placement.height_m,'patch':native.placement,'free_surface_verified':True}]
+        self.metric_objects = measured_objects
+
+
+class StackSupport:
+    """Measured top face; stability uses the payload centre of mass."""
+    def __init__(self, cube):
+        from scipy.spatial import ConvexHull
+        top = cube.vertices_m[np.argsort(cube.vertices_m[:,2])[-4:]]
+        self.polygon_xy_m = top[ConvexHull(top[:,:2]).vertices,:2]
+        self.height_m = float(top[:,2].mean())
+        self.uncertainty_m = float(max(cube.evidence.get('position_sigma_m',[0.,0.,.002])))
+        if self.uncertainty_m > .002 or np.ptp(top[:,2]) > .002:
+            raise ValueError('tower support is too uncertain or tilted')
+        self.support_id = cube.evidence.get('object_id')
+        self.evidence = dict(cube.evidence)
+
+    def contains(self, vertices, margin_m=.005):
+        from scipy.spatial import ConvexHull
+        hull = ConvexHull(self.polygon_xy_m)
+        points = np.asarray(vertices)
+        center = points.mean(0)[:2]
+        radius = float(np.min(np.ptp(points[:,:2],axis=0)))/4+self.uncertainty_m
+        return bool(np.all(center@hull.equations[:,:2].T+hull.equations[:,2] <= -radius))
 
 
 class BoxUnion:

@@ -10,6 +10,14 @@ RANGES = {
 }
 
 
+def projective_center(quad):
+    q = np.column_stack((np.asarray(quad,float).reshape(4,2),np.ones(4)))
+    point = np.cross(np.cross(q[0],q[2]),np.cross(q[1],q[3]))
+    if abs(point[2])<1e-8:
+        raise ValueError('top-face diagonals have no finite intersection')
+    return point[:2]/point[2]
+
+
 def color_masks(image):
     hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
     masks = {}
@@ -38,7 +46,7 @@ def detect_cubes(frame):
                     object_mask = np.zeros(mask.shape, np.uint8)
                     cv2.drawContours(object_mask, [contour], -1, 255, -1)
                     detections.append({'color': color, 'mask': object_mask, 'quad': quad.reshape(4, 2),
-                        'center_px': np.mean(quad.reshape(4, 2), axis=0).tolist(),
+                        'center_px': projective_center(quad).tolist(),
                         'confidence': float(min(solidity, ratio+.25)), 'area_px': area})
     return sorted(detections, key=lambda item: item['center_px'][0])
 
@@ -139,3 +147,21 @@ def frame_quality(frame, minimum_sharpness=40.):
     return {'sharpness':sharpness,'brightness_p95':p95,
             'usable':sharpness >= minimum_sharpness and p95 >= 45.,
             'reason':'недостаточно света' if p95 < 45. else 'размытый кадр' if sharpness < minimum_sharpness else ''}
+
+
+def track_color_in_grip(frame, color, expected_pixel, radius_px=150.):
+    mask = color_masks(frame.image)[color]
+    contours,_ = cv2.findContours(mask,cv2.RETR_EXTERNAL,cv2.CHAIN_APPROX_SIMPLE)
+    matches = []
+    for contour in contours:
+        area = cv2.contourArea(contour)
+        moments = cv2.moments(contour)
+        if area > 100 and moments['m00'] > 0:
+            center = np.array([moments['m10']/moments['m00'],moments['m01']/moments['m00']])
+            distance = float(np.linalg.norm(center-expected_pixel))
+            if distance < radius_px:
+                matches.append((distance,center,area))
+    matches.sort(key=lambda item:item[0])
+    if not matches or (len(matches)>1 and matches[1][0]-matches[0][0]<15.):
+        raise ValueError('held cube colour region is missing or ambiguous')
+    return {'center_px':matches[0][1].tolist(),'area_px':matches[0][2],'frame_id':frame.frame_id}

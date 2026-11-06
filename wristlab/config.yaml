@@ -6,5 +6,21 @@
   "max_recovery_attempts": 2,
   "placement_tolerance_m": 0.008,
   "qualification_file": "runtime/qualification.json",
-  "attachment_file": "runtime/attachment-candidate.json"
+  "attachment_file": "runtime/attachment-candidate.json",
+  "camera_controls": {
+    "overview": {
+      "auto_exposure": 1,
+      "exposure_time_absolute": 200,
+      "gain": 32,
+      "power_line_frequency": 1,
+      "exposure_dynamic_framerate": 0
+    },
+    "wrist": {
+      "auto_exposure": 1,
+      "exposure_time_absolute": 80,
+      "gain": 0,
+      "power_line_frequency": 1,
+      "exposure_dynamic_framerate": 0
+    }
+  }
 }

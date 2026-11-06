@@ -56,7 +56,7 @@ async function refreshScene(){
   drawOverlay();
 }
 async function start(mode){
-  try{await api('/api/run',{mode,dry:document.getElementById('dry').checked,destination:document.getElementById('destination').value});}
+  try{await api('/api/run',{mode,dry:document.getElementById('dry').checked,destination:document.getElementById('destination').value,object_id:statusData?.selected,count:2,rows:2,columns:2,pattern:mode==='build_color_pattern'?[['green','yellow'],['red','blue']]:undefined});}
   catch(err){error(err);}await poll();
 }
 ['relocate','stow','extract'].forEach(id=>document.getElementById(id).addEventListener('click',()=>start(id)));
@@ -64,10 +64,16 @@ document.getElementById('scene-btn').addEventListener('click',()=>refreshScene()
 document.getElementById('stop').addEventListener('click',async()=>{await api('/api/stop',{});await poll();});
 document.getElementById('reset').addEventListener('click',async()=>{try{await api('/api/reset',{});}catch(err){error(err);}await poll();});
 document.getElementById('pause').addEventListener('click',async()=>{await api('/api/pause',{paused:!statusData?.paused});await poll();});
+document.getElementById('experiment-start').addEventListener('click',()=>start(document.getElementById('experiment').value));
+document.getElementById('task-plan').addEventListener('click',async()=>{
+  const body={mode:document.getElementById('experiment').value,destination:document.getElementById('destination').value,object_id:statusData?.selected,count:2,rows:2,columns:2};
+  if(body.mode==='build_color_pattern')body.pattern=[['green','yellow'],['red','blue']];
+  try{const plan=await api('/api/task-plan',body);const out=document.getElementById('task-proposal');out.hidden=false;out.textContent=JSON.stringify(plan,null,2);}catch(err){error(err);}
+});
 document.getElementById('dry').addEventListener('change',gate);
 function gate(){
   const dry=document.getElementById('dry').checked;
-  ['relocate','stow','extract'].forEach(id=>document.getElementById(id).disabled=lastRunning||statusData?.stop_latched||(!dry&&!statusData?.ready));
+  ['relocate','stow','extract','experiment-start'].forEach(id=>document.getElementById(id).disabled=lastRunning||statusData?.stop_latched||(!dry&&!statusData?.ready));
 }
 async function poll(){
   try{
@@ -75,10 +81,18 @@ async function poll(){
     document.getElementById('state-text').textContent=s.ready?'Ready':({blocked:'Движение заблокировано',stopped:'STOP',checking:'Проверка без движения',initializing:'Инициализация',completed:'Завершено'}[s.phase]||s.phase);
     document.getElementById('state-dot').className='dot '+(s.running?'run':s.ready?'ok':'bad');
     document.getElementById('state-detail').textContent=s.detail;
-    document.getElementById('blockers').textContent=s.blockers.join(' · ');
+    document.getElementById('blockers').textContent=s.physical_blocker?
+      'Исходная поза: '+(1000*s.physical_blocker.clearance_m).toFixed(1)+' мм при требуемых '+(1000*s.physical_blocker.required_clearance_m).toFixed(0)+' мм. '+s.physical_blocker.required_action+' '+s.physical_blocker.recheck:
+      s.blockers.join(' · ');
+    document.getElementById('qualification').textContent=s.blockers.join(' · ');
+    document.getElementById('action-result').textContent=s.results.length?
+      s.results.map(r=>(r.success?'Успех: ':'Не выполнено: ')+r.reason+' · физически подтверждено: '+(r.evidence?.physical_verified?'да':'нет')).join('\n'):
+      'Физически подтверждённых переносов пока нет.';
     document.getElementById('pause').textContent=s.paused?'Resume':'Pause';
     const m=s.metrics;document.getElementById('metrics').textContent='Vision: '+(m.vision_s===undefined?'—':(1000*m.vision_s).toFixed(0)+' мс')+' · Start → первая команда: '+(m.first_command_s==null?'команд не было':m.first_command_s.toFixed(3)+' с');
-    document.getElementById('log').textContent=s.log.join('\n');await refreshScene();
+    document.getElementById('log').textContent=s.log.join('\n');
+    const live=await api('/api/live');document.getElementById('joints').textContent=live.pos?'Суставы · '+Object.entries(live.pos).map(([k,v])=>k+': '+v.toFixed(1)).join(' · '):'Нет свежей обратной связи';
+    await refreshScene();
   }catch(err){error(err);}
 }
 setInterval(()=>feeds.forEach(camera),650);setInterval(poll,1000);

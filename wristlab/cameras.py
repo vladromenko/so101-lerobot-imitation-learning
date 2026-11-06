@@ -10,14 +10,17 @@ from .types import Frame
 
 
 class Cameras:
-    def __init__(self, api, max_age=.5):
+    def __init__(self, api, max_age=.5, controls=None):
         self.api, self.max_age = api, max_age
+        self.controls = controls or {}
+        self.exposure_s = {name:values.get('exposure_time_absolute',0)/10000. for name,values in self.controls.items()}
         self.frames, self.history = {}, deque(maxlen=120)
         self.last_health = {}
         self.error = None
         self.stop_event = threading.Event()
         self.thread = None
         self.on_native_stop = None
+        self.frame_ready = threading.Condition()
 
     def json(self, path, payload=None, timeout=2.):
         request = urllib.request.Request(self.api + path,
@@ -25,6 +28,11 @@ class Cameras:
             headers={} if payload is None else {'Content-Type': 'application/json'})
         with urllib.request.urlopen(request, timeout=timeout) as response:
             return json.load(response)
+
+    def apply_controls(self):
+        from .camera_controls import apply_controls
+        health = self.json('/api/camera-health')['cameras']
+        return {name:apply_controls(health[name]['device'],values) for name,values in self.controls.items()}
 
     def start_capture(self):
         try:
@@ -46,7 +54,7 @@ class Cameras:
                     raise RuntimeError('; '.join(invalid))
                 native = self.json('/api/status')
                 if native.get('state') == 'EMERGENCY_STOP' and self.on_native_stop is not None:
-                    self.on_native_stop()
+                    self.on_native_stop(native.get('updated_at'))
                 self.error = None
             except Exception as exc:
                 self.error = str(exc)
@@ -83,25 +91,43 @@ class Cameras:
             # Snapshot API supplies no sequence header. Preserve the actual interval,
             # rather than claiming an exact sequence from a different HTTP response.
             frame_id = f"{name}:{health['sequence']}-{after['sequence']}"
-            frame = Frame(name, frame_id, image, (lo + hi) / 2., received, (lo, hi))
+            exposure = self.exposure_s.get(name,0.)
+            frame = Frame(name,frame_id,image,(lo+hi-exposure)/2.,received,(lo-exposure,hi))
             state = self.get_robot_state_at(frame.timestamp)
             if state is not None:
-                frame.joints, frame.feedback_error_s = state
+                frame.joints, frame.feedback_error_s, frame.gripper = state
             self.frames[name] = frame
         self.last_health = before
+        with self.frame_ready:
+            self.frame_ready.notify_all()
         return self.frames
 
-    def record_state(self, timestamp, joints):
-        self.history.append((float(timestamp), np.asarray(joints, float).copy()))
+    def wait_for_frame(self, camera_id, after_time, check_cancel, timeout=2.):
+        deadline = time.monotonic()+timeout
+        with self.frame_ready:
+            frame = self.frames.get(camera_id)
+            while frame is None or frame.capture_interval[0] < after_time:
+                check_cancel()
+                remaining = deadline-time.monotonic()
+                if remaining<=0:
+                    raise RuntimeError('camera did not supply a complete post-motion exposure')
+                self.frame_ready.wait(min(.1,remaining))
+                frame = self.frames.get(camera_id)
+        return self.get_latest_frame(camera_id)
+
+    def record_state(self, timestamp, joints, gripper=None):
+        self.history.append((float(timestamp),np.asarray(joints,float).copy(),gripper))
 
     def get_robot_state_at(self, timestamp):
-        pairs = list(zip(self.history, list(self.history)[1:]))
-        match = next(((a, b) for a, b in reversed(pairs) if a[0] <= timestamp <= b[0] and b[0]-a[0] <= .1), None)
+        history = list(self.history)
+        pairs = list(zip(history,history[1:]))
+        match = next(((a, b) for a, b in reversed(pairs) if a[0] <= timestamp <= b[0] and (b[0]-a[0] <= .1 or (b[0]-a[0] <= .5 and np.max(np.abs(b[1]-a[1])) < .002))), None)
         if match is None:
             return None
         a, b = match
         alpha = (timestamp-a[0]) / max(1e-9, b[0]-a[0])
-        return a[1] + alpha*(b[1]-a[1]), max(timestamp-a[0], b[0]-timestamp)
+        gripper = None if a[2] is None or b[2] is None else a[2]+alpha*(b[2]-a[2])
+        return a[1]+alpha*(b[1]-a[1]),max(timestamp-a[0],b[0]-timestamp),gripper
 
     def get_latest_frame(self, camera_id):
         frame = self.frames[camera_id]
@@ -109,5 +135,10 @@ class Cameras:
             raise RuntimeError(camera_id + ': stale frame')
         state = self.get_robot_state_at(frame.timestamp)
         if state is not None:
-            frame.joints, frame.feedback_error_s = state
+            frame.joints, frame.feedback_error_s, frame.gripper = state
+        before = [sample for sample in self.history if sample[0] <= frame.capture_interval[0]]
+        after = [sample for sample in self.history if sample[0] >= frame.capture_interval[1]]
+        if before and after:
+            samples = [before[-1],*[sample for sample in self.history if frame.capture_interval[0] < sample[0] < frame.capture_interval[1]],after[0]]
+            frame.motion_during_exposure_rad = float(np.ptp(np.array([sample[1] for sample in samples]),axis=0).max())
         return frame

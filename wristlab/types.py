@@ -55,6 +55,7 @@ class Placement:
     object_pose: np.ndarray
     support_surface: str
     tolerance: float = .008
+    support_object_id: str | None = None
 
 
 @dataclass
@@ -76,3 +77,5 @@ class Frame:
     capture_interval: tuple
     joints: np.ndarray | None = None
     feedback_error_s: float | None = None
+    gripper: float | None = None
+    motion_during_exposure_rad: float | None = None

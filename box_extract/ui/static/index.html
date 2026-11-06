@@ -36,7 +36,7 @@
 
   <section class="card right">
     <h2>Что сделать</h2>
-    <p class="hint">Разрешение на испытания со STOP принято из текущего задания. Start доступен после геометрической проверки.</p>
+    <p class="hint">Start использует общий relocate. Проверка геометрии и STOP действуют для всех экспериментов.</p>
     <div id="selected" class="state">Нажмите на кубик в любой камере.</div>
     <p><label>Цель: <select id="destination"><option value="">Коробки ещё не измерены</option></select></label></p>
     <button id="relocate" class="primary">Start · выбранный кубик → коробка</button>
@@ -44,6 +44,18 @@
       <button id="stow" class="primary">Сложить все кубики в коробку</button>
       <button id="extract" class="primary">Вытащить все кубики из коробки</button>
     </div>
+    <p><label>Эксперимент: <select id="experiment">
+      <option value="sort_colors">Сортировка цветов</option>
+      <option value="build_tower">Башня из двух кубиков</option>
+      <option value="unstack_tower">Разбор башни</option>
+      <option value="pack_box">Однослойная укладка</option>
+      <option value="arrange_grid">Сетка 2×2</option>
+      <option value="build_color_pattern">Цветной узор 2×2</option>
+      <option value="free_target">Освободить выбранный кубик</option>
+      <option value="reset_scene">Восстановить начальную раскладку</option>
+      <option value="run_sequence">Автономный цикл</option>
+    </select></label></p>
+    <div class="actions"><button id="task-plan">Рассчитать задачу</button><button id="experiment-start" class="primary">Start · эксперимент</button></div>
     <label class="check"><input type="checkbox" id="dry" checked> Только геометрическая проверка, без движения</label>
     <div class="actions"><button id="pause">Pause</button><button id="reset">Сброс STOP</button></div>
     <button id="stop" class="danger">STOP · остановить оба исполнителя</button>
@@ -54,7 +66,11 @@
       <div id="chips" class="chips"></div>
     </div>
     <div id="metrics" class="hint"></div>
+    <div id="joints" class="hint"></div>
+    <div id="action-result" class="note">Физически подтверждённых переносов пока нет.</div>
+    <pre id="task-proposal" hidden></pre>
     <div id="blockers" class="note"></div>
+    <details><summary>Условия Ready</summary><div id="qualification" class="hint"></div></details>
     <h3>Журнал</h3>
     <pre id="log">Журнал появится здесь.</pre>
   </section>

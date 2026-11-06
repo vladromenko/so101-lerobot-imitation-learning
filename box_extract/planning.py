@@ -8,9 +8,8 @@ from so101_pick_place.geometry.spatial_cube import SpatialCube
 from so101_pick_place.kinematics.so101_backend import ARM_JOINTS  # noqa: F401
 
 
-def released_cube(placed, factor=.93):
-    """The placed cube as an obstacle for the retract: slightly smaller, because the fixed jaw lies flush against it at
-    the start (zero clearance by construction) and the retract's first move is the sideways separation from it."""
+def released_cube(placed, factor=1.):
+    """Retain the measured cube size through release and retreat checks."""
     centre = placed.vertices_m.mean(0)
     return replace(placed, side_m=placed.side_m*factor, vertices_m=centre+(placed.vertices_m-centre)*factor)
 

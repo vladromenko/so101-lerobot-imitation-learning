@@ -75,7 +75,7 @@ def run_task(mode, scene, actions, refresh, check_cancel, selected=None, destina
         results.append(result)
         if not result.success:
             deferred.add(object_id)
-            if result.evidence.get('motion_started') or result.evidence.get('critical'):
+            if result.evidence.get('critical') or (result.evidence.get('motion_started') and not result.evidence.get('recovered')):
                 return results
         if mode == 'relocate':
             return results
