@@ -223,8 +223,16 @@ class GeometryPolicy(unittest.TestCase):
     def test_active_perception_cannot_move_to_resolve_its_own_startup_block(self):
         rt=Runtime.__new__(Runtime);rt.check_cancel=Mock();rt.scene=NS(held=None)
         rt.robot=NS(read_state=Mock(return_value={}),audit_state=Mock(return_value={'planning_valid':False}))
-        rt.motion=Mock()
+        rt.motion=Mock();rt.motion.driver=None
         with self.assertRaisesRegex(ValueError,'verified working area'):
+            rt.refine_object('cube',None,None)
+        rt.motion.execute_trajectory.assert_not_called()
+
+    def test_active_perception_respects_force_retention_even_without_scene_attachment(self):
+        rt=Runtime.__new__(Runtime);rt.check_cancel=Mock();rt.scene=NS(held=None)
+        rt.robot=NS(read_state=Mock(),audit_state=Mock(return_value={'planning_valid':True}))
+        rt.motion=Mock();rt.motion.driver=NS(retention=NS(armed=True))
+        with self.assertRaisesRegex(ValueError,'empty jaw'):
             rt.refine_object('cube',None,None)
         rt.motion.execute_trajectory.assert_not_called()
 

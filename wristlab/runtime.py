@@ -315,7 +315,8 @@ class Runtime:
         from dataclasses import replace
         from so101_pick_place.experiments.box_extraction.planner import Phase
         self.check_cancel()
-        if self.scene.held is not None or not self.robot.audit_state(self.robot.read_state())['planning_valid']:
+        force_held=self.motion.driver is not None and self.motion.driver.retention.armed
+        if self.scene.held is not None or force_held or not self.robot.audit_state(self.robot.read_state())['planning_valid']:
             raise ValueError('active perception is allowed only with an empty jaw in the verified working area')
         obj = self.scene.state.objects[object_id]
         point = obj.pose[:3,3]+[0.,0.,obj.dimensions[2]/2]
