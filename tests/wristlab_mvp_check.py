@@ -204,6 +204,14 @@ class GeometryPolicy(unittest.TestCase):
         self.assertAlmostEqual(sent[1]['shoulder_pan']-sent[0]['shoulder_pan'],.5)
         self.assertIs(robot.arm.follow,native_follow)
         self.assertEqual(robot.arm.raw.sag,3.7)
+        motion=Motion(robot,lambda:None,lambda *args:None,ROOT/'runtime/qualification.json')
+        motion.planner.command_sag=3.7;motion.recovery_mapping=synchronization
+        worlds=NS(reason=Mock(return_value=None))
+        phase=Phase('RECOVERY_FROM_INVALID_START',(state['positions'],state['positions']))
+        plan=NS(target_id='released',payload_local=None)
+        motion.edge_is_valid(state['positions'],state['positions'],phase,plan,worlds)
+        checked=[call.args[0] for call in worlds.reason.call_args_list]
+        self.assertEqual(robot.quantized_command(checked[1]),expected)
 
     def test_changed_hold_is_rejected_before_the_native_follower(self):
         recorded=json.loads((ROOT/'runtime/retreat-park-before-restart.json').read_text())

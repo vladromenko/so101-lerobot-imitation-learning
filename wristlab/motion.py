@@ -444,7 +444,8 @@ class Motion:
             raise ValueError('native gravity-compensation setting has not been read')
         for q in self.robot.native_edge_samples(start,goal):
             self.check_cancel()
-            for kind,pose in (('pose',q),('native command',self.planner._command_pose(q))):
+            command = self.robot.synchronized_command(q,self.recovery_mapping) if phase.name=='RECOVERY_FROM_INVALID_START' else self.planner._command_pose(q)
+            for kind,pose in (('pose',q),('native command',command)):
                 reason = self.state_is_valid(pose,phase,plan,world)
                 intended = reason in {'gripper_link: cube '+plan.target_id,'moving_jaw_so101_v1_link: cube '+plan.target_id}
                 force_close = phase.name=='grasp' and phase.jaw_contact and not phase.carrying
