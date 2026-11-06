@@ -165,3 +165,34 @@ def track_color_in_grip(frame, color, expected_pixel, radius_px=150.):
     if not matches or (len(matches)>1 and matches[1][0]-matches[0][0]<15.):
         raise ValueError('held cube colour region is missing or ambiguous')
     return {'center_px':matches[0][1].tolist(),'area_px':matches[0][2],'frame_id':frame.frame_id}
+
+
+def visible_attachment_features(frame, projected_board):
+    """Image evidence only. Neither colour nor a cable-like contour supplies depth."""
+    image = frame.image
+    region = np.zeros(image.shape[:2],np.uint8)
+    cv2.fillConvexPoly(region,cv2.convexHull(np.int32(projected_board)),255)
+    hsv = cv2.cvtColor(image,cv2.COLOR_BGR2HSV)
+    coloured = cv2.inRange(hsv,np.array([80,20,25]),np.array([150,255,245])) & region
+    coloured = cv2.morphologyEx(coloured,cv2.MORPH_CLOSE,np.ones((3,3),np.uint8))
+    contours,_ = cv2.findContours(coloured,cv2.RETR_EXTERNAL,cv2.CHAIN_APPROX_SIMPLE)
+    board = max(contours,key=cv2.contourArea) if contours else None
+    board_mask = np.zeros(region.shape,np.uint8)
+    if board is not None and cv2.contourArea(board)>=40:
+        cv2.drawContours(board_mask,[board],-1,255,-1)
+    gray = cv2.cvtColor(image,cv2.COLOR_BGR2GRAY)
+    features = cv2.goodFeaturesToTrack(gray,40,.02,4,mask=board_mask) if np.any(board_mask) else None
+    count,labels,stats,_ = cv2.connectedComponentsWithStats(np.uint8(gray<55),8)
+    distance = cv2.distanceTransform(255-region,cv2.DIST_L2,3)
+    reach = max(8.,.3*max(np.ptp(projected_board,axis=0)))
+    cable_like = []
+    for index in range(1,count):
+        x,y,w,h,area = stats[index]
+        if 100<area<image.shape[0]*image.shape[1]*.03 and area/(w*h)<.4:
+            pixels = labels==index
+            if distance[pixels].min()<reach:
+                cable_like.append({'bbox_px':[int(x),int(y),int(x+w),int(y+h)],
+                    'visible_pixels':int(area),'depth_observable':False})
+    return {'board_mask':board_mask,'board_hull_px':None if not np.any(board_mask) else cv2.convexHull(board).reshape(-1,2).tolist(),
+            'board_features_px':[] if features is None else features.reshape(-1,2).tolist(),
+            'cable_like_components':cable_like,'visible_board_pixels':int(np.count_nonzero(board_mask))}

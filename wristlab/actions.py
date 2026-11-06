@@ -25,7 +25,7 @@ class Actions:
         executing,last_phase = False,None
         stage = 'observe'
         plan = world = None
-        aligned = False
+        aligned,active_refined = False,False
         try:
             obj = self.observe_object(object_id)
             self.scene.reserve_object(object_id)
@@ -62,15 +62,26 @@ class Actions:
                 stage = phase.name
                 if stage == 'enter' and not aligned:
                     stage = 'visual_alignment'
-                    observation = visual_alignment(obj,rt.cameras,self.robot,self.motion,plan,world,self.scene.geometry)
-                    observed_top = np.asarray(observation['observed_top_m'])
-                    delta = observed_top-(obj.pose[:3,3]+[0.,0.,obj.dimensions[2]/2])
-                    maximum = 3*max(np.asarray(obj.evidence.get('position_sigma_m',[.003]*3))[:2])
-                    if np.linalg.norm(delta[:2])>maximum:
-                        raise ValueError('wrist correction exceeds measured localization uncertainty')
-                    original = native_scene.cubes[object_id]
-                    updated = replace(original,center_m=original.center_m+delta,vertices_m=original.vertices_m+delta)
-                    self.scene.metric_objects[object_id] = updated
+                    try:
+                        observation = visual_alignment(obj,rt.cameras,self.robot,self.motion,plan,world,self.scene.geometry)
+                    except ValueError:
+                        if active_refined or not hasattr(rt,'refine_object'):
+                            raise
+                        obj = rt.refine_object(object_id,plan,world)
+                        active_refined,observation = True,None
+                    if observation is not None:
+                        observed_top = np.asarray(observation['observed_top_m'])
+                        delta = observed_top-(obj.pose[:3,3]+[0.,0.,obj.dimensions[2]/2])
+                        if hasattr(rt,'record_action_measurement'):
+                            rt.record_action_measurement('visual_alignment',object_id,{'target_top_m':(obj.pose[:3,3]+[0.,0.,obj.dimensions[2]/2]).tolist(),
+                                'observed_top_m':observed_top.tolist(),'xy_error_m':delta[:2].tolist(),'frame_id':observation['frame_id'],
+                                'independent_z_measurement':False})
+                        maximum = 3*max(np.asarray(obj.evidence.get('position_sigma_m',[.003]*3))[:2])
+                        if np.linalg.norm(delta[:2])>maximum:
+                            raise ValueError('wrist correction exceeds measured localization uncertainty')
+                        original = native_scene.cubes[object_id]
+                        updated = replace(original,center_m=original.center_m+delta,vertices_m=original.vertices_m+delta)
+                        self.scene.metric_objects[object_id] = updated
                     rt.refresh()
                     obj = self.scene.state.objects[object_id]
                     native_scene = self.scene.native_scene(object_id,placement)
@@ -81,7 +92,7 @@ class Actions:
                     stage = 'path_check'
                     self.motion.check_path(plan,world)
                     queue = list(plan.phases)
-                    aligned = True
+                    aligned = observation is not None
                     phase = None
                 if phase is not None:
                     if stage == 'release' and not held_verified:
@@ -135,6 +146,11 @@ class Actions:
             if not verified:
                 raise ValueError('object was not observed at placement within tolerance')
             self.scene.detach_object(object_id,observed)
+            if hasattr(rt,'record_action_measurement'):
+                measured = self.scene.state.objects[object_id]
+                rt.record_action_measurement('placement',object_id,{'requested_pose_m':placement.object_pose.tolist(),
+                    'observed_pose_m':observed.tolist(),'error_m':(observed[:3,3]-placement.object_pose[:3,3]).tolist(),
+                    'position_sigma_m':measured.evidence['position_sigma_m']})
             returned = rt.physical_relocate_count==0 or rt.mode=='relocate'
             if returned:
                 stage = 'return_planning'

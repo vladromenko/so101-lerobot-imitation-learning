@@ -9,6 +9,8 @@ from pathlib import Path
 import sys
 import time
 import threading
+import tempfile
+from collections import deque
 from types import SimpleNamespace as NS
 import unittest
 from unittest.mock import Mock, patch
@@ -76,6 +78,27 @@ def action_contract():
 
 
 class RelocateContract(unittest.TestCase):
+    def test_active_perception_is_bounded_and_replans_approach(self):
+        setup=action_contract();obj,rt,action,placement,plan,alignment=setup
+        rt.refine_object=Mock(return_value=obj)
+        with patch('wristlab.actions.choose_grasp',return_value=(None,plan,NS())) as choose,patch(
+            'wristlab.actions.visual_alignment',side_effect=[ValueError('view occluded'),alignment]):
+            result=action.relocate(obj.id,placement)
+        self.assertTrue(result.success,result.reason)
+        rt.refine_object.assert_called_once()
+        self.assertEqual(choose.call_count,3)
+        self.assertEqual([c.args[0].name for c in rt.motion.execute_trajectory.call_args_list].count('grasp'),1)
+
+    def test_active_perception_does_not_repeat_same_failed_alignment(self):
+        setup=action_contract();obj,rt,action,placement,plan,_=setup
+        rt.refine_object=Mock(return_value=obj)
+        with patch('wristlab.actions.choose_grasp',return_value=(None,plan,NS())),patch(
+            'wristlab.actions.visual_alignment',side_effect=ValueError('target still occluded')):
+            result=action.relocate(obj.id,placement)
+        self.assertFalse(result.success)
+        rt.refine_object.assert_called_once()
+        self.assertNotIn('grasp',[c.args[0].name for c in rt.motion.execute_trajectory.call_args_list])
+        rt.stop.assert_not_called()
     def invoke(self, setup, **options):
         obj,rt,action,placement,plan,alignment = setup
         with patch('wristlab.actions.choose_grasp',return_value=(None,plan,NS())),patch('wristlab.actions.visual_alignment',return_value=alignment):
@@ -159,6 +182,65 @@ class RelocateContract(unittest.TestCase):
 
 
 class GeometryPolicy(unittest.TestCase):
+    def test_passive_current_image_does_not_invent_hidden_depth(self):
+        record=json.loads((ROOT/'runtime/visual-measurement.json').read_text())
+        robot=Robot('/home/jetsonnx/Projects/so101_autonomous_pick_place',ROOT/'runtime/unit')
+        geometry=Geometry(robot.root)
+        image=cv2.imread(str(ROOT/'runtime/visibility-current.jpg'))
+        frame=Frame('overview',record['frame_id'],image,sum(record['capture_interval'])/2,
+            record['capture_interval'][1],tuple(record['capture_interval']),np.asarray(record['joints_rad']),
+            record['feedback_error_s'],Q['gripper'],0.)
+        report=geometry.measure_visible_attachment(frame,robot,json.loads((ROOT/'runtime/attachment-candidate.json').read_text()),now=frame.received_at)
+        self.assertTrue(report['overview_fk_control']['passed'])
+        self.assertGreater(report['visible_board_pixels'],100)
+        self.assertIsNone(report['physical_gap_m'])
+        self.assertFalse(report['cable_3d_pose_inferred'])
+        self.assertFalse(report['motion_authorized'])
+        self.assertGreaterEqual(report['visible_surface_clearance_bound']['lower_bound_m'],0.)
+        with self.assertRaisesRegex(ValueError,'stale'):
+            geometry.measure_visible_attachment(frame,robot,json.loads((ROOT/'runtime/attachment-candidate.json').read_text()),now=frame.received_at+2.)
+
+    def test_pnp_geometry_identity_and_landmark_uncertainty(self):
+        geometry=Geometry('/home/jetsonnx/Projects/so101_autonomous_pick_place')
+        # Numerical projection identity, not a simulated or physically observed robot.
+        points=np.array([[x,y,z] for x in (-.015,.015) for y in (-.012,.012) for z in (-.01,.01)])
+        target=np.eye(4);target[:3,3]=[.26,0.,.04]
+        pixels=geometry.project(points+target[:3,3])
+        frame=Frame('overview','math-check',np.zeros((720,1280,3),np.uint8),time.time(),time.time(),(time.time(),time.time()))
+        result=geometry.rigid_pose_from_landmarks(points,pixels,frame,None,.0001)
+        self.assertLess(np.linalg.norm(np.asarray(result['base_from_object'])-target),1e-5)
+        self.assertGreater(max(result['translation_sigma_m']),0.)
+        with self.assertRaisesRegex(ValueError,'collinear'):
+            geometry.rigid_pose_from_landmarks(np.column_stack((np.arange(4),np.zeros((4,2)))),np.zeros((4,2)),frame,None,.001)
+
+    def test_repeated_fixed_camera_views_cannot_measure_depth(self):
+        geometry=Geometry('/home/jetsonnx/Projects/so101_autonomous_pick_place')
+        stamp=time.time();image=np.zeros((720,1280,3),np.uint8)
+        observations=[{'frame':Frame('overview',str(i),image,stamp,stamp,(stamp,stamp)),'mask':np.ones((720,1280),np.uint8)} for i in range(3)]
+        with self.assertRaisesRegex(ValueError,'no metric depth parallax'):
+            geometry.reconstruct_feature_cloud(observations,None)
+
+    def test_active_perception_cannot_move_to_resolve_its_own_startup_block(self):
+        rt=Runtime.__new__(Runtime);rt.check_cancel=Mock();rt.scene=NS(held=None)
+        rt.robot=NS(read_state=Mock(return_value={}),audit_state=Mock(return_value={'planning_valid':False}))
+        rt.motion=Mock()
+        with self.assertRaisesRegex(ValueError,'verified working area'):
+            rt.refine_object('cube',None,None)
+        rt.motion.execute_trajectory.assert_not_called()
+
+    def test_one_placement_never_changes_calibration_or_establishes_bias(self):
+        rt=Runtime.__new__(Runtime);rt.action_measurements=deque(maxlen=80);rt.metrics={}
+        rt.robot=NS(read_state=Mock(return_value={'q':np.zeros(5),'gripper':20.}))
+        rt.geometry=NS(fingerprint='fixture');rt.scene=NS(state=SceneState())
+        with tempfile.TemporaryDirectory(dir=ROOT/'runtime') as directory:
+            rt.output=Path(directory)
+            for i in range(5):
+                rt.record_action_measurement('placement',str(i),{'error_m':[.005,0.,0.],'position_sigma_m':[.001]*3})
+                stats=rt.metrics['placement_residuals']
+                self.assertFalse(stats['parameters_changed'])
+                self.assertFalse(stats['hardware_limits_changed'])
+                if i==0:self.assertFalse(stats['systematic_bias_candidate'])
+            self.assertTrue(stats['systematic_bias_candidate'])
     def test_saved_native_box_observation_keeps_two_bodies_without_qualifying_depth(self):
         scan=json.loads((ROOT/'runtime/boxes-native-current.json').read_text())
         captured=scan['frame']['captured_at_unix_s']

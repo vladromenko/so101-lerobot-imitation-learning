@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import time
 import numpy as np
+import cv2
 from so101_pick_place.experiments.box_extraction.driver import ExistingArmDriver
 from box_extract.planning import TunedExtractionPlanner
 from so101_pick_place.experiments.box_extraction.planner import Phase, ExtractionPlan
@@ -99,6 +100,52 @@ class Motion:
 
     def plan_direct_transfer(self, start, goal, world, **policy):
         return self.planner.transport(start,goal,world,**policy)
+
+    def informative_views(self, plan, world, geometry, point, current, radius_m=0.):
+        """Choose viewpoints only on an already checked free-space approach."""
+        from so101_pick_place.vision.wrist_camera_geometry import camera_projection
+        if geometry.wrist is None or not self.contact_free_passed:
+            raise ValueError('active perception requires calibrated wrist and a qualified free-space approach')
+        projection = camera_projection(geometry.wrist,self.robot.backend.model,current)
+        current_pose = np.linalg.inv(np.asarray(projection['camera_from_robot']))
+        fixed = geometry.point_image_jacobian(point,geometry.calibration)
+        size = np.asarray(geometry.wrist.get('image_size',[0,0]))
+        if size.shape!=(2,) or np.any(size<=0):
+            raise ValueError('active perception requires calibrated wrist image dimensions')
+        candidates=[]
+        for phase in plan.phases:
+            if phase.name in ('approach','prepare_ready','observe') and not phase.carrying and not phase.jaw_contact:
+                indices=np.unique(np.linspace(0,len(phase.joints)-1,min(12,len(phase.joints))).astype(int))
+                for index in indices:
+                    q=dict(phase.joints[index],gripper=current['gripper'])
+                    observation=camera_projection(geometry.wrist,self.robot.backend.model,q)
+                    pose=np.linalg.inv(np.asarray(observation['camera_from_robot']))
+                    baseline=float(np.linalg.norm(pose[:3,3]-current_pose[:3,3]))
+                    turn=float(np.arccos(np.clip((np.trace(pose[:3,:3].T@current_pose[:3,:3])-1)/2,-1.,1.)))
+                    optical=np.asarray(observation['camera_from_robot'])@np.r_[point,1.]
+                    k=np.asarray(observation['camera_matrix'])
+                    camera=np.asarray(observation['camera_from_robot']);rotation,_=cv2.Rodrigues(camera[:3,:3])
+                    pixel=cv2.projectPoints(np.asarray(point)[None],rotation,camera[:3,3],k,np.asarray(observation['distortion']))[0].ravel()
+                    margin=max(k[0,0],k[1,1])*radius_m/max(.001,optical[2]-radius_m)+3*observation.get('reprojection_rmse_px',2.5)
+                    in_view=bool(np.all(pixel>margin) and np.all(pixel<size-margin))
+                    if optical[2]>.025+radius_m and in_view and (baseline>=.025 or turn>=np.deg2rad(5)) and world.reason(q,target=plan.target_id) is None:
+                        moving=geometry.point_image_jacobian(point,observation)
+                        information=fixed.T@fixed+moving.T@moving
+                        score=float(np.linalg.eigvalsh(information)[0])
+                        cost=float(np.linalg.norm(self.robot.from_native(q)-self.robot.from_native(current)))
+                        candidates.append((-score,cost,q))
+        if not candidates:
+            raise ValueError('checked path offers no new informative view; movement is not bootstrapped from missing geometry')
+        selected,poses=[],[]
+        for _,_,q in sorted(candidates,key=lambda item:item[:2]):
+            pose=np.linalg.inv(np.asarray(camera_projection(geometry.wrist,self.robot.backend.model,q)['camera_from_robot']))
+            novel=all(np.linalg.norm(pose[:3,3]-old[:3,3])>=.025 or
+                      np.arccos(np.clip((np.trace(pose[:3,:3].T@old[:3,:3])-1)/2,-1.,1.))>=np.deg2rad(5.) for old in poses)
+            if novel:
+                selected.append(q);poses.append(pose)
+            if len(selected)>=3:
+                break
+        return selected
 
     def execute_trajectory(self, phase, plan, world):
         self.check_cancel()

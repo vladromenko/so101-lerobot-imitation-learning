@@ -1,6 +1,7 @@
 """Calibrated overview rays and explicit upright-cube top-face fitting."""
 import hashlib
 import json
+import time
 from pathlib import Path
 import cv2
 import numpy as np
@@ -20,6 +21,7 @@ class Geometry:
         self.camera_from_base = np.asarray(self.calibration['camera_from_robot'], float)
         self.table_z = float(self.calibration['table_z_m'])
         self.wrist = None
+        self.attachment_projection_cache = None
         reference = Path(native_root)/'config/grasp_tcp_calibration.json'
         self.known_cube = json.loads(reference.read_text()) if reference.exists() else None
         if self.known_cube is not None and (not self.known_cube.get('validated') or not .015 < self.known_cube.get('cube_size_m',0.) < .065):
@@ -263,6 +265,179 @@ class Geometry:
     @staticmethod
     def object_pose_to_tool_pose(object_pose, held_transform):
         return np.asarray(object_pose) @ np.linalg.inv(held_transform)
+
+    def measure_visible_attachment(self, frame, robot, hypothesis, *, now=None):
+        """Use the calibrated fixed camera without moving or certifying a hidden gap."""
+        from .vision import visible_attachment_features
+        from so101_pick_place.vision.calibration_control import validate_overview_control
+        if frame.camera_id!='overview' or frame.joints is None or frame.gripper is None:
+            raise ValueError('attachment measurement requires exposure-paired encoder feedback')
+        age=(time.time() if now is None else now)-frame.capture_interval[0]
+        if not 0.<=age<=.5:
+            raise ValueError('attachment measurement frame is stale')
+        if frame.motion_during_exposure_rad is None or frame.motion_during_exposure_rad>.002:
+            raise ValueError('attachment exposure was not stationary')
+        q = robot.to_native(frame.joints,frame.gripper)
+        frames = robot.backend.model.frames(q)
+        part = next((p for p in hypothesis['parts'] if p['name']=='wrist_camera_board_lens'),None)
+        if part is None:
+            raise ValueError('archived camera-board geometry is unavailable')
+        lo,hi = np.asarray(part['lower_m']),np.asarray(part['upper_m'])
+        corners = np.array([[x,y,z] for x in (lo[0],hi[0]) for y in (lo[1],hi[1]) for z in (lo[2],hi[2])])
+        transform = frames[part['parent_link']]
+        points = corners@transform[:3,:3].T+transform[:3,3]
+        projected = self.project(points)
+        visible = visible_attachment_features(frame,projected)
+        mask = visible.pop('board_mask')
+        key=(tuple(q.items()),mask.shape,self.fingerprint,tuple(lo),tuple(hi),part['parent_link'],tuple(robot.backend.model.offsets))
+        cached=self.attachment_projection_cache
+        if cached is None or cached[0]!=key:
+            arm = np.zeros(mask.shape,np.uint8)
+            from so101_pick_place.experiments.box_extraction.mesh_collision import load_collision_meshes
+            meshes = load_collision_meshes(str(robot.root/'vendor/SO101/so101_new_calib.urdf'))
+            minimum_depth = float('inf')
+            for link in ('upper_arm_link','lower_arm_link','wrist_link'):
+                mesh = np.vstack([p.triangles.reshape(-1,3) for p in meshes[link]])
+                vertices = mesh@frames[link][:3,:3].T+frames[link][:3,3]
+                minimum_depth=min(minimum_depth,float((vertices@self.camera_from_base[:3,:3].T+self.camera_from_base[:3,3])[:,2].min()))
+                cv2.fillConvexPoly(arm,cv2.convexHull(np.int32(self.project(vertices))),255)
+            distance = cv2.distanceTransform(255-arm,cv2.DIST_L2,cv2.DIST_MASK_PRECISE)
+            self.attachment_projection_cache=key,arm,distance,minimum_depth
+        else:
+            _,arm,distance,minimum_depth=cached
+        gap = float(distance[mask>0].min()) if np.any(mask) else None
+        predicted = np.zeros(mask.shape,np.uint8)
+        cv2.fillConvexPoly(predicted,cv2.convexHull(np.int32(projected)),255)
+        overlap = np.column_stack(np.where((predicted>0)&(arm>0)))[:,::-1]
+        unresolved = projected if not len(overlap) else overlap
+        region = np.r_[unresolved.min(0),unresolved.max(0)].astype(int).tolist()
+        if visible['board_hull_px'] is not None:
+            outline=np.asarray(visible['board_hull_px'])
+            region=np.r_[outline.min(0),outline.max(0)].astype(int).tolist()
+        try:
+            control = validate_overview_control(frame.image,self.calibration,robot.backend.model,q)
+        except ValueError as exc:
+            control = {'passed':False,'reason':str(exc),'parameters_changed':False}
+        visible_bound = None
+        if gap is not None and control['passed'] and np.allclose(self.distortion,0.) and minimum_depth>0:
+            pixels=np.column_stack(np.where(mask>0))[:,::-1]
+            h,w=mask.shape
+            edge=float(min(pixels[:,0].min(),pixels[:,1].min(),w-1-pixels[:,0].max(),h-1-pixels[:,1].max()))
+            padding=control['error_px']+3*self.calibration['reprojection_rmse_px']+1.
+            sensor=np.array([[0.,0.],[w,0.],[w,h],[0.,h]])
+            radius=np.max(np.linalg.norm((sensor-self.intrinsic[:2,2])/self.intrinsic[[0,1],[0,1]],axis=1))
+            angle=max(0.,min(gap,edge)-padding)/(max(self.intrinsic[0,0],self.intrinsic[1,1])*(1+radius**2))
+            visible_bound={'lower_bound_m':float(minimum_depth*np.sin(angle)),
+                'image_uncertainty_padding_px':float(padding),
+                'method':'calibrated-ray angular separation from complete triangle projections of the compared links',
+                'arm_links_compared':['upper_arm_link','lower_arm_link','wrist_link'],
+                'scope':'visible coloured board surface versus the listed links at current stationary pose only; hidden surfaces, other objects and cable are excluded'}
+        optical = points@self.camera_from_base[:3,:3].T+self.camera_from_base[:3,3]
+        depth = [float(optical[:,2].min()-.003),float(optical[:,2].max()+.003)]
+        bounds = None
+        if visible['board_hull_px'] is not None:
+            pixels = np.asarray(visible['board_hull_px'],float)
+            rays = cv2.undistortPoints(pixels.reshape(-1,1,2),self.intrinsic,self.distortion).reshape(-1,2)
+            pose = np.linalg.inv(self.camera_from_base)
+            cloud = np.vstack([np.column_stack((rays,np.ones(len(rays))))*z for z in depth])
+            cloud = cloud@pose[:3,:3].T+pose[:3,3]
+            bounds = {'lower_m':cloud.min(0).tolist(),'upper_m':cloud.max(0).tolist(),
+                'condition':'depth bracket from archived CAD placement; not independently measured depth'}
+        return visible|{'frame_id':frame.frame_id,'capture_interval':list(frame.capture_interval),
+            'feedback_error_s':frame.feedback_error_s,'joints_rad':frame.joints.tolist(),
+            'gripper_native':float(frame.gripper),
+            'overview_fk_control':control,'tool_pose_base_m':frames['gripper_frame_link'].tolist(),
+            'tool_pose_camera_m':(self.camera_from_base@frames['gripper_frame_link']).tolist(),
+            'board_bounds_base_conditional':bounds,'depth_bracket_cad_only_m':depth,
+            'board_to_arm_projected_gap_px':gap,'physical_gap_m':None,
+            'visible_surface_clearance_bound':visible_bound,
+            'pnp_status':'not identifiable: image features have no independently known 3D landmark correspondences',
+            'metric_depth_observable':False,'independent_view_count':1,
+            'image_region_is_visible_reference_only':True,
+            'unresolved_region_px':region,'unresolved_part':'rear/underside of camera PCB and USB cable exit facing forearm; wrist camera cannot see its own rear',
+            'needed_measurement':'minimum physical clearance of that hidden assembly to the arm over the initial wrist segment, including the tracking-error envelope',
+            'motion_authorized':False,'calibration_changed':False,'cable_3d_pose_inferred':False}
+
+    def rigid_pose_from_landmarks(self, points_m, pixels, frame, robot, landmark_sigma_m):
+        """PnP for corresponding physical landmarks, not a segmentation bounding box."""
+        points,pixels = np.asarray(points_m,float),np.asarray(pixels,float)
+        if points.ndim!=2 or points.shape[1]!=3 or len(points)<4 or pixels.shape!=(len(points),2):
+            raise ValueError('four or more paired metric physical landmarks are required')
+        if not np.isfinite(points).all() or not np.isfinite(pixels).all() or landmark_sigma_m<=0:
+            raise ValueError('finite landmarks and their measured uncertainty are required')
+        if np.linalg.matrix_rank(points-points.mean(0))<2 or len(np.unique(points,axis=0))!=len(points):
+            raise ValueError('landmarks are repeated or collinear')
+        projection = self.projection_for_frame(frame,robot)
+        k,d = np.asarray(projection['camera_matrix']),np.asarray(projection['distortion'])
+        solutions = cv2.solvePnPGeneric(points,pixels,k,d,flags=cv2.SOLVEPNP_SQPNP)
+        accepted = []
+        for rotation,translation in zip(solutions[1],solutions[2]):
+            matrix,_ = cv2.Rodrigues(rotation)
+            projected,jacobian = cv2.projectPoints(points,rotation,translation,k,d)
+            errors = np.linalg.norm(projected.reshape(-1,2)-pixels,axis=1)
+            if np.min((points@matrix.T+translation.ravel())[:,2])>.025 and errors.max()<=5.:
+                accepted.append((float(np.sqrt(np.mean(errors**2))),matrix,translation.ravel(),jacobian[:,:6]))
+        accepted.sort(key=lambda item:item[0])
+        if not accepted or accepted[0][0]>2.5:
+            raise ValueError('physical landmarks do not support a cheiral PnP pose')
+        if len(accepted)>1 and accepted[1][0]-accepted[0][0]<1.:
+            raise ValueError('PnP pose remains ambiguous; another checked view is required')
+        error,rotation,translation,jacobian = accepted[0]
+        if np.linalg.matrix_rank(jacobian)<6:
+            raise ValueError('PnP pose is not observable')
+        covariance = np.linalg.inv(jacobian.T@jacobian)*max(1.,error**2)
+        diameter = float(np.linalg.norm(np.ptp(points,axis=0)))
+        scale_error = landmark_sigma_m*np.linalg.norm(translation)/max(diameter,1e-6)
+        base_from_camera=np.linalg.inv(np.asarray(projection['camera_from_robot']))
+        translation_covariance=base_from_camera[:3,:3]@(covariance[3:6,3:6]+np.eye(3)*scale_error**2)@base_from_camera[:3,:3].T
+        sigma = np.sqrt(np.diag(translation_covariance))
+        camera_from_object = np.eye(4);camera_from_object[:3,:3]=rotation;camera_from_object[:3,3]=translation
+        return {'base_from_object':(base_from_camera@camera_from_object).tolist(),
+            'translation_sigma_m':sigma.tolist(),'reprojection_rmse_px':error,'frame_id':frame.frame_id,
+            'method':'metric physical-landmark PnP','calibration_changed':False}
+
+    def reconstruct_feature_cloud(self, observations, robot):
+        """Native descriptor correspondence + independent metric rays, with covariance."""
+        from so101_pick_place.vision.wrist_feature_calibration import feature_tracks
+        from so101_pick_place.experiments.box_extraction.perception import triangulate_track
+        if len(observations)<3 or len({item['frame'].frame_id for item in observations})!=len(observations):
+            raise ValueError('three distinct physical observations are required')
+        now=time.time()
+        if any(not 0.<=now-item['frame'].timestamp<=60. for item in observations) or now-max(item['frame'].timestamp for item in observations)>.5:
+            raise ValueError('feature reconstruction requires a current exposure and a bounded observation history')
+        projections = [self.projection_for_frame(item['frame'],robot) for item in observations]
+        origins=np.asarray([np.linalg.inv(np.asarray(p['camera_from_robot']))[:3,3] for p in projections])
+        if np.max(np.linalg.norm(origins[:,None]-origins[None,:],axis=2))<.025:
+            raise ValueError('repeated fixed-camera images provide no metric depth parallax')
+        tracks = feature_tracks([item['frame'].image for item in observations],[item['mask'] for item in observations])
+        cloud,rejected = [],[]
+        for track in tracks:
+            try:
+                point = triangulate_track(track['measurements'],projections)
+                rows = []
+                for measurement in track['measurements']:
+                    p = projections[measurement['view']]
+                    rows.extend(self.point_image_jacobian(point,p).tolist())
+                matrix = np.asarray(rows)
+                noise = max(1.,max(p.get('reprojection_rmse_px',0.) for p in projections))
+                covariance = np.linalg.inv(matrix.T@matrix)*noise**2
+                cloud.append({'point_m':point.tolist(),'sigma_m':np.sqrt(np.diag(covariance)).tolist(),
+                    'measurements':track['measurements']})
+            except (ValueError,np.linalg.LinAlgError) as exc:
+                rejected.append(str(exc))
+        if len(cloud)<12:
+            raise ValueError('fewer than twelve independently reconstructed features: '+str(rejected[:2]))
+        return {'points':cloud,'rejected_tracks':len(rejected),'metric_depth_measured':True,
+            'frame_ids':[item['frame'].frame_id for item in observations]}
+
+    @staticmethod
+    def point_image_jacobian(point, projection):
+        camera = np.asarray(projection['camera_from_robot']);rotation,_=cv2.Rodrigues(camera[:3,:3])
+        k,d=np.asarray(projection['camera_matrix']),np.asarray(projection['distortion'])
+        def project(p):
+            return cv2.projectPoints(np.asarray(p)[None],rotation,camera[:3,3],k,d)[0].ravel()
+        step=1e-5
+        return np.column_stack([(project(point+axis*step)-project(point-axis*step))/(2*step) for axis in np.eye(3)])
 
 
 class AttachmentGeometry:

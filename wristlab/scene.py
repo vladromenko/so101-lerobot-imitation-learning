@@ -25,6 +25,8 @@ class Scene:
         self.metric_boxes = {}
         self.measured_surfaces = []
         self.boxes_semantically_seeded = False
+        self.attachment_hypothesis = None
+        self.passive_measurements = None
 
     def install_box_proposals(self, scan):
         """One native semantic fallback at startup; track its actual source image."""
@@ -185,6 +187,11 @@ class Scene:
             {'boxes_at':boxes_at,'coverage_verified':bool(self.metric_boxes) and len(boxes)==len(self.metric_boxes) and all(o.evidence.get('metric_qualified') for o in objects) and not rejected,'metric_camera':'overview','wrist_metric_qualified':False})
         self.raw = {'overview':detected,'wrist':wrist_detections}
         self.frames = dict(frames)
+        if self.robot is not None and self.attachment_hypothesis is not None:
+            try:
+                self.passive_measurements = self.geometry.measure_visible_attachment(frame,self.robot,self.attachment_hypothesis)
+            except ValueError as exc:
+                self.passive_measurements = {'frame_id':frame.frame_id,'motion_authorized':False,'reason':str(exc)}
         return self.state
 
     def reserve_object(self, object_id):
@@ -330,7 +337,7 @@ class Scene:
     def install_metric_survey(self, surveys):
         """Accept actual native WristSurveyBuilder results; no nominal substitutes."""
         from scipy.optimize import linear_sum_assignment
-        measured_objects = {}
+        measured_objects = dict(self.metric_objects)
         for box_id,native in surveys.items():
             native.require_complete()
             box = self.state.boxes[box_id]
@@ -348,6 +355,24 @@ class Scene:
                 measured_objects.update({current[i].id:cubes[j] for i,j in zip(rows,columns)})
             self.measured_surfaces = [{'id':'table','height_m':native.placement.height_m,'patch':native.placement,'free_surface_verified':True}]
         self.metric_objects = measured_objects
+
+    def install_measured_views(self, box_id, observations):
+        """Reconstruct real floor/rim/wall tracks using the existing native builder."""
+        from so101_pick_place.experiments.box_extraction.survey import WristSurveyBuilder,WristView
+        views=[]
+        for item in observations:
+            frame=item['frame']
+            if frame.joints is None or frame.gripper is None or frame.motion_during_exposure_rad is None or frame.motion_during_exposure_rad>.002:
+                raise ValueError('box observations require stationary exposure-paired feedback')
+            masks=[item[name] for name in ('box','opening','floor','free_table')]
+            if any(np.asarray(mask).shape!=frame.image.shape[:2] for mask in masks):
+                raise ValueError('box masks do not belong to their physical image')
+            projection=self.geometry.projection_for_frame(frame,self.robot)
+            views.append(WristView(frame.image,projection,frame.timestamp,self.robot.to_native(frame.joints,frame.gripper),
+                tuple(item.get('cubes',())),*masks,tuple(item.get('unknown',())),frame.received_at))
+        measured = WristSurveyBuilder().build(views)
+        self.install_metric_survey({box_id:measured})
+        return measured
 
 
 class StackSupport:

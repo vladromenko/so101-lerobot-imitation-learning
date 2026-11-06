@@ -31,6 +31,9 @@ class Runtime:
         self.cameras = Cameras(self.config['api'],self.config['frame_max_age_s'],self.config.get('camera_controls'))
         self.robot = Robot(self.config['native_root'],self.output/'controller')
         self.scene = Scene(self.geometry,self.robot)
+        attachment_path = self.root/self.config['attachment_file']
+        if attachment_path.exists():
+            self.scene.attachment_hypothesis = json.loads(attachment_path.read_text())
         self.stop_event,self.pause_event = threading.Event(),threading.Event()
         self.commands = queue.Queue(maxsize=1)
         self.submit_lock = threading.Lock()
@@ -69,6 +72,17 @@ class Runtime:
         self.native_stop_ack = None
         self.native_stop_seen = None
         self.camera_error = None
+        self.action_measurements = deque(maxlen=80)
+        journal=self.output/'action-measurements.jsonl'
+        if journal.exists():
+            with journal.open() as handle:
+                for line in handle:
+                    try:
+                        record=json.loads(line)
+                        if record.get('calibration_sha256')==self.geometry.fingerprint:
+                            self.action_measurements.append(record)
+                    except ValueError:
+                        pass
         self.hardware_error = None
         try:
             self.known_working_configuration = json.loads((self.output/'model-audit.json').read_text()).get('known_working_configuration')
@@ -296,6 +310,73 @@ class Runtime:
         self.selected = objects[0].id
         return {'object_id':self.selected,'color':objects[0].color,'frame_id':frame_id}
 
+    def refine_object(self, object_id, plan, world):
+        """Bounded active perception inside a previously checked working scene."""
+        from dataclasses import replace
+        from so101_pick_place.experiments.box_extraction.planner import Phase
+        self.check_cancel()
+        if self.scene.held is not None or not self.robot.audit_state(self.robot.read_state())['planning_valid']:
+            raise ValueError('active perception is allowed only with an empty jaw in the verified working area')
+        obj = self.scene.state.objects[object_id]
+        point = obj.pose[:3,3]+[0.,0.,obj.dimensions[2]/2]
+        current = self.robot.read_state()['positions']
+        candidates = self.motion.informative_views(plan,world,self.geometry,point,current,float(np.linalg.norm(obj.dimensions)/2))
+        attempted = []
+        for goal in candidates[:3]:
+            self.check_cancel();self.refresh()
+            if not self.scene.state.evidence.get('coverage_verified'):
+                raise ValueError('scene coverage changed; an unobserved region is not assumed empty')
+            for key,cube in world.scene.cubes.items():
+                observed = self.scene.state.objects.get(key)
+                if observed is None or not observed.evidence.get('metric_qualified'):
+                    raise ValueError('active-view path lost its measured obstacle map')
+                sigma = max(observed.evidence.get('position_sigma_m',[.003]*3))
+                if np.linalg.norm(observed.pose[:3,3]-cube.center_m)>3*sigma:
+                    raise ValueError('workspace changed before active observation')
+            current = self.robot.read_state()['positions']
+            self.report('observing','информативный ракурс из проверенного подхода')
+            path,_ = self.motion.planner.transport(current,dict(goal,gripper=current['gripper']),world,target=object_id)
+            phase = Phase('observe',path)
+            self.motion.check_path(replace(plan,phases=(phase,)),world)
+            self.motion.execute_trajectory(phase,plan,world)
+            after_motion = time.time()
+            before = self.robot.read_state();self.cameras.record_state(before['timestamp'],before['q'],before['gripper'])
+            for camera in ('overview','wrist'):
+                self.cameras.wait_for_frame(camera,after_motion,self.check_cancel)
+            after = self.robot.read_state();self.cameras.record_state(after['timestamp'],after['q'],after['gripper'])
+            self.refresh()
+            measured = self.scene.state.objects[object_id]
+            attempted.append({'q_rad':after['q'].tolist(),'frame_id':self.cameras.get_latest_frame('wrist').frame_id})
+            self.metrics['active_observations'] = attempted
+            if measured.evidence.get('metric_qualified') and max(measured.evidence['position_sigma_m'])<=.003:
+                return measured
+        raise ValueError('three checked observations did not reach grasp accuracy; holding without blind retry')
+
+    def record_action_measurement(self, event, object_id, values):
+        """Observe residuals; never apply an automatic offset or change servo limits."""
+        state = self.robot.read_state()
+        record = {'event':event,'object_id':object_id,'timestamp':time.time(),'q_rad':state['q'].tolist(),
+            'gripper_native':state['gripper'],'calibration_sha256':self.geometry.fingerprint,
+            'scene_version':self.scene.state.version,'values':values}
+        self.action_measurements.append(record)
+        try:
+            with (self.output/'action-measurements.jsonl').open('a') as handle:
+                handle.write(json.dumps(record,ensure_ascii=False)+'\n')
+        except OSError as exc:
+            self.metrics['measurement_log_error'] = str(exc)
+        independent = []
+        for item in self.action_measurements:
+            if item['event']=='placement' and not any(item['object_id']==old['object_id'] and np.max(np.abs(np.subtract(item['q_rad'],old['q_rad'])))<np.deg2rad(5.) for old in independent):
+                independent.append(item)
+        if independent:
+            errors = np.asarray([item['values']['error_m'] for item in independent])
+            median = np.median(errors,axis=0);spread=1.4826*np.median(np.abs(errors-median),axis=0)
+            sigma = max(max(item['values']['position_sigma_m']) for item in independent)
+            significant = len(independent)>=5 and bool(np.any(np.abs(median)>2*np.maximum(spread/np.sqrt(len(independent)),sigma)))
+            self.metrics['placement_residuals'] = {'independent_samples':len(independent),'median_error_m':median.tolist(),
+                'robust_spread_m':spread.tolist(),'systematic_bias_candidate':significant,
+                'parameters_changed':False,'hardware_limits_changed':False}
+
     def execute(self, payload):
         try:
             self.check_cancel()
@@ -391,6 +472,12 @@ class Runtime:
                 'missing_measurement':'Минимальный зазор камеры/крепления/кабеля до руки на начальном участке выхода из текущей позы с учётом отставания приводов; wrist_flex сейчас 62,59°, в последнем записанном camera-aware старте было 15,38°',
                 'required_action':'Калибровка руки сохранена. Восстановлен MountedTaskArm.prepare_ready; его вход из сегодняшней позы требует проверки зазора на дополнительном начальном участке. Слепой native-unfold включать нельзя.',
                 'recheck':'Свежие энкодеры и штатная проверка всего пути; сброс STOP сам по себе движение не разрешает.'}
+            observation=getattr(self.scene,'passive_measurements',None)
+            if observation and observation.get('unresolved_part'):
+                physical_blocker['unobserved_part']=observation['unresolved_part']
+                physical_blocker['image_region_px']=observation['unresolved_region_px']
+                physical_blocker['missing_measurement']=observation['needed_measurement']
+                physical_blocker['visible_surface_bound']=observation.get('visible_surface_clearance_bound')
         return {'running':self.running,'mode':self.mode,'dry':None,'started':self.started,'finished':self.finished,
             'phase':self.phase,'state':state,'blocking_conditions':conditions,
             'project_detail':self.detail,'project_state':state,'detail':self.detail,

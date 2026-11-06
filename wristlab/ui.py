@@ -41,6 +41,7 @@ def diagnostics():
     import json
     path = root/'runtime/escape-proposal.json'
     return {'current':None if runtime.robot.last_state is None else runtime.robot.audit_state(runtime.robot.last_state),
+            'visual_measurements':runtime.scene.passive_measurements,
             'escape_proposal':None if not path.exists() else json.loads(path.read_text()),
             'robot_motion_commanded':runtime.robot.first_command_at is not None}
 
