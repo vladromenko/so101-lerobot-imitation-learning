@@ -1,6 +1,7 @@
 """Observed identities and reservations. Unmeasured geometry stays unqualified."""
 from dataclasses import replace
 import time
+import threading
 import cv2
 import numpy as np
 from scipy.optimize import linear_sum_assignment
@@ -11,6 +12,7 @@ from .vision import detect_cubes, detect_boxes
 
 class Scene:
     def __init__(self, geometry, robot=None):
+        self.lock = threading.RLock()
         self.geometry, self.robot = geometry, robot
         self.state = SceneState()
         self.next_id = 1
@@ -84,7 +86,7 @@ class Scene:
                                  line_tracking_inliers=int(inliers.sum())))
         return proposed
 
-    def update_scene(self, frames):
+    def update_scene(self, frames, measure_attachment=True):
         frame = frames['overview']
         detected = detect_cubes(frame)
         wrist_detections = detect_cubes(frames['wrist'])
@@ -116,7 +118,10 @@ class Scene:
                 top = cube.vertices_m[np.argsort(cube.vertices_m[:,2])[-4:]]
                 cv2.fillConvexPoly(expected,cv2.convexHull(np.int32(self.geometry.project(top))),1)
                 overlap = np.count_nonzero((expected>0)&(obj.mask>0))/max(1,np.count_nonzero((expected>0)|(obj.mask>0)))
-                if overlap > .85:
+                contained = np.count_nonzero((expected>0)&(obj.mask>0))/max(1,np.count_nonzero(obj.mask))
+                centered = np.linalg.norm(self.geometry.project(top).mean(0)-np.mean(obj.evidence['quad'],axis=0))<3.
+                known_silhouette = getattr(self.geometry,'grasp_mode',None)=='overhead_grasp' and contained>.95 and centered
+                if overlap > .85 or known_silhouette:
                     obj.id = key
                     obj.pose[:3,:3],obj.pose[:3,3] = cube.rotation,cube.center_m
                     obj.dimensions = np.full(3,cube.side_m)
@@ -138,6 +143,41 @@ class Scene:
                 self.next_id += 1
             if obj.id in self.reserved:
                 obj.status = 'reserved'
+        seen_overview = {obj.id for obj in objects}
+        if self.held is not None and self.robot is not None:
+            held_id,transform = self.held
+            previous = self.state.objects.get(held_id)
+            if previous is not None:
+                measured = next((obj for obj in objects if obj.id==held_id),previous)
+                pose = self.robot.backend.model.frames(self.robot.last_state['positions'])['gripper_frame_link']@transform
+                objects = [obj for obj in objects if obj.id!=held_id]
+                objects.append(replace(measured,pose=pose,status='held',evidence={**measured.evidence,
+                    'spatial_timestamp':self.robot.last_state['timestamp'],'pose_source':'force-confirmed attachment and encoders'}))
+        if self.robot is not None and self.metric_objects:
+            from box_extract.scene_builder import robot_mask
+            occluder = robot_mask(self.robot.backend,self.robot.last_state['positions'],self.geometry.calibration,frame.image.shape[:2])
+            visible = {o.id for o in objects}
+            for previous in self.state.objects.values():
+                if previous.id not in visible and previous.id in self.metric_objects and previous.status!='held':
+                    covered = np.count_nonzero((previous.mask>0)&(occluder>0))/max(1,np.count_nonzero(previous.mask))
+                    if covered>.5:
+                        measured = self.metric_objects[previous.id]
+                        pose = previous.pose.copy();pose[:3,:3] = measured.rotation;pose[:3,3] = measured.center_m
+                        objects.append(replace(previous,status='occluded',pose=pose,dimensions=np.full(3,measured.side_m),
+                            evidence={**previous.evidence,**measured.evidence,'metric_qualified':True,
+                                      'current_visibility':'robot occlusion; retained metric observation'}))
+        for obj in objects:
+            matches = [d for d in wrist_detections if d['color']==obj.color]
+            unique = len(matches)==1 and sum(o.color==obj.color for o in objects)==1
+            obj.evidence['visible_overview'] = obj.id in seen_overview
+            obj.evidence['visible_wrist'] = unique
+            if obj.status!='held':
+                obj.evidence['spatial_timestamp'] = frame.timestamp if obj.id in seen_overview else obj.evidence.get('spatial_timestamp',obj.timestamp)
+            if unique:
+                detection = matches[0]
+                obj.evidence['wrist_observation'] = {'frame_id':frames['wrist'].frame_id,'timestamp':frames['wrist'].timestamp,
+                    'center_px':detection['center_px'],'quad':np.asarray(detection['quad']).tolist(),
+                    'spatial_update':False,'association':'unique known cube color; image tracking only'}
         from so101_pick_place.geometry.cuboid_vision import cube_vertices
         for obj in objects:
             if obj.evidence.get('metric_qualified') and obj.status!='held':
@@ -149,6 +189,7 @@ class Scene:
         # Reuse box edges between periodic background measurements.
         if frame.timestamp != self.state.timestamp:
             proposals = self.track_box_edges(frame)
+            retained_boxes = proposals is None and self.boxes_semantically_seeded
             if proposals is None:
                 proposals = [] if self.boxes_semantically_seeded else detect_boxes(frame)
             if self.robot is not None and self.robot.last_state is not None:
@@ -162,7 +203,7 @@ class Scene:
                     if overlap < .05:
                         retained.append(proposal)
                 proposals = retained
-            boxes = {}
+            boxes = {key:replace(box,evidence={**box.evidence,'visibility':'untracked'}) for key,box in self.state.boxes.items()} if retained_boxes else {}
             for i, proposal in enumerate(proposals):
                 center = self.geometry.intersect_ray_with_plane(self.geometry.pixel_ray_in_base(proposal['center_px'], frame), ([0,0,1],-self.geometry.table_z))
                 pose = np.eye(4);pose[:3,3] = center
@@ -175,8 +216,9 @@ class Scene:
                         box.pose = measured.pose.copy()
                         box.inner_dimensions = measured.inner_dimensions.copy()
                         box.wall_height = measured.wall_height
+                box.evidence.update(visibility='observed',last_observed_at=frame.timestamp,frame_id=frame.frame_id)
                 boxes[box.id] = box
-            boxes_at = frame.timestamp
+            boxes_at = self.state.evidence.get('boxes_at',0.) if retained_boxes else frame.timestamp
         else:
             boxes, boxes_at = self.state.boxes, self.state.evidence['boxes_at']
         for box in boxes.values():
@@ -187,7 +229,9 @@ class Scene:
             {'boxes_at':boxes_at,'coverage_verified':bool(self.metric_boxes) and len(boxes)==len(self.metric_boxes) and all(o.evidence.get('metric_qualified') for o in objects) and not rejected,'metric_camera':'overview','wrist_metric_qualified':False})
         self.raw = {'overview':detected,'wrist':wrist_detections}
         self.frames = dict(frames)
-        if self.robot is not None and self.attachment_hypothesis is not None:
+        self.state.evidence.update(processed_at=time.time(),overview_frame_id=frame.frame_id,
+            wrist_frame_id=frames['wrist'].frame_id,overview_captured_at=frame.timestamp,wrist_captured_at=frames['wrist'].timestamp)
+        if measure_attachment and self.robot is not None and self.attachment_hypothesis is not None:
             try:
                 self.passive_measurements = self.geometry.measure_visible_attachment(frame,self.robot,self.attachment_hypothesis)
             except ValueError as exc:
@@ -195,6 +239,10 @@ class Scene:
         return self.state
 
     def reserve_object(self, object_id):
+        with self.lock:
+            return self._reserve_object(object_id)
+
+    def _reserve_object(self, object_id):
         if object_id in self.reserved or self.held is not None:
             raise ValueError('object is reserved or gripper already holds a payload')
         obj = self.state.objects[object_id]
@@ -208,11 +256,13 @@ class Scene:
         self.reserved_slots = {s for s in self.reserved_slots if s[0] != object_id}
 
     def attach_object(self, object_id, transform):
-        self.held = (object_id,np.asarray(transform))
-        self.state.objects[object_id].status = 'held'
+        with self.lock:
+            self.held = (object_id,np.asarray(transform))
+            self.state.objects[object_id].status = 'held'
 
     def detach_object(self, object_id, observed_pose):
-        self.state.objects[object_id].pose = np.asarray(observed_pose)
+        with self.lock:
+            self.state.objects[object_id].pose = np.asarray(observed_pose)
         self.state.objects[object_id].status = 'observed'
         self.held = None
         self.pending_placement = None
@@ -222,12 +272,30 @@ class Scene:
         box = self.state.boxes[box_id]
         if not box.evidence.get('metric_qualified'):
             raise ValueError('box opening, floor and wall height have no qualified metric survey')
+        observed = box.evidence.get('last_observed_at',box.evidence.get('source_timestamp',0.))
+        if time.time()-observed>1.:
+            raise ValueError('target box is not freshly observed; retained geometry is obstacle-only')
         from box_extract.stow import box_floor_patches
         from box_extract.scene_builder import SceneParameters
         from types import SimpleNamespace
         cubes = {key:self.native_object(key) for key in self.state.objects if self.held is None or key!=self.held[0]}
         native = SimpleNamespace(box=box.evidence['native_box'],cubes=cubes)
-        return box_floor_patches(native,SceneParameters())
+        patches = box_floor_patches(native,SceneParameters())
+        # Preserve the proven wall/finger keepouts. Size the support footprint
+        # for this measured cube instead of the old fixed 90 mm placeholder.
+        half = float(np.linalg.norm(np.asarray(object_shape)[:2])/2+.008)
+        resized = [replace(p,polygon_xy_m=np.mean(p.polygon_xy_m,axis=0)+
+                           np.array([[-1,-1],[1,-1],[1,1],[-1,1]])*half) for p in patches]
+        # Include the geometric midpoint of neighbouring free patches. The
+        # legacy 57 mm packing pitch need not be a placement restriction for
+        # one smaller cube. Only empty boxes use these additional candidates.
+        if not box.occupied_slots:
+            centers = sorted([np.mean(p.polygon_xy_m,axis=0) for p in resized],key=lambda p:p[0])
+            for a,b in zip(centers,centers[1:]):
+                center = (a+b)/2
+                resized.append(replace(resized[0],polygon_xy_m=center+
+                    np.array([[-1,-1],[1,-1],[1,1],[-1,1]])*half))
+        return resized
 
     def find_free_table_slots(self, object_shape):
         from box_extract.stow import CUBE_KEEPOUT_LONG_M,CUBE_KEEPOUT_SHORT_M
@@ -272,13 +340,32 @@ class Scene:
             'cubes':[{'id':o.id,'color':o.color,'px':np.mean(o.evidence['quad'],axis=0).tolist(),'xy_m':o.pose[:2,3].tolist(),
                       'dimensions_m':o.dimensions.tolist(),'confidence':o.confidence,'polygon':[o.evidence['quad']],
                       'inside':any(o.id in b.occupied_slots for b in self.state.boxes.values()),'status':o.status,
-                      'metric_qualified':o.evidence['metric_qualified']} for o in self.state.objects.values()],
-            'boxes':[{'id':b.id,'polygon':b.evidence['polygon'],'occupied':b.occupied_slots,'metric_qualified':b.evidence['metric_qualified']} for b in self.state.boxes.values()],
+                      'metric_qualified':o.evidence['metric_qualified'],'last_observed_at':o.timestamp,
+                      'observation_age_s':max(0.,time.time()-o.timestamp),
+                      'spatial_age_s':max(0.,time.time()-o.evidence.get('spatial_timestamp',o.timestamp)),
+                      'source_frame_id':o.evidence.get('frame_id'),
+                      'last_wrist_observed_at':o.evidence.get('wrist_observation',{}).get('timestamp'),
+                      'spatial_status':'retained' if o.status=='occluded' else 'attached' if o.status=='held' else 'measured' if o.evidence.get('metric_qualified') else 'unqualified',
+                      'visible_overview':o.evidence.get('visible_overview',False),'visible_wrist':o.evidence.get('visible_wrist',False)} for o in self.state.objects.values()],
+            'wrist_objects':[{'id':o.id,'color':o.color,'polygon':[o.evidence['wrist_observation']['quad']],
+                'px':o.evidence['wrist_observation']['center_px'],
+                'frame_id':o.evidence['wrist_observation']['frame_id'],'spatial_update':False} for o in self.state.objects.values()
+                if o.evidence.get('visible_wrist')],
+            'visible_overview_count':sum(o.evidence.get('visible_overview',False) for o in self.state.objects.values()),
+            'visible_wrist_count':sum(o.evidence.get('visible_wrist',False) for o in self.state.objects.values()),
+            'occluded_count':sum(o.status=='occluded' for o in self.state.objects.values()),
+            'boxes':[{'id':b.id,'polygon':b.evidence['polygon'],'occupied':b.occupied_slots,'metric_qualified':b.evidence['metric_qualified'],
+                'visibility':b.evidence.get('visibility','observed'),'last_observed_at':b.evidence.get('last_observed_at',b.evidence.get('source_timestamp')),
+                'source_frame_id':b.evidence.get('frame_id')} for b in self.state.boxes.values()],
             'inside':sum(any(o.id in b.occupied_slots for b in self.state.boxes.values()) for o in self.state.objects.values()),
             'outside':sum(not any(o.id in b.occupied_slots for b in self.state.boxes.values()) for o in self.state.objects.values()),
             'opening':None,'time':time.time(),'evidence':self.state.evidence,'rejected':self.state.obstacles}
 
     def native_scene(self, object_id, placement):
+        with self.lock:
+            return self._native_scene(object_id,placement)
+
+    def _native_scene(self, object_id, placement):
         """Translate a qualified survey into the existing hollow-wall world."""
         from so101_pick_place.experiments.box_extraction.scene import ExtractionScene
         surface = next((s for s in self.state.surfaces if s['id']==placement.support_surface),None)
@@ -308,7 +395,7 @@ class Scene:
             primary = qualified[0].evidence['native_box']
         else:
             raise ValueError('placement has no surveyed support surface')
-        if any(not b.evidence.get('metric_qualified') for b in self.state.boxes.values()):
+        if any(not (b.evidence.get('metric_qualified') or b.evidence.get('collision_qualified')) for b in self.state.boxes.values()):
             raise ValueError('an unmeasured second box remains in the workspace')
         if not self.state.evidence.get('coverage_verified'):
             raise ValueError('workspace coverage and unknown obstacles are not qualified')
@@ -318,7 +405,7 @@ class Scene:
             raise ValueError('requested placement disagrees with measured support height')
         if placement.support_object_id is None:
             from so101_pick_place.experiments.box_extraction.scene import SupportPatch
-            half = obj.dimensions[:2]/2+.007
+            half = np.full(2,np.linalg.norm(obj.dimensions[:2])/2+.007)
             polygon = placement.object_pose[:2,3]+np.array([[-1,-1],[1,-1],[1,1],[-1,1]])*half
             test = np.column_stack((polygon,np.full(4,patch.height_m)))
             if not patch.contains(test,margin_m=0.):
@@ -397,15 +484,39 @@ class StackSupport:
         return bool(np.all(center@hull.equations[:,:2].T+hull.equations[:,2] <= -radius))
 
 
+class BoxKeepout:
+    """A non-enterable bound for a box whose opening was not repeatable."""
+    def __init__(self,lower,upper):
+        self.lower,self.upper = np.asarray(lower),np.asarray(upper)
+        self.base_from_box = np.eye(4)
+        self.evidence = {'floor_measured':False,'opening_verified':False,'entry_allowed':False}
+
+    def solid_parts(self):
+        return [(self.lower,self.upper,'unconfirmed box keepout')]
+
+    def collision(self,points):
+        points = np.asarray(points)
+        if np.all(points.max(0)>=self.lower) and np.all(points.min(0)<=self.upper):
+            return 'unconfirmed box keepout'
+        return None
+
+
 class BoxUnion:
     """Keep every measured box hollow, expressed in the active box frame."""
     def __init__(self, primary, boxes):
         self.primary, self.boxes = primary, boxes
+        self.inverse = np.linalg.inv(primary.base_from_box)
+        self.parts = self._solid_parts()
+        self.lower = np.array([part[0] for part in self.parts])
+        self.upper = np.array([part[1] for part in self.parts])
 
     def __getattr__(self, name):
         return getattr(self.primary,name)
 
     def solid_parts(self):
+        return self.parts
+
+    def _solid_parts(self):
         inverse = np.linalg.inv(self.primary.base_from_box)
         result = []
         for box in self.boxes:
@@ -418,4 +529,7 @@ class BoxUnion:
         return result
 
     def collision(self, points):
-        return next((reason for box in self.boxes if (reason:=box.collision(points)) is not None),None)
+        points = np.asarray(points)@self.inverse[:3,:3].T+self.inverse[:3,3]
+        contacts = np.all(points.max(0)>=self.lower-1e-9,axis=1)&np.all(points.min(0)<=self.upper+1e-9,axis=1)
+        indices = np.flatnonzero(contacts)
+        return self.parts[int(indices[0])][2] if len(indices) else None

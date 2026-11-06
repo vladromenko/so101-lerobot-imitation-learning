@@ -69,6 +69,15 @@ def reset():
         raise HTTPException(409,str(exc)) from exc
 
 
+@app.post('/api/prepare')
+def prepare(payload: dict):
+    try:
+        runtime.prepare(payload)
+        return {'queued':True,'scope':'attended overhead geometry' if payload.get('grasp_mode')=='overhead_grasp' else 'attended folded exit only'}
+    except (ValueError,RuntimeError) as exc:
+        raise HTTPException(409,str(exc)) from exc
+
+
 @app.get('/api/status')
 def status():
     return runtime.status()

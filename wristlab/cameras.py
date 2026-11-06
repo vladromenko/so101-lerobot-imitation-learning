@@ -20,7 +20,9 @@ class Cameras:
         self.stop_event = threading.Event()
         self.thread = None
         self.on_native_stop = None
+        self.on_frames = None
         self.frame_ready = threading.Condition()
+        self.cache_refreshes = deque(maxlen=20)
 
     def json(self, path, payload=None, timeout=2.):
         request = urllib.request.Request(self.api + path,
@@ -58,6 +60,8 @@ class Cameras:
                 self.error = None
             except Exception as exc:
                 self.error = str(exc)
+            if self.error is None and self.on_frames is not None:
+                self.on_frames()
 
     def latest_pair(self):
         return {name:self.get_latest_frame(name) for name in ('overview','wrist')}
@@ -65,7 +69,19 @@ class Cameras:
     def check(self):
         if self.error:
             raise RuntimeError(self.error)
-        self.latest_pair()
+        try:
+            self.latest_pair()
+        except RuntimeError as exc:
+            if ': stale frame' not in str(exc):
+                raise
+            began = time.time()
+            old = {name:began-frame.capture_interval[0] for name,frame in self.frames.items()}
+            # Hold the command callback until actual fresh native snapshots
+            # arrive. Neither the age bound nor a real camera failure is waived.
+            self.refresh()
+            self.latest_pair()
+            self.cache_refreshes.append({'at':began,'old_age_s':old,'fetch_s':time.time()-began,
+                'native_age_s':{name:value['age_s'] for name,value in self.last_health.items()}})
 
     def close(self):
         self.stop_event.set()
@@ -96,7 +112,10 @@ class Cameras:
             state = self.get_robot_state_at(frame.timestamp)
             if state is not None:
                 frame.joints, frame.feedback_error_s, frame.gripper = state
-            self.frames[name] = frame
+            with self.frame_ready:
+                previous = self.frames.get(name)
+                if previous is None or previous.timestamp<=frame.timestamp:
+                    self.frames[name] = frame
         self.last_health = before
         with self.frame_ready:
             self.frame_ready.notify_all()
@@ -136,9 +155,10 @@ class Cameras:
         state = self.get_robot_state_at(frame.timestamp)
         if state is not None:
             frame.joints, frame.feedback_error_s, frame.gripper = state
-        before = [sample for sample in self.history if sample[0] <= frame.capture_interval[0]]
-        after = [sample for sample in self.history if sample[0] >= frame.capture_interval[1]]
+        history = list(self.history)
+        before = [sample for sample in history if sample[0] <= frame.capture_interval[0]]
+        after = [sample for sample in history if sample[0] >= frame.capture_interval[1]]
         if before and after:
-            samples = [before[-1],*[sample for sample in self.history if frame.capture_interval[0] < sample[0] < frame.capture_interval[1]],after[0]]
+            samples = [before[-1],*[sample for sample in history if frame.capture_interval[0] < sample[0] < frame.capture_interval[1]],after[0]]
             frame.motion_during_exposure_rad = float(np.ptp(np.array([sample[1] for sample in samples]),axis=0).max())
         return frame

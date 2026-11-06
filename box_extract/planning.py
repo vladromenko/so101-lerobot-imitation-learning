@@ -292,6 +292,9 @@ class TunedExtractionPlanner(ExtractionPlanner):
         # The cube only has to clear the rim: its lowest point, not its corner radius, sets the lift.
         rise = max(.025, rim+scene.box.clearance_m+self.rim_margin_m+cube.side_m/2-cube.center_m[2])
         entry_up = self.vertical_center(grasp, rise, local.mean(0), world, **policy)
+        failure = self._tracking_robust(entry_up, world, **policy)
+        if failure:
+            raise ValueError('enter is not robust to arm tracking error: '+failure)
         approach = entry_up[-1]
         opened = dict(current, gripper=grasp['gripper'])
         open_path = self.edge(current, opened, world)
@@ -349,7 +352,7 @@ class TunedExtractionPlanner(ExtractionPlanner):
                     reason = world.reason(self._command_pose(q), **(policy | extra))
                     if reason and not (name == 'closure' and self._intended(reason, target_id)):
                         raise ValueError(f'{name} under the gravity-compensated command: {reason}')
-        for name, path, closing in (('enter', entry_up, False), ('closure', closure[:-1], True)):
+        for name, path, closing in (('closure', closure[:-1], True),):
             failure = self._tracking_robust(path, world, closing=closing, **policy)
             if failure:
                 raise ValueError(f'{name} is not robust to arm tracking error: {failure}')

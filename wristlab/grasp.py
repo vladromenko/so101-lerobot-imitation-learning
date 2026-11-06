@@ -26,6 +26,7 @@ def rank_grasps(candidates):
 
 
 def choose_grasp(obj, scene, robot, planner, current, check_cancel, world):
+    from box_extract.planning import flush_local
     failures = []
     metrics = getattr(planner,'timings',{})
     started = time.perf_counter()
@@ -35,10 +36,25 @@ def choose_grasp(obj, scene, robot, planner, current, check_cancel, world):
             grasp,closed = candidate.native
             begin = time.perf_counter()
             try:
+                # Reject an unreachable destination before constructing and
+                # checking hundreds of approach/closure/lift waypoints.
+                cube = scene.cubes[obj.id]
+                frame = robot.backend.model.frames(grasp)['gripper_frame_link']
+                local = flush_local((cube.vertices_m-frame[:3,3])@frame[:3,:3])
+                held = dict(grasp,gripper=min(closed,planner.last_clamp_deg))
+                patch = scene.placement
+                center = np.r_[np.mean(patch.polygon_xy_m,axis=0),
+                               patch.height_m+patch.uncertainty_m+cube.side_m/2+.001]
+                down = planner.placement_pose(held,local,cube,center)
+                for pose in (down,planner._command_pose(down)):
+                    reason = world.reason(pose,target=obj.id,jaw_contact=True,payload_local=local,support_contact=True)
+                    if reason:
+                        raise ValueError('placement pose: '+reason)
                 plan = planner._candidate(scene,current,obj.id,scene.cubes[obj.id],grasp,closed,world)
                 return candidate,plan,world
             except ValueError as exc:
                 failures.append(str(exc))
+                metrics['candidate_failures'] = failures[-12:]
             finally:
                 metrics['motion_planning_s'] = (metrics.get('motion_planning_s',0.) or 0.)+time.perf_counter()-begin
         raise ValueError('no full-arm grasp/approach/lift/placement path: '+('; '.join(failures[-3:]) or 'no admissible opposing-face grasp'))
@@ -52,6 +68,20 @@ def visual_alignment(object_state, cameras, robot, motion, plan, world, geometry
     import cv2
     from .vision import detect_cubes
     from so101_pick_place.vision.wrist_camera_geometry import camera_projection
+    if motion.grasp_mode=='overhead_grasp':
+        state = robot.read_state()
+        cameras.record_state(state['timestamp'],state['q'],state['gripper'])
+        cameras.wait_for_frame('overview',time.time(),motion.check_cancel)
+        frame = cameras.get_latest_frame('overview')
+        matches = [d for d in detect_cubes(frame) if d['color']==object_state.color]
+        if len(matches)!=1:
+            raise ValueError('overhead target is missing or ambiguous')
+        measured = geometry.estimate_cube_pose(matches[0],frame,object_state.evidence['support_z_m'])
+        if not measured.evidence.get('metric_qualified'):
+            raise ValueError('overhead target no longer has a complete supported top face')
+        return {'center_px':matches[0]['center_px'],'frame_id':frame.frame_id,
+                'observed_top_m':(measured.pose[:3,3]+[0.,0.,measured.dimensions[2]/2]).tolist(),
+                'grasp_mode':'overhead_grasp','wrist_refinement':False}
     if geometry.wrist is None:
         raise ValueError('qualified wrist hand-eye calibration is required')
     reference = next(p for p in plan.phases if p.name=='enter').joints[0]

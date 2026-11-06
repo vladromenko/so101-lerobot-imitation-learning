@@ -26,6 +26,82 @@ class Motion:
         self.attachment = None
         self.trial_attachment_sha256 = None
         self.attachment_path = self.qualification_file.parent/'attachment-candidate.json'
+        self.startup_world = None
+        self.grasp_mode = 'wrist_refinement'
+        self.operator_observation = None
+        self.release_phase,self.release_previous = None,None
+
+    def prepare_ready(self, scene, geometry, attendance, dry=False):
+        """Leave the folded soft-margin violation through an attended opening corridor.
+
+        This does not qualify an unknown cable or enable manipulation. The human
+        observation covers the cable; the native model and rigid CAD are checked
+        before and during the motion. Ordinary task margins remain unchanged.
+        """
+        from box_extract.mounted_arm import validated_segments
+        self.check_cancel()
+        if attendance.get('cable_and_hidden_surfaces_clear') is not True:
+            raise ValueError('attended startup requires the operator observation')
+        state = self.robot.read_state()
+        if not self.robot.audit_state(state)['hard_valid']:
+            raise ValueError('startup violates a hard constraint')
+        start = state['positions']
+        model = self.robot.backend.model
+        ready = dict(start)
+        # Only open the folded shoulder/elbow towards their ordinary domain.
+        for index,name in ((1,'shoulder_lift'),(2,'elbow_flex')):
+            low,high = model.ranges[index]
+            ready[name] = float(np.clip(start[name],low+model.margin+1.5,high-model.margin-1.5))
+        if max(abs(ready[j]-start[j]) for j in start)>10.:
+            raise ValueError('initial opening exceeds the bounded ten-degree corridor')
+        world = StartupWorld(self.robot,scene,geometry,start,ready,self.attachment_path)
+        path = validated_segments(start,[ready],world.reason)
+        sag = float(self.robot.arm.raw.sag)
+        # Independent joint lag stays between the start and the waypoint. Check
+        # its corners, rather than extrapolating past the stationary start.
+        import itertools
+        for q in path:
+            self.check_cancel()
+            lag_deg = self.planner.tracking_error_deg
+            for lift,elbow in itertools.product((max(start['shoulder_lift'],q['shoulder_lift']-lag_deg),q['shoulder_lift']),
+                                               (min(start['elbow_flex'],q['elbow_flex']+lag_deg),q['elbow_flex'])):
+                lag = dict(q,shoulder_lift=lift,elbow_flex=elbow)
+                for pose in (lag,self.robot.backend.driver_command_goal(lag,sag)):
+                    reason = world.reason(pose)
+                    if reason:
+                        raise ValueError('startup path: '+reason)
+        if model.problems(model.pose(ready)) or model.collides(model.pose(ready)):
+            raise ValueError('startup endpoint must satisfy ordinary working constraints')
+        evidence = {'start':start,'goal':ready,'attendance':attendance,'path':path,
+                    'scope':'attended folded exit only','automatic_unfold':False,
+                    'ordinary_margin_deg':model.margin,'ordinary_gap_m':model.gap,
+                    'initial_sample_gap_m':world.initial_gap,'physical_completed':False}
+        output = self.qualification_file.parent/'startup-trial.json'
+        output.write_text(json.dumps(evidence,indent=2,ensure_ascii=False))
+        if dry:
+            return evidence
+        self.startup_world = world
+        self.report('moving','attended_prepare_ready: coordinated shoulder/elbow opening; wrist held')
+        try:
+            self.robot.enable()
+            for name,goal in (('folded_exit',ready),):
+                actual = self.robot.read_state()['positions']
+                segment = validated_segments(actual,[goal],world.reason)
+                for q in segment:
+                    reason = world.reason(self.robot.backend.driver_command_goal(q,sag))
+                    if reason:
+                        raise ValueError('startup command: '+reason)
+                travel = sum(max(abs(b[j]-a[j]) for j in a) for a,b in zip(segment,segment[1:]))
+                self.robot.arm.follow(segment,duration=max(1.,1.875*travel/2.),settle=1.,within=.7,lead=False,step=name)
+            final = self.robot.read_state()
+            if not self.robot.audit_state(final)['planning_valid']:
+                raise RuntimeError('startup ended outside ordinary working margins')
+            evidence.update(physical_completed=True,actual=final['positions'],finished=time.time())
+            output.write_text(json.dumps(evidence,indent=2,ensure_ascii=False))
+            return evidence
+        finally:
+            self.startup_world = None
+            self.robot.stop_motion()
 
     def qualification_reasons(self, geometry):
         return [item['reason'] for item in self.qualification_blockers(geometry)]
@@ -54,13 +130,16 @@ class Motion:
                 blockers[-1]['working_margin_details'] = {'joints':audit['planning_margin_problems'],
                     'sample_separation_m':audit['minimum_model_clearance_m'],'pair':audit['planning_clearance_collision']}
         try:
-            self.attachment = AttachmentGeometry(self.attachment_path,self.qualification_file,geometry.fingerprint)
+            if self.grasp_mode=='overhead_grasp':
+                self.attachment = AttachmentGeometry.attended(self.attachment_path,self.robot,self.operator_observation or {})
+            else:
+                self.attachment = AttachmentGeometry(self.attachment_path,self.qualification_file,geometry.fingerprint)
         except (OSError,ValueError,KeyError,TypeError) as exc:
             self.attachment = None
             add('ACCESSORY_GEOMETRY','QUALIFICATION','нет квалифицированного объёма камеры/крепления/кабеля',
                 'измеренная геометрия совпадает с калибровкой и независимо проверена для всего диапазона пути')
             blockers[-1]['evidence_error'] = str(exc)
-        if geometry.wrist is None:
+        if geometry.wrist is None and self.grasp_mode!='overhead_grasp':
             add('WRIST_CALIBRATION','QUALIFICATION','нет независимо проверенной wrist hand-eye для текущего крепления',
                 'установлена калибровка с независимой проверкой текущего крепления; отдельный флаг допуска наведения не требуется')
         return blockers
@@ -82,6 +161,15 @@ class Motion:
             self.check_cancel()
             for kind,pose in (('pose',q),('native command',self.planner._command_pose(q))):
                 reason = self.state_is_valid(pose,phase,plan,world)
+                intended = reason in {'gripper_link: cube '+plan.target_id,'moving_jaw_so101_v1_link: cube '+plan.target_id}
+                force_close = phase.name=='grasp' and phase.jaw_contact and not phase.carrying
+                stationary_arm = all(abs(goal[j]-start[j])<1e-6 for j in start if j!='gripper')
+                if intended and force_close and stationary_arm and 4.<=pose['gripper']<=45.:
+                    # Native grasp() closes by force, not by following these
+                    # penetration requests as a rigid position trajectory.
+                    reason = world.grasp_contact_reason(pose,plan.target_id)
+                if reason=='gripper_link: cube '+plan.target_id and kind=='native command' and self.separating_release(goal,start,phase):
+                    reason = world.grasp_contact_reason(pose,plan.target_id,phase.placed_cube)
                 if reason:
                     return kind+': '+reason
         return None
@@ -179,9 +267,48 @@ class Motion:
 
     def guarded_tick(self, record):
         self.check_cancel()
+        if self.startup_world is not None:
+            for kind,q in (('goal',record['goal']),('pos',record['pos']),
+                           ('command',self.robot.backend.driver_command_goal(record['goal'],self.robot.arm.raw.sag))):
+                reason = self.startup_world.reason(q)
+                if reason:
+                    raise RuntimeError('startup '+kind+': '+reason)
+            return
         if self.driver is None:
             raise RuntimeError('motion callback has no checked scene')
-        self.driver.guard_tick(record)
+        phase = self.driver.phase
+        previous = self.release_previous if self.release_phase is phase else (phase.joints[0] if phase is not None else record['pos'])
+        try:
+            self.driver.guard_tick(record)
+        except RuntimeError as exc:
+            phase,plan,world = self.driver.phase,self.driver.plan,self.driver.world
+            expected = 'retract command: gripper_link: cube '+plan.target_id if plan is not None else ''
+            if str(exc)!=expected or not self.separating_release(record['goal'],previous,phase):
+                raise
+            policy = {'target':plan.target_id,'jaw_contact':phase.jaw_contact,'placed_cube':phase.placed_cube}
+            for kind,q in (('pos',record['pos']),('goal',record['goal'])):
+                reason = world.reason(q,**policy)
+                if reason:
+                    raise RuntimeError('release separation '+kind+': '+reason) from exc
+            command = self.robot.backend.driver_command_goal(record['goal'],self.robot.arm.raw.sag)
+            reason = world.grasp_contact_reason(command,plan.target_id,phase.placed_cube)
+            if reason:
+                raise RuntimeError('release separation command: '+reason) from exc
+            self.driver.previous['command'] = command
+        self.release_phase,self.release_previous = phase,dict(record['goal'])
+
+    def separating_release(self,goal,previous,phase):
+        if phase is None or phase.name!='retract' or phase.placed_cube is None or phase.carrying:
+            return False
+        from box_extract.driver import BoxArmDriver
+        start = phase.joints[0]
+        model = self.robot.backend.model
+        distance = np.linalg.norm(np.asarray(model.pose(goal).tip)-model.pose(start).tip)
+        first_gap = self.planner._fixed_jaw_clearance(start,phase.placed_cube)
+        before = self.planner._fixed_jaw_clearance(previous,phase.placed_cube)
+        after = self.planner._fixed_jaw_clearance(goal,phase.placed_cube)
+        return bool(distance<=BoxArmDriver.SEPARATION_ZONE_M and after>=max(first_gap,before)-1e-6 and
+                    abs(goal['gripper']-start['gripper'])<1e-6)
 
     def contact_free_trial(self, plan, world, start):
         """Physically exercise only the free-space approach and its checked reverse."""
@@ -263,6 +390,113 @@ class Motion:
         self.check_path(replace(plan,phases=(phase,)),world)
         self.execute_trajectory(phase,plan,world)
 
+    def recover_empty_approach(self,plan,world):
+        """Return on the already checked, empty-hand approach after a STOP."""
+        from dataclasses import replace
+        self.check_cancel()
+        self.prepare_driver(self.driver.check_sensor)
+        current = self.robot.read_state()['positions']
+        approach = next(p for p in plan.phases if p.name=='approach')
+        nearest = min(range(len(approach.joints)),key=lambda i:max(abs(current[j]-approach.joints[i][j]) for j in current if j!='gripper'))
+        reverse = tuple(dict(q,gripper=current['gripper']) for q in reversed(approach.joints[:nearest+1]))
+        bridge = self.planner.edge(current,reverse[0],world)
+        back = Phase('recover_empty_approach',tuple(bridge)+reverse[1:])
+        recovery = replace(plan,phases=(back,))
+        self.check_path(recovery,world)
+        self.driver.phase,self.driver.plan,self.driver.world = back,recovery,world
+        self.robot.enable()
+        for phase in recovery.phases:
+            self.report('moving',phase.name)
+            self._execute_native(phase,recovery,world)
+        actual = self.robot.read_state()['positions']
+        start = plan.phases[0].joints[0]
+        restore = Phase('open',self.planner.edge(actual,dict(start,gripper=start['gripper']),world))
+        self.check_path(replace(plan,phases=(restore,)),world)
+        self._execute_native(restore,plan,world)
+        returned = self.robot.read_state()['positions']
+        error = float(np.max(np.abs(self.robot.from_native(returned)-self.robot.from_native(start))))
+        if error>np.pi/240.:
+            raise RuntimeError('resumed noncontact trial did not return within tracking tolerance')
+        evidence = {'returned_safely':True,'contact_free_trial_complete':False,'start':start,'returned':returned,
+                    'tracking_error_rad':error,'attachment_sha256':self.attachment.fingerprint,'contact_was_commanded':False}
+        (self.qualification_file.parent/'empty-approach-return.json').write_text(json.dumps(evidence,indent=2))
+        return returned
+
+
+class StartupWorld:
+    """Checked, pose-bounded exit; never used as a manipulation collision world."""
+    def __init__(self,robot,scene,geometry,start,goal,profile_path):
+        from scipy.spatial import ConvexHull
+        from .diagnostics import minimum_clearance
+        from so101_pick_place.experiments.box_extraction.mesh_collision import load_collision_meshes
+        self.robot,self.geometry = robot,geometry
+        self.initial_gap = minimum_clearance(robot.backend.model,start)
+        self.start,self.goal = dict(start),dict(goal)
+        self.meshes = load_collision_meshes(str(robot.root/'vendor/SO101/so101_new_calib.urdf'))
+        self.points = {}
+        for link,parts in self.meshes.items():
+            points = np.unique(np.concatenate([part.triangles.reshape(-1,3) for part in parts]),axis=0)
+            self.points[link] = points[ConvexHull(points).vertices]
+        profile = json.loads(Path(profile_path).read_text())
+        self.parts = profile['parts']
+        self.mask = np.zeros(scene.frames['overview'].image.shape[:2],np.uint8)
+        for box in scene.state.boxes.values():
+            cv2.fillConvexPoly(self.mask,np.int32(box.evidence['polygon']),255)
+        for obj in scene.state.objects.values():
+            self.mask[obj.mask>0] = 255
+        self.mask = cv2.dilate(self.mask,np.ones((25,25),np.uint8))
+        self.cache = {}
+
+    def reason(self,q,**policy):
+        key = tuple(q[j] for j in self.start)
+        if key not in self.cache:
+            if len(self.cache)>8192:
+                self.cache.clear()
+            self.cache[key] = self._reason(q)
+        return self.cache[key]
+
+    def _reason(self,q):
+        from so101_pick_place.experiments.box_extraction.mesh_collision import mesh_box_overlap
+        robot,model = self.robot,self.robot.backend.model
+        for name,value in q.items():
+            low,high = sorted((self.start[name],self.goal[name]))
+            # Native sag can move the elbow inwards; no outward range override.
+            allowance = 2. if name=='elbow_flex' else .8
+            if not low-allowance<=value<=high+.8:
+                return name+': outside bounded startup corridor'
+        pose = model.pose(q)
+        problems = model.problems(pose,margin=0.)
+        if problems:
+            return 'hard constraints: '+str(problems)
+        collision = model.collides(pose,gap=max(0.,self.initial_gap-.0002))
+        if collision:
+            return 'startup closes existing sampled separation: '+collision
+        frames = model.frames(q)
+        bodies = dict(self.points)
+        for part in self.parts:
+            lo,hi = np.asarray(part['lower_m']),np.asarray(part['upper_m'])
+            local = np.array([[x,y,z] for x in (lo[0],hi[0]) for y in (lo[1],hi[1]) for z in (lo[2],hi[2])])
+            parent = frames[part['parent_link']]
+            inverse = np.linalg.inv(parent)
+            for link,points in self.points.items():
+                other = robot.backend._transform_points(inverse@frames[link],points)
+                separated = np.any(other.max(0)<lo) or np.any(other.min(0)>hi)
+                if link not in part.get('allow_contact_links',[]) and not separated:
+                    if mesh_box_overlap(self.meshes[link],frames[link],parent,lo,hi):
+                        return part['name']+': robot link '+link
+            bodies[part['name']] = local
+            frames[part['name']] = parent
+        for name,local in bodies.items():
+            points = robot.backend._transform_points(frames[name],local)
+            if name not in ('base_link','shoulder_link') and points[:,2].min()<model.table_z+.004:
+                return name+': table clearance'
+            hull = cv2.convexHull(np.float32(self.geometry.project(points))).astype(np.int32)
+            mask = np.zeros_like(self.mask)
+            cv2.fillConvexPoly(mask,hull,255)
+            if np.any((mask>0)&(self.mask>0)):
+                return name+': projected cube/box keepout'
+        return None
+
 
 class AccessoryWorld(ExtractionCollisionWorld):
     def __init__(self, robot, scene, attachment, metrics=None):
@@ -276,6 +510,25 @@ class AccessoryWorld(ExtractionCollisionWorld):
         ground = SimpleNamespace(height_m=float(robot.backend.model.table_z),uncertainty_m=0.)
         self.ground_scene = replace(scene,placement=ground)
         self.native_checks = ExtractionCollisionWorld(robot.backend,self.ground_scene)
+        self.grasp_worlds = {}
+
+    def grasp_contact_reason(self,joints,target,placed_cube=None):
+        """Permit only target/jaw contact; independently check everything else."""
+        from so101_pick_place.experiments.box_extraction.mesh_collision import mesh_cube_overlap
+        from so101_pick_place.experiments.box_extraction.scene import localization_margin
+        if target not in self.grasp_worlds:
+            other = replace(self.ground_scene,cubes={key:cube for key,cube in self.ground_scene.cubes.items() if key!=target})
+            self.grasp_worlds[target] = ExtractionCollisionWorld(self.robot.backend,other)
+        reason = self.grasp_worlds[target].reason(joints)
+        if reason:
+            return reason
+        cube = self.scene.cubes[target] if placed_cube is None else placed_cube
+        frames = self.robot.backend.model.frames(joints)
+        for link,parts in self.collision_meshes.items():
+            if link not in ('gripper_link','moving_jaw_so101_v1_link'):
+                if mesh_cube_overlap(parts,frames[link],cube,localization_margin(cube)):
+                    return link+': cube '+target
+        return self.attachment.reason(self.robot,joints,self.scene,target,placed_cube=placed_cube)
 
     def support_contact_valid(self, joints, payload, support_id):
         support = self.scene.cubes[support_id]
@@ -314,6 +567,12 @@ class AccessoryWorld(ExtractionCollisionWorld):
 
     def _reason(self, joints, **policy):
         native = self.native_checks.reason(joints,**policy)
+        target = policy.get('target')
+        jaw_contact = native in {'gripper_link: cube '+str(target),'moving_jaw_so101_v1_link: cube '+str(target)}
+        if jaw_contact and policy.get('jaw_contact') and policy.get('payload_local') is None:
+            other = self.grasp_contact_reason(joints,target,policy.get('placed_cube'))
+            if other:
+                return other
         support_id = getattr(self.scene.placement,'support_id',None)
         intended = support_id is not None and native == 'payload: cube '+support_id
         if intended and policy.get('support_contact') and policy.get('payload_local') is not None:

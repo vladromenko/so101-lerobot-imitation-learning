@@ -28,11 +28,12 @@ function drawOverlay(){
     const img=document.getElementById(imageIds[name]),canvas=document.getElementById(canvasIds[name]),rect=img.getBoundingClientRect();
     canvas.width=rect.width;canvas.height=rect.height;
     const g=canvas.getContext('2d');g.clearRect(0,0,canvas.width,canvas.height);
-    if(!sceneData||name!=='overview')return;
+    if(!sceneData)return;
     const k=rect.width/(img.naturalWidth||1280);g.lineWidth=2;g.font='bold 13px sans-serif';
     function polygon(points,color){g.strokeStyle=color;g.beginPath();points.forEach((p,i)=>i?g.lineTo(p[0]*k,p[1]*k):g.moveTo(p[0]*k,p[1]*k));g.closePath();g.stroke();}
-    sceneData.boxes.forEach(b=>{polygon(b.polygon,b.metric_qualified?'#22c55e':'#f59e0b');const p=b.polygon[0];g.fillStyle='#f59e0b';g.fillText(b.id+' · '+(b.metric_qualified?'измерена':'кандидат'),p[0]*k,p[1]*k-5);});
-    sceneData.cubes.forEach(o=>{const selected=o.id===statusData?.selected,color=selected?'#fff':'#38bdf8';o.polygon.forEach(p=>polygon(p,color));g.fillStyle=color;g.fillText(o.id+' '+o.color,o.px[0]*k-35,o.px[1]*k-25);});
+    if(name==='overview')sceneData.boxes.forEach(b=>{polygon(b.polygon,b.metric_qualified?'#22c55e':'#f59e0b');const p=b.polygon[0];g.fillStyle='#f59e0b';g.fillText(b.id+' · '+(b.metric_qualified?'измерена':'кандидат'),p[0]*k,p[1]*k-5);});
+    (name==='overview'?sceneData.cubes:sceneData.wrist_objects||[]).forEach(o=>{const selected=o.id===statusData?.selected,color=selected?'#fff':'#38bdf8';g.setLineDash(o.status==='occluded'?[5,4]:[]);o.polygon.forEach(p=>polygon(p,color));g.fillStyle=color;g.fillText(o.id+' '+o.color+(o.status==='occluded'?' · скрыт':''),o.px[0]*k-35,o.px[1]*k-25);});
+    g.setLineDash([]);
   });
 }
 feeds.forEach(name=>document.getElementById(canvasIds[name]).addEventListener('click',async e=>{
@@ -52,7 +53,12 @@ async function refreshScene(){
     destination.replaceChildren(...sceneData.boxes.map(b=>{const o=document.createElement('option');o.value=b.id;o.textContent=b.id+(b.metric_qualified?'':' · не квалифицирована');return o;}));
     if(ids.includes(previous))destination.value=previous;
   }
-  if(!sceneData.observation_valid)document.getElementById('scene-hint').textContent=sceneData.observation_error||'Нет достоверного свежего наблюдения';
+  const hint=document.getElementById('scene-hint');
+  hint.textContent=!sceneData.video_fresh?'Видеокадр устарел; показаны последние данные':
+    sceneData.detection_error?'Видео обновляется. Ошибка обработки сцены: '+sceneData.detection_error:
+    !sceneData.detection_fresh?'Видео обновляется; ожидается обновление детекции':
+    'Кадры свежие · обзор: '+sceneData.visible_overview_count+' видно, '+sceneData.occluded_count+' скрыто рукой · wrist: '+sceneData.visible_wrist_count+' видно';
+  hint.title='Обзор: '+sceneData.evidence.overview_frame_id+'; wrist: '+sceneData.evidence.wrist_frame_id+'; SceneState #'+sceneData.version;
   drawOverlay();
 }
 async function start(mode){

@@ -85,7 +85,10 @@ class Geometry:
                 evidence={'kind':'known_upright_cube','quad':quad.tolist(),'frame_id':frame.frame_id,
                     'dimension_source':self.known_cube['source_artifacts'],'side_sigma_m':.0015,
                     'position_sigma_m':[sigma,sigma,.002],'rotation_sigma_rad':[0.,0.,.035],
-                    'support_z_m':support_z,'support_assumed':True,'metric_qualified':False,
+                    'support_z_m':support_z,'support_assumed':True,
+                    'metric_qualified':getattr(self,'grasp_mode',None)=='overhead_grasp' and
+                        bool(np.all(lengths>.85*side)) and orthogonal_error<.15,
+                    'geometry_mode':getattr(self,'grasp_mode','wrist_refinement'),
                     'colour_patch_was_not_used_as_cube_size':True,'calibration_sha256':self.fingerprint})
         rough = np.array([self.intersect_ray_with_plane(self.pixel_ray_in_base(p, frame), ([0, 0, 1], -support_z)) for p in quad])
         signed_area = np.sum(rough[:,0]*np.roll(rough[:,1],-1)-rough[:,1]*np.roll(rough[:,0],-1))
@@ -354,7 +357,7 @@ class Geometry:
             'pnp_status':'not identifiable: image features have no independently known 3D landmark correspondences',
             'metric_depth_observable':False,'independent_view_count':1,
             'image_region_is_visible_reference_only':True,
-            'unresolved_region_px':region,'unresolved_part':'rear/underside of camera PCB and USB cable exit facing forearm; wrist camera cannot see its own rear',
+            'unresolved_region_px':region,'unresolved_part':'underside of camera support; the visible USB wire exit is on its outside/right; wrist camera cannot see its own rear',
             'needed_measurement':'minimum physical clearance of that hidden assembly to the arm over the initial wrist segment, including the tracking-error envelope',
             'motion_authorized':False,'calibration_changed':False,'cable_3d_pose_inferred':False}
 
@@ -473,6 +476,30 @@ class AttachmentGeometry:
             points = np.array([[x,y,z] for x in (lo[0],hi[0]) for y in (lo[1],hi[1]) for z in (lo[2],hi[2])])
             self.parts.append((part['name'],part['parent_link'],lo,hi,points))
         self.fingerprint = fingerprint
+        self.allowed_contacts = {}
+
+    @classmethod
+    def attended(cls, profile_path, robot, observation):
+        """Historical rigid CAD, with the cable explicitly watched by a human.
+
+        This is not independent cable qualification and is never persisted as
+        one. Full rigid collision checks remain active on the planned path.
+        """
+        if observation.get('cable_and_hidden_surfaces_clear') is not True:
+            raise ValueError('attended overhead operation requires the operator observation')
+        obj = cls.__new__(cls)
+        path = Path(profile_path)
+        profile = json.loads(path.read_text())
+        obj.parts,obj.allowed_contacts = [],{}
+        for part in profile['parts']:
+            lo,hi = np.asarray(part['lower_m']),np.asarray(part['upper_m'])
+            points = np.array([[x,y,z] for x in (lo[0],hi[0]) for y in (lo[1],hi[1]) for z in (lo[2],hi[2])])
+            obj.parts.append((part['name'],part['parent_link'],lo,hi,points))
+            obj.allowed_contacts[part['name']] = set(part.get('allow_contact_links',[part['parent_link']]))
+        obj.domain = np.deg2rad(np.asarray(robot.backend.model.ranges,float))
+        obj.fingerprint = hashlib.sha256(path.read_bytes()).hexdigest()
+        obj.operator_observation = dict(observation)
+        return obj
 
     def reason(self, robot, joints, scene, target=None, payload_local=None, placed_cube=None):
         from dataclasses import replace
@@ -483,6 +510,19 @@ class AttachmentGeometry:
             return 'pose leaves measured camera/cable qualification domain'
         frames = robot.backend.model.frames(joints)
         meshes = load_collision_meshes(str(robot.root/'vendor/SO101/so101_new_calib.urdf'))
+        if not hasattr(self,'link_bounds'):
+            self.link_bounds = {}
+            for link,parts in meshes.items():
+                lo = np.min([part.tree[0] for part in parts],axis=0)
+                hi = np.max([part.tree[1] for part in parts],axis=0)
+                self.link_bounds[link] = np.array([[x,y,z] for x in (lo[0],hi[0]) for y in (lo[1],hi[1]) for z in (lo[2],hi[2])])
+        relative = {}
+        for parent in {part[1] for part in self.parts}:
+            inverse = np.linalg.inv(frames[parent])
+            relative[parent] = {}
+            for link,bounds in self.link_bounds.items():
+                points = robot.backend._transform_points(inverse@frames[link],bounds)
+                relative[parent][link] = points.min(0),points.max(0)
         for name,parent,lo,hi,local in self.parts:
             transform = frames[parent]
             points = local @ transform[:3,:3].T + transform[:3,3]
@@ -493,7 +533,10 @@ class AttachmentGeometry:
                 return name+': '+wall
             for link,mesh in meshes.items():
                 # Only the fastening parent is an intended mechanical contact.
-                if link != parent and mesh_box_overlap(mesh,frames[link],transform,lo,hi):
+                intended = link==parent or link in self.allowed_contacts.get(name,set())
+                lower,upper = relative[parent][link]
+                separated = np.any(upper<lo-1e-9) or np.any(lower>hi+1e-9)
+                if not intended and not separated and mesh_box_overlap(mesh,frames[link],transform,lo,hi):
                     return name+': robot link '+link
             for object_id,cube in scene.cubes.items():
                 if object_id==target and placed_cube is not None:

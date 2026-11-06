@@ -267,6 +267,7 @@ class GeometryPolicy(unittest.TestCase):
     def test_runtime_states_distinguish_planning_execution_and_failure(self):
         rt = Runtime.__new__(Runtime)
         rt.blocking_conditions=Mock(return_value=[])
+        rt.motion=NS(grasp_mode='wrist_refinement')
         rt.robot=NS(last_state=None,arm=None);rt.scene=NS(held=None,state=SceneState())
         rt.initialized=False;rt.running=False;rt.phase='initializing';rt.detail='check'
         rt.stop_event=threading.Event();rt.pause_event=threading.Event();rt.fault_latched=False
@@ -292,6 +293,7 @@ class GeometryPolicy(unittest.TestCase):
     def test_native_auto_unfold_is_disabled_without_enabling_torque(self):
         robot = Robot.__new__(Robot)
         robot.arm=None;robot.acquire=Mock();robot.release=Mock();robot.output=ROOT/'runtime/unit'
+        robot.nonce='recorded-test-owner'
         robot.backend=NS()
         robot.config=NS(robot={'port':'unused','calibration':'unused'})
         with patch('wristlab.robot.TaskArm') as native:

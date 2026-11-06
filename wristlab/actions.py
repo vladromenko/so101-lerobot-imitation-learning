@@ -12,6 +12,35 @@ class Actions:
         self.runtime = runtime
         self.scene,self.robot,self.motion = runtime.scene,runtime.robot,runtime.motion
 
+    def rank_first_pick(self,box_id,excluded_colors=()):
+        from .grasp import generate_grasps
+        from .tasks import placement_in_box
+        current = self.robot.read_state()['positions']
+        ranking = []
+        rejected = {key:reason for (key,reason) in self.runtime.recovery.failures
+                    if 'enter is not robust' in reason and 'wrist_camera' in reason}
+        for obj in self.scene.state.objects.values():
+            self.runtime.check_cancel()
+            row = {'object_id':obj.id,'color':obj.color,'admissible':False}
+            if obj.id in rejected or obj.color in excluded_colors:
+                row['reason'] = 'previously rejected camera/box entry; not retried'
+            else:
+                placement = placement_in_box(self.scene,obj.id,box_id)
+                native = self.scene.native_scene(obj.id,placement)
+                world = self.motion.make_world(native)
+                candidates = list(generate_grasps(obj,native,self.robot,self.motion.planner,current,world))
+                if candidates:
+                    point = (np.linalg.inv(native.box.base_from_box)@np.r_[obj.pose[:3,3],1.])[:3]
+                    clearance = min(float(np.linalg.norm(np.maximum(np.maximum(lo-point,point-hi),0.)))
+                                    for lo,hi,_ in native.box.solid_parts())
+                    row.update(admissible=True,grasp_candidates=len(candidates),
+                               obstacle_clearance_m=clearance,joint_cost=min(c.score[0] for c in candidates))
+                else:
+                    row['reason'] = 'no admissible opposing-face grasp IK with rigid accessories'
+            ranking.append(row)
+        self.runtime.metrics['object_accessibility'] = ranking
+        return sorted([r for r in ranking if r['admissible']],key=lambda r:(-r['obstacle_clearance_m'],r['joint_cost']))
+
     def observe_object(self, object_id):
         self.runtime.refresh()
         obj = self.scene.state.objects[object_id]
@@ -30,20 +59,37 @@ class Actions:
             obj = self.observe_object(object_id)
             self.scene.reserve_object(object_id)
             rt.report(stage,object_id)
+            self.robot.read_state()
             reasons = self.motion.qualification_reasons(self.scene.geometry)
             if reasons:
                 raise ValueError('; '.join(reasons))
             stage = 'grasp_planning'
             rt.report(stage,object_id)
-            native_scene = self.scene.native_scene(object_id,placement)
             if not dry:
                 rt.ensure_driver()
             start = self.robot.read_state()['positions']
-            world = self.motion.make_world(native_scene)
-            candidate,plan,world = choose_grasp(obj,native_scene,self.robot,self.motion.planner,start,rt.check_cancel,world)
+            choices = [placement]
+            if placement.support_surface in self.scene.state.boxes:
+                for patch in self.scene.find_free_box_slots(placement.support_surface,obj.dimensions):
+                    center = np.r_[np.mean(patch.polygon_xy_m,axis=0),patch.height_m+obj.dimensions[2]/2]
+                    if np.linalg.norm(center-placement.object_pose[:3,3])>.015:
+                        pose = placement.object_pose.copy();pose[:3,3] = center
+                        choices.append(replace(placement,object_pose=pose))
+            failures = []
+            for choice in choices:
+                if plan is None:
+                    native_scene = self.scene.native_scene(object_id,choice)
+                    world = self.motion.make_world(native_scene)
+                    try:
+                        candidate,plan,world = choose_grasp(obj,native_scene,self.robot,self.motion.planner,start,rt.check_cancel,world)
+                        placement = choice
+                    except ValueError as exc:
+                        failures.append(str(exc))
+            if plan is None:
+                raise ValueError('; '.join(failures[-3:]))
             stage = 'path_check'
-            self.motion.check_path(plan,world)
             rt.last_plan = plan
+            self.motion.check_path(plan,world)
             if dry:
                 return ActionResult(True,'geometric path checked; no actuator commands',object_id,self.scene.state,
                                     {'physical_verified':False,'motion_started':False})
@@ -209,6 +255,16 @@ class Actions:
         state = self.robot.read_state();cameras.record_state(state['timestamp'],state['q'],state['gripper'])
         cameras.wait_for_frame('wrist',after_time,self.runtime.check_cancel)
         state = self.robot.read_state();cameras.record_state(state['timestamp'],state['q'],state['gripper'])
+        if self.motion.grasp_mode=='overhead_grasp':
+            if self.scene.held is None:
+                raise ValueError('no force-confirmed payload attachment')
+            base_object = self.robot.backend.model.frames(state['positions'])['gripper_frame_link']@self.scene.held[1]
+            top = base_object[:3,3]+base_object[:3,2]*obj.dimensions[2]/2
+            predicted = self.scene.geometry.project(top[None])[0]
+            cameras.wait_for_frame('overview',after_time,self.runtime.check_cancel)
+            frame = cameras.get_latest_frame('overview')
+            result = track_color_in_grip(frame,obj.color,predicted,radius_px=45.)
+            return dict(result,relative_error_px=(np.asarray(result['center_px'])-predicted).tolist(),camera_id='overview')
         frame = cameras.get_latest_frame('wrist')
         record = self.scene.geometry.projection_for_frame(frame,self.robot)
         camera = np.asarray(record['camera_from_robot']);rotation,_ = cv2.Rodrigues(camera[:3,:3])
@@ -227,7 +283,8 @@ class Actions:
         observed = self.capture_grip_view(obj,after_time)
         if observed['frame_id']==anchor['frame_id']:
             return False
-        visible_attached = np.linalg.norm(np.asarray(observed['center_px'])-anchor['center_px'])<12.
+        field = 'relative_error_px' if self.motion.grasp_mode=='overhead_grasp' else 'center_px'
+        visible_attached = np.linalg.norm(np.asarray(observed[field])-anchor[field])<12.
         actual = self.robot.arm.read()[0]
         blocked = self.motion.driver.blocked_grip
         jaw_retained = blocked is not None and abs(actual['gripper']-blocked)<3.

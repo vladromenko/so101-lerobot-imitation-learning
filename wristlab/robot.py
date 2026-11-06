@@ -123,7 +123,7 @@ class Robot:
             try:
                 r = self.config.robot
                 self.arm = TaskArm(mount_backend=self.backend,port=r['port'], calibration_file=r['calibration'], offsets=r.get('kinematic_offsets_deg'),
-                    on_tick=tick, hold_on_success=True, out=self.output, name='wristlab')
+                    on_tick=tick, hold_on_success=True, out=self.output, name='wristlab-'+self.nonce[:12])
                 # Arm._ready() otherwise silently invokes the stock unfold
                 # before move_joints/follow, outside our checked trajectory.
                 self.arm.unfold_first = False
