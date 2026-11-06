@@ -1,20 +1,30 @@
 --- a/python/so101ik/_arm.c
 +++ b/python/so101ik/_arm.c
-@@ -7,6 +7,7 @@
- #include <string.h>
- #include <sys/time.h>
- #include "so101ik.h"
+@@ -9,0 +10 @@
 +#include "sts.h"
- 
- static PyObject *Fault, *Unreachable, *GripLost;
- static PyTypeObject *PoseType;
-@@ -269,6 +270,51 @@
-     if (rc) return call_done(self, rc);
-     GIVE(self);
-     return Py_BuildValue("(dddd)", (double)tip[0], (double)tip[1], (double)tip[2], (double)pitch);
+@@ -271,0 +273,64 @@
 +}
 +
 +/* Read-only reconnect: preserve hardware goals, torque and RAM settings. */
++/* Same-owner register reads, including from its tick callback. No writes. */
++static PyObject *arm_read_registers(ArmObject *self, PyObject *args) {
++    int address,n;
++    if (!PyArg_ParseTuple(args,"ii",&address,&n)) return NULL;
++    if (address<0 || n<1 || address+n>256) { PyErr_SetString(PyExc_ValueError,"invalid register span"); return NULL; }
++    OPEN(self); if (!take(self,1)) return NULL;
++    unsigned long was=self->busy; self->busy=PyThread_get_thread_ident();
++    uint8_t ids[SO101_NJ];
++    for (int j=0;j<SO101_NJ;j++) ids[j]=(uint8_t)self->arm.cal[j].id;
++    PyObject *bytes=PyBytes_FromStringAndSize(NULL,SO101_NJ*n);
++    if (!bytes) { self->busy=was; return NULL; }
++    int rc=so101_sts_sync_read(&self->arm.hal,(uint8_t)address,n,ids,SO101_NJ,(uint8_t*)PyBytes_AS_STRING(bytes));
++    self->busy=was;
++    if (rc) { Py_DECREF(bytes); PyErr_SetString(Fault,"servo telemetry read failed"); return NULL; }
++    PyObject *rows=PyTuple_New(SO101_NJ);
++    for (int j=0;j<SO101_NJ;j++) PyTuple_SET_ITEM(rows,j,PyBytes_FromStringAndSize(PyBytes_AS_STRING(bytes)+j*n,n));
++    Py_DECREF(bytes); return rows;
++}
++
 +static PyObject *arm_adopt_hold(ArmObject *self, PyObject *noargs) {
 +    OPEN(self); TAKE(self);
 +    so101_arm *a = &self->arm;
@@ -57,14 +67,70 @@
 +    a->have_pose=0; a->have_target=0; a->folded=0; a->torque=1;
 +    h_log(self,"adopt_hold: stationary powered servos; all hardware goals preserved");
 +    GIVE(self); Py_RETURN_TRUE;
- }
- 
- static PyObject *arm_torque_on(ArmObject *self, PyObject *noargs) {
-@@ -677,6 +723,7 @@
-     {"check", (PyCFunction)arm_check, METH_NOARGS, "every servo answers and its EEPROM matches the calibration"},
-     {"read", (PyCFunction)arm_read, METH_NOARGS, "read() -> (degrees, load %, mA), dicts by joint"},
-     {"where", (PyCFunction)arm_where, METH_NOARGS, "where() -> (x, y, z, pitch): the tip from one read of the positions"},
+@@ -676,0 +742 @@
++    {"read_registers", (PyCFunction)arm_read_registers, METH_VARARGS, "same-owner read-only servo register block"},
+@@ -679,0 +746 @@
 +    {"adopt_hold", (PyCFunction)arm_adopt_hold, METH_NOARGS, "read-only adoption of stationary already-powered servos; False if all torque is off"},
-     {"torque_on", (PyCFunction)arm_torque_on, METH_NOARGS, "goals to the present positions, RAM settings, torque on"},
-     {"torque_off", (PyCFunction)arm_torque_off, METH_NOARGS, "torque off: the arm drops"},
-     {"move_joints", (PyCFunction)(void (*)(void))arm_move_joints, METH_VARARGS | METH_KEYWORDS,
+--- a/python/so101ik/_core.c
++++ b/python/so101ik/_core.c
+@@ -10,0 +11,2 @@
++extern int so101_pair_count(void);
++extern int so101_pair_collides(const so101_model*,const so101_real*,so101_real,int);
+@@ -286,0 +289,34 @@
++}
++
++static PyObject *model_pair_clearances(ModelObject *self,PyObject *obj) {
++    so101_real deg[SO101_NJ]; if (!read_deg(obj,deg)) return NULL;
++    PyObject *result=PyDict_New();
++    for (int code=1;code<=so101_pair_count();code++) {
++        float low=0,high=(float)self->m.gap;
++        if (!so101_pair_collides(&self->m,deg,high,code)) low=high;
++        else while (nextafterf(low,high)<high) {
++            float middle=(low+high)/2;
++            if (middle==low || middle==high) break;
++            if (so101_pair_collides(&self->m,deg,middle,code)) high=middle; else low=middle;
++        }
++        PyObject *value=PyFloat_FromDouble(low);
++        PyDict_SetItemString(result,so101_collision_name(code),value); Py_DECREF(value);
++    }
++    return result;
++}
++static PyObject *model_pair_collisions(ModelObject *self,PyObject *args) {
++    PyObject *obj,*overrides=Py_None;
++    if (!PyArg_ParseTuple(args,"O|O",&obj,&overrides)) return NULL;
++    if (overrides!=Py_None && !PyDict_Check(overrides)) { PyErr_SetString(PyExc_TypeError,"pair gaps must be a dictionary"); return NULL; }
++    so101_real deg[SO101_NJ]; if (!read_deg(obj,deg)) return NULL;
++    PyObject *result=PyList_New(0);
++    for (int code=1;code<=so101_pair_count();code++) {
++        const char *name=so101_collision_name(code);
++        PyObject *item=overrides==Py_None?NULL:PyDict_GetItemString(overrides,name);
++        double gap=item?PyFloat_AsDouble(item):self->m.gap;
++        if (PyErr_Occurred() || !isfinite(gap) || gap<0 || gap>self->m.gap) { Py_DECREF(result); if (!PyErr_Occurred()) PyErr_SetString(PyExc_ValueError,"pair gap outside native bounds"); return NULL; }
++        if (so101_pair_collides(&self->m,deg,gap,code)) {
++            PyObject *label=PyUnicode_FromString(name); PyList_Append(result,label); Py_DECREF(label);
++        }
++    }
++    return result;
+@@ -362,0 +399,2 @@
++    {"pair_clearances",(PyCFunction)model_pair_clearances,METH_O,"native pair clearance lower bounds, capped at ordinary gap"},
++    {"pair_collisions",(PyCFunction)model_pair_collisions,METH_VARARGS,"native collision pairs with phase-local lower bounds"},
+--- a/src/kin.c
++++ b/src/kin.c
+@@ -410,0 +411,17 @@
++
++/* Read-only pair query; ordinary collision checking above is unchanged. */
++int so101_pair_count(void) { return 5+NPAIRS; }
++int so101_pair_collides(const so101_model *m,const so101_real deg[SO101_NJ],so101_real gap_r,int code) {
++    so101_tf F[8]; ftf T[SO101_NL];
++    so101_frames(m,deg,F);
++    (void)so101_collides_frames(m,F,gap_r); /* prepare the native BVH leaf cache */
++    for (int k=0;k<SO101_NL;k++) {
++        for (int i=0;i<9;i++) T[k].R[i]=(float)F[k].R[i];
++        for (int i=0;i<3;i++) T[k].p[i]=(float)F[k].p[i];
++    }
++    if (code>=1 && code<=5) return below(SO101_LINK_ROOT[code+1],&T[code+1],(float)(m->table_z+gap_r));
++    int pair=code-6;
++    if (pair<0 || pair>=NPAIRS) return 1;
++    int A=PAIRS[pair][0],B=PAIRS[pair][1];
++    return near_pair(SO101_LINK_ROOT[A],&T[A],SO101_LINK_ROOT[B],&T[B],(float)gap_r);
++}

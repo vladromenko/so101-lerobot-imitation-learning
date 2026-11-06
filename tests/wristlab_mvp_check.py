@@ -64,10 +64,11 @@ def action_contract():
     driver = NS(confirm_grasp=Mock(return_value=local),release_confirmed=Mock(),confirm_retention=Mock(),retention=NS(armed=True))
     motion = NS(qualification_reasons=Mock(return_value=[]),make_world=Mock(return_value=NS()),
         check_path=Mock(),contact_free_passed=True,driver=driver,planner=NS(),execute_trajectory=Mock(),
-        replan_held=Mock(return_value=(rest,NS())),return_to_start=Mock(),state_is_valid=Mock(return_value=None))
+        replan_held=Mock(return_value=(rest,NS())),preflight_cycle=Mock(),state_is_valid=Mock(return_value=None))
     rt = NS(scene=scene,robot=robot,motion=motion,metrics={},report=Mock(),refresh=Mock(),
         check_cancel=Mock(),wait_pause=Mock(),ensure_driver=Mock(),stop=Mock(),recovery=Recovery(),
-        mode='relocate',physical_relocate_count=0,cameras=NS(check=Mock()),stop_event=threading.Event())
+        mode='relocate',physical_relocate_count=0,cameras=NS(check=Mock()),stop_event=threading.Event(),
+        park_qualified_file=NS(exists=lambda:True),park_arm=Mock())
     action = Actions(rt)
     action.capture_grip_view = Mock(return_value={'frame_id':'anchor'})
     action.verify_pick = Mock(return_value=True)
@@ -105,7 +106,7 @@ class RelocateContract(unittest.TestCase):
             result = action.relocate(obj.id,placement,**options)
         return result
 
-    def test_full_contract_removes_static_payload_and_returns_using_observed_cube(self):
+    def test_full_contract_prechecks_exit_and_parks_using_observed_cube(self):
         setup = action_contract();obj,rt,action,*_ = setup
         result = self.invoke(setup)
         self.assertTrue(result.success,result.reason)
@@ -114,8 +115,11 @@ class RelocateContract(unittest.TestCase):
         self.assertLess(names.index('extract_vertical'),names.index('release'))
         action.verify_pick.assert_called_once()
         action.verify_placement.assert_called_once()
-        rt.motion.return_to_start.assert_called_once()
-        self.assertIs(rt.motion.return_to_start.call_args.args[-1],rt.scene.native_object.return_value)
+        self.assertGreaterEqual(rt.motion.preflight_cycle.call_count,2)
+        rt.park_arm.assert_called_once()
+        self.assertIs(rt.motion.make_world.call_args.args[0].cubes[obj.id],rt.scene.native_object.return_value)
+        self.assertTrue(result.evidence['retreat_completed'])
+        self.assertTrue(result.evidence['parked'])
         self.assertEqual(rt.physical_relocate_count,1)
 
     def test_unconfirmed_holding_stops_before_transfer_and_release(self):
@@ -182,6 +186,49 @@ class RelocateContract(unittest.TestCase):
 
 
 class GeometryPolicy(unittest.TestCase):
+    def test_incomplete_exit_blocks_before_any_actuator_call(self):
+        setup=action_contract();obj,rt,action,placement,plan,_=setup
+        rt.motion.preflight_cycle.side_effect=ValueError('retreat: no safe Park route')
+        with patch('wristlab.actions.choose_grasp',return_value=(None,plan,NS())):
+            result=action.relocate(obj.id,placement)
+        self.assertFalse(result.success)
+        rt.motion.execute_trajectory.assert_not_called()
+        rt.motion.driver.confirm_grasp.assert_not_called()
+        rt.park_arm.assert_not_called()
+
+    def test_full_cycle_requires_stationary_released_cube_and_park_exit(self):
+        motion=Motion.__new__(Motion);motion.check_path=Mock();motion.plan_park=Mock()
+        phase=lambda name:Phase(name,(dict(Q),dict(Q)))
+        phases=tuple(phase(name) for name in ('approach','enter','grasp','extract_vertical','transfer','lower_to_support','release','retract'))
+        plan=NS(phases=phases)
+        with self.assertRaisesRegex(ValueError,'stationary released cube'):
+            motion.preflight_cycle(plan,NS())
+        plan.phases=phases[:-1]+(Phase('retract',(dict(Q),dict(Q)),placed_cube=NS()),)
+        motion.preflight_cycle(plan,NS())
+        motion.plan_park.assert_called_once()
+        plan.phases=plan.phases[:-1]
+        with self.assertRaisesRegex(ValueError,'retract'):
+            motion.preflight_cycle(plan,NS())
+
+    def test_park_cannot_bypass_latched_stop(self):
+        rt=Runtime.__new__(Runtime);rt.stop_event=threading.Event();rt.stop_event.set()
+        rt.robot=Mock();rt.cameras=Mock()
+        with self.assertRaisesRegex(RuntimeError,'STOP'):
+            rt.park_arm(dry=False,attended=True)
+        rt.robot.assert_not_called()
+        rt.robot.enable.assert_not_called()
+        rt.robot.read_state.assert_not_called()
+
+    def test_native_per_pair_queries_preserve_ordinary_collisions(self):
+        robot=Robot('/home/jetsonnx/Projects/so101_autonomous_pick_place',ROOT/'runtime/unit')
+        model=robot.backend.model
+        ready=json.loads((ROOT/'runtime/contact-free-trial.json').read_text())['start']
+        for q in (Q,ready):
+            first=model.collides(model.pose(q));pairs=model.pair_collisions(q)
+            self.assertEqual(bool(first),bool(pairs))
+            if first:self.assertIn(first,pairs)
+            self.assertEqual(len(model.pair_clearances(q)),19)
+
     def test_wrist_visibility_does_not_require_overview_identity(self):
         scene=Scene(NS())
         scene.raw={'wrist':[{'color':'green','quad':np.array([[0,0],[20,0],[20,20],[0,20]]),'center_px':[10,10]}]}
@@ -303,6 +350,8 @@ class GeometryPolicy(unittest.TestCase):
         rt.blocking_conditions=Mock(return_value=[])
         rt.motion=NS(grasp_mode='wrist_refinement')
         rt.robot=NS(last_state=None,arm=None);rt.scene=NS(held=None,state=SceneState())
+        rt.robot.motor_health={};rt.motor_warnings=[];rt.parked=False;rt.last_motion_unix=time.time()
+        rt.park_error=rt.recovery_proposal=None;rt.physical_progress={}
         rt.initialized=False;rt.running=False;rt.phase='initializing';rt.detail='check'
         rt.stop_event=threading.Event();rt.pause_event=threading.Event();rt.fault_latched=False
         rt.mode=rt.started=rt.finished=rt.selected=None

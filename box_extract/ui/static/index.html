@@ -57,7 +57,7 @@
     </select></label></p>
     <div class="actions"><button id="task-plan">Рассчитать задачу</button><button id="experiment-start" class="primary">Start · эксперимент</button></div>
     <label class="check"><input type="checkbox" id="dry" checked> Только геометрическая проверка, без движения</label>
-    <div class="actions"><button id="pause">Pause</button><button id="reset">Сброс STOP</button></div>
+    <div class="actions"><button id="pause">Pause</button><button id="park">Park · рассчитать</button><button id="park-run" disabled>Park · выполнить у STOP</button><button id="reset">Сброс STOP</button></div>
     <button id="stop" class="danger">STOP · остановить оба исполнителя</button>
 
     <div id="state" class="state">
@@ -67,6 +67,8 @@
     </div>
     <div id="metrics" class="hint"></div>
     <div id="joints" class="hint"></div>
+    <div id="motor-health" class="hint"></div>
+    <div id="motor-warnings" class="note"></div>
     <div id="action-result" class="note">Физически подтверждённых переносов пока нет.</div>
     <pre id="task-proposal" hidden></pre>
     <div id="blockers" class="note"></div>

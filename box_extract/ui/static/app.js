@@ -70,6 +70,12 @@ document.getElementById('scene-btn').addEventListener('click',()=>refreshScene()
 document.getElementById('stop').addEventListener('click',async()=>{await api('/api/stop',{});await poll();});
 document.getElementById('reset').addEventListener('click',async()=>{try{await api('/api/reset',{});}catch(err){error(err);}await poll();});
 document.getElementById('pause').addEventListener('click',async()=>{await api('/api/pause',{paused:!statusData?.paused});await poll();});
+document.getElementById('park').addEventListener('click',async()=>{try{await api('/api/park',{dry:true});}catch(err){error(err);}await poll();});
+document.getElementById('park-run').addEventListener('click',async()=>{
+  if(confirm('Выполнить показанный Park? Я наблюдаю руку, камера и кабель свободны, STOP доступен.')){
+    try{await api('/api/park',{dry:false,operator_at_stop:true});}catch(err){error(err);}await poll();
+  }
+});
 document.getElementById('experiment-start').addEventListener('click',()=>start(document.getElementById('experiment').value));
 document.getElementById('task-plan').addEventListener('click',async()=>{
   const body={mode:document.getElementById('experiment').value,destination:document.getElementById('destination').value,object_id:statusData?.selected,count:2,rows:2,columns:2};
@@ -80,22 +86,27 @@ document.getElementById('dry').addEventListener('change',gate);
 function gate(){
   const dry=document.getElementById('dry').checked;
   ['relocate','stow','extract','experiment-start'].forEach(id=>document.getElementById(id).disabled=lastRunning||statusData?.stop_latched||(!dry&&!statusData?.ready));
+  document.getElementById('park').disabled=lastRunning||statusData?.stop_latched;
+  document.getElementById('park-run').disabled=lastRunning||statusData?.stop_latched||!statusData?.results?.some(r=>r.status==='PARK_CHECKED');
 }
 async function poll(){
   try{
     const s=await api('/api/status');statusData=s;lastRunning=s.running;gate();
-    document.getElementById('state-text').textContent=({NOT_INITIALIZED:'Инициализация',READY:'Ready',PLANNING:'Планирование',EXECUTING:'Движение',RECOVERING:'Восстановление',SAFETY_BLOCKED:'Движение заблокировано',COMPLETED:'Завершено',FAILED:'Задача не выполнена'}[s.state]||s.phase);
+    document.getElementById('state-text').textContent=({NOT_INITIALIZED:'Инициализация',READY:'Ready',PARKED:'PARKED',PLANNING:'Планирование',EXECUTING:'Движение',RECOVERING:'Восстановление',SAFETY_BLOCKED:'Движение заблокировано',COMPLETED:'Завершено',FAILED:'Задача не выполнена'}[s.state]||s.phase);
     document.getElementById('state-dot').className='dot '+(s.running?'run':s.ready?'ok':'bad');
     document.getElementById('state-detail').textContent=s.detail;
     document.getElementById('blockers').textContent=s.physical_blocker?
       'Программный запас исходной позы: выборка поверхности '+(1000*s.physical_blocker.clearance_m).toFixed(1)+' мм при требуемых '+(1000*s.physical_blocker.required_clearance_m).toFixed(0)+' мм. '+s.physical_blocker.required_action+' '+s.physical_blocker.recheck:
       s.blockers.join(' · ');
     const qualification=document.getElementById('qualification');qualification.style.whiteSpace='pre-line';
-    qualification.textContent=(s.known_working_configuration?'Калибровка суставов и FK сохранены от физически работавшей системы. Восстановлен '+s.startup_driver+'; автоматическая подготовка позы ещё не разрешена.\n\n':'')+
+    qualification.textContent=(s.known_working_configuration?'Калибровка суставов и FK сохранены от физически работавшей системы. Драйвер '+s.startup_driver+'; режим '+s.grasp_mode+'.\n\n':'')+
       (s.blocking_conditions||[]).map(b=>b.code+' ['+b.category+']: '+b.reason+'\nСнятие: '+b.clear_when).join('\n\n');
     document.getElementById('action-result').textContent=s.results.length?
-      s.results.map(r=>(r.success?'Успех: ':'Не выполнено: ')+r.reason+' · физически подтверждено: '+(r.evidence?.physical_verified?'да':'нет')).join('\n'):
-      'Физически подтверждённых переносов пока нет.';
+      s.results.map(r=>(r.success?'Успех: ':'Не выполнено: ')+(r.reason||r.status)+' · физически подтверждено: '+(r.evidence?.physical_verified||r.physical_verified?'да':'нет')).join('\n'):
+      (s.physical_progress?.gripper_release_completed?'Захват, перенос зелёного кубика в белую коробку и отпускание физически выполнены. Retreat и Park ещё не завершены.':'Физически подтверждённых переносов пока нет.');
+    const motors=Object.entries(s.motor_health||{});
+    document.getElementById('motor-health').textContent=motors.map(([name,m])=>name+': '+m.temperature_c+' °C · '+(s.motor_loads?.[name]??0).toFixed(1)+'% · '+m.current_ma.toFixed(1)+' мА · '+m.voltage_v.toFixed(1)+' В · torque '+(m.torque_enabled?'ON':'OFF')).join(' | ');
+    document.getElementById('motor-warnings').textContent=(s.motor_warnings||[]).join(' · ')+(s.park_error?' · Park: '+s.park_error:'');
     document.getElementById('pause').textContent=s.paused?'Resume':'Pause';
     const m=s.metrics;document.getElementById('metrics').textContent=[['Start → команда','first_command_s'],['Vision','vision_s'],['Захват','grasp_planning_s'],['IK','ik_s'],['Коллизии','collision_checking_s'],['Путь','motion_planning_s'],['Движение','actual_motion_s'],['Проверка','verification_s']].map(([label,key])=>label+': '+(m[key]==null?'не выполнялось':(1000*m[key]).toFixed(1)+' мс')).join(' · ');
     document.getElementById('log').textContent=s.log.join('\n');

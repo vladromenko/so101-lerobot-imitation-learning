@@ -25,6 +25,11 @@ class Robot:
         self.on_tick = None
         self.first_command_at = None
         self.audit_cache = None
+        self.servo_calibration = json.loads(Path(robot['calibration']).read_text())
+        self.motor_health = {}
+        self.motor_limits = {}
+        self.health_at = 0.
+        self.health_interval_s = 1.
 
     @staticmethod
     def from_native(joints):
@@ -66,14 +71,18 @@ class Robot:
             if not self.owns_lease():
                 raise RuntimeError('hardware lease was lost; no further bus reads')
             q, loads, currents = self.arm.read()
+            observed_at = time.time()
             state = {'positions': q, 'loads': loads, 'currents': currents}
+            self.read_motor_health()
+            state['motor_health'] = self.motor_health
         else:
             self.acquire('read_only_feedback')
             try:
                 state = ReadOnlySO101(self.config.robot['port'], self.config.robot['calibration']).read()
+                observed_at = time.time()
             finally:
                 self.release()
-        state['timestamp'] = time.time()
+        state['timestamp'] = observed_at
         state['q'] = self.from_native(state['positions'])
         state['gripper'] = float(state['positions']['gripper'])
         self.last_state = state
@@ -84,6 +93,48 @@ class Robot:
             temporary.write_text(json.dumps(record))
             temporary.replace(self.lease)
         return state
+
+    def read_motor_health(self, force=False):
+        if self.arm is None or (not force and time.time()-self.health_at<self.health_interval_s):
+            return self.motor_health
+        from lerobot.motors.feetech.tables import MODEL_CONTROL_TABLE
+        table = MODEL_CONTROL_TABLE['sts3215']
+        names = (*ARM_JOINTS,'gripper')
+        def decode(row,base,name):
+            address,size = table[name]
+            return int.from_bytes(row[address-base:address-base+size],'little')
+        if not self.motor_limits:
+            rows = self.arm.raw.read_registers(0,40)
+            for name,row in zip(names,rows):
+                self.motor_limits[name] = {key:decode(row,0,key) for key in
+                    ('Model_Number','Max_Temperature_Limit','Max_Voltage_Limit','Min_Voltage_Limit',
+                     'Protection_Current','Overload_Torque','Protection_Time','Over_Current_Protection_Time')}
+        rows = self.arm.raw.read_registers(40,31)
+        calibration = json.loads(Path(self.config.robot['calibration']).read_text())
+        result = {}
+        for name,row in zip(names,rows):
+            raw = decode(row,40,'Goal_Position');cal = calibration[name]
+            goal = ((raw-cal['range_min'])/(cal['range_max']-cal['range_min'])*100. if name=='gripper'
+                    else (raw-(cal['range_min']+cal['range_max'])/2)*360./4095.)
+            result[name] = {'goal':goal,'temperature_c':decode(row,40,'Present_Temperature'),
+                'voltage_v':decode(row,40,'Present_Voltage')/10.,'status_raw':decode(row,40,'Status'),
+                'torque_enabled':bool(decode(row,40,'Torque_Enable')),'moving':bool(decode(row,40,'Moving')),
+                'current_ma':decode(row,40,'Present_Current')*6.5,'limits':self.motor_limits[name]}
+        self.motor_health,self.health_at = result,time.time()
+        return result
+
+    def encoder_steps(self):
+        return {name:(100./(cal['range_max']-cal['range_min']) if name=='gripper' else 360./4095.)
+                for name,cal in self.servo_calibration.items()}
+
+    def quantized_command(self, joints):
+        result = {}
+        for name,cal in self.servo_calibration.items():
+            lo,hi = cal['range_min'],cal['range_max']
+            raw = int(joints[name]/100.*(hi-lo)+lo) if name=='gripper' else int(joints[name]*4095./360.+(lo+hi)/2)
+            raw = min(4095,max(0,raw))
+            result[name] = (raw-lo)/(hi-lo)*100. if name=='gripper' else (raw-(lo+hi)/2)*360./4095.
+        return result
 
     def audit_state(self, state):
         from .diagnostics import audit_pose

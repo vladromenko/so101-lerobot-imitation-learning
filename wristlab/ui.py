@@ -39,10 +39,10 @@ def task_plan(payload: dict):
 @app.get('/api/diagnostics')
 def diagnostics():
     import json
-    path = root/'runtime/escape-proposal.json'
+    path = root/'runtime/invalid-start-proposal.json'
     return {'current':None if runtime.robot.last_state is None else runtime.robot.audit_state(runtime.robot.last_state),
             'visual_measurements':runtime.scene.passive_measurements,
-            'escape_proposal':None if not path.exists() else json.loads(path.read_text()),
+            'retreat_recovery_proposal':None if not path.exists() else json.loads(path.read_text()),
             'robot_motion_commanded':runtime.robot.first_command_at is not None}
 
 
@@ -73,7 +73,17 @@ def reset():
 def prepare(payload: dict):
     try:
         runtime.prepare(payload)
-        return {'queued':True,'scope':'attended overhead geometry' if payload.get('grasp_mode')=='overhead_grasp' else 'attended folded exit only'}
+        return {'queued':True,'scope':'read-only retreat recovery; STOP retained' if payload.get('mode')=='RECOVERY_FROM_INVALID_START' else
+                'attended overhead geometry' if payload.get('grasp_mode')=='overhead_grasp' else 'attended folded exit only'}
+    except (ValueError,RuntimeError) as exc:
+        raise HTTPException(409,str(exc)) from exc
+
+
+@app.post('/api/park')
+def park(payload: dict):
+    try:
+        runtime.request_park(payload)
+        return {'queued':True,'stop_reset':False}
     except (ValueError,RuntimeError) as exc:
         raise HTTPException(409,str(exc)) from exc
 
@@ -103,6 +113,7 @@ def live():
             'age_s':None if state is None else time.time()-state['timestamp'],
             'pos':None if state is None else state['positions'],
             'loads':None if state is None else state['loads'],'currents':None if state is None else state['currents'],
+            'motor_health':runtime.robot.motor_health,'motor_health_at':runtime.robot.health_at,
             'source':'wristlab native encoder read'}
 
 

@@ -91,15 +91,17 @@ class Actions:
                     world = self.motion.make_world(native_scene)
                     try:
                         candidate,plan,world = choose_grasp(obj,native_scene,self.robot,self.motion.planner,start,rt.check_cancel,world)
+                        self.motion.preflight_cycle(plan,world)
                         placement = choice
                     except ValueError as exc:
+                        plan = None
                         failures.append(str(exc))
             if plan is None:
                 raise ValueError('; '.join(failures[-3:]))
             stage = 'path_check'
             rt.last_plan = plan
-            if not resume_held:
-                self.motion.check_path(plan,world)
+            if resume_held:
+                self.motion.preflight_cycle(plan,world,require_pick=False)
             if dry:
                 return ActionResult(True,'geometric path checked; no actuator commands',object_id,self.scene.state,
                                     {'physical_verified':False,'motion_started':False})
@@ -157,7 +159,7 @@ class Actions:
                         stage = 'grasp_planning'
                         candidate,plan,world = choose_grasp(obj,native_scene,self.robot,self.motion.planner,current,rt.check_cancel,world)
                         stage = 'path_check'
-                        self.motion.check_path(plan,world)
+                        self.motion.preflight_cycle(plan,world)
                         queue = list(plan.phases)
                         aligned = observation is not None
                         phase = None
@@ -193,8 +195,9 @@ class Actions:
                             rt.metrics['motion_planning_s'] = (rt.metrics.get('motion_planning_s') or 0.)+time.perf_counter()-planning_started
                         world = self.motion.make_world(new_scene)
                         stage = 'path_check'
-                        self.motion.check_path(remainder,world)
+                        self.motion.preflight_cycle(remainder,world,require_pick=False)
                         plan = remainder
+                        rt.last_plan = plan
                         queue = list(remainder.phases)
                     elif stage == 'extract_vertical':
                         verify_started = time.perf_counter()
@@ -210,6 +213,17 @@ class Actions:
                         if pending is not None and pending.exists():
                             pending.unlink()
                         rt.pending_grasp = None
+                        if hasattr(rt,'output'):
+                            import pickle
+                            placed = next(p.placed_cube for p in queue if p.name=='retract')
+                            released = replace(native_scene,cubes=native_scene.cubes|{object_id:placed})
+                            checkpoint = {'plan':plan,'native_scene':released,'object':obj,'placement':placement,
+                                'start':start,'release_actual':self.robot.read_state()['positions'],
+                                'boxes':dict(self.scene.metric_boxes),'calibration_sha256':self.scene.geometry.fingerprint}
+                            temporary = rt.output/'released-placement.tmp'
+                            with temporary.open('wb') as handle:
+                                pickle.dump(checkpoint,handle)
+                            temporary.replace(rt.output/'released-placement.pkl')
             stage = 'verify_placement'
             verify_started = time.monotonic()
             verified,observed = self.verify_placement(obj,placement)
@@ -227,14 +241,19 @@ class Actions:
                 rt.record_action_measurement('placement',object_id,{'requested_pose_m':placement.object_pose.tolist(),
                     'observed_pose_m':observed.tolist(),'error_m':(observed[:3,3]-placement.object_pose[:3,3]).tolist(),
                     'position_sigma_m':measured.evidence['position_sigma_m']})
-            returned = rt.physical_relocate_count==0 or rt.mode=='relocate'
-            if returned:
-                stage = 'return_planning'
-                self.motion.return_to_start(start,plan,world,self.scene.native_object(object_id))
+            parked = False
+            observed_scene = replace(native_scene,cubes=native_scene.cubes|{object_id:self.scene.native_object(object_id)})
+            observed_world = self.motion.make_world(observed_scene)
+            self.motion.plan,self.motion.world = plan,observed_world
+            if rt.mode=='relocate' and rt.park_qualified_file.exists():
+                stage = 'park'
+                rt.park_arm(plan,observed_world)
+                parked = True
             rt.physical_relocate_count += 1
             rt.metrics['cycle_s'] = time.monotonic()-started
             return ActionResult(True,'relocated and observed at destination',object_id,self.scene.state,
-                {'physical_verified':True,'motion_started':True,'placement_tolerance_m':placement.tolerance,'returned_to_start':returned})
+                {'physical_verified':True,'motion_started':True,'placement_tolerance_m':placement.tolerance,
+                 'retreat_completed':True,'parked':parked,'park_pending_attended_trial':rt.mode=='relocate' and not parked})
         except Exception as exc:
             reason = f'{stage}: {type(exc).__name__}: {exc}'
             empty = stage=='grasp' and str(exc)=='measured grasp differs from jaw-mesh prediction'

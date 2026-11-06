@@ -530,7 +530,19 @@ class AttachmentGeometry:
                 return name+': table clearance'
             wall = scene.box.collision(points)
             if wall:
-                return name+': '+wall
+                recovery = getattr(self,'recovery_walls',{})
+                if not recovery:
+                    return name+': '+wall
+                inverse = np.linalg.inv(scene.box.base_from_box)
+                local_points = points@inverse[:3,:3].T+inverse[:3,3]
+                for lower,upper,label in scene.box.solid_parts():
+                    if np.all(local_points.max(0)>=lower) and np.all(local_points.min(0)<=upper):
+                        bound = recovery.get((name,label))
+                        if bound is None:
+                            return name+': '+label
+                        gap = float(np.max(np.maximum(bound['lower']-local_points.max(0),local_points.min(0)-bound['upper'])))
+                        if gap<bound['minimum']:
+                            return name+': recovery decreases '+label
             for link,mesh in meshes.items():
                 # Only the fastening parent is an intended mechanical contact.
                 intended = link==parent or link in self.allowed_contacts.get(name,set())
