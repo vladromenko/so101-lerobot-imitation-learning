@@ -163,9 +163,10 @@ class Robot:
             native = preview(state['positions'],result['offset'],goals['gripper'])
             def valid_packet(packet):
                 return len(packet)==26 and packet[:3]==b'\xff\xff\xfe' and (sum(packet[2:])&255)==255
-            checked = (native['ordinary_packet_unchanged'] and valid_packet(native['factory_packet']) and
+            checked = (native.get('stop_policy')=='last_checked_hardware_goals' and native.get('last_packet_retained') is True and native['ordinary_packet_unchanged'] and valid_packet(native['factory_packet']) and
                        valid_packet(native['supported_packet']) and all(abs(native['goals'][j]-goals[j])<steps[j]/2 for j in names))
             result.update(supported_stop_packet_checked=bool(checked),supported_stop_goals=native['goals'],
+                supported_stop_policy=native.get('stop_policy'),
                 factory_stop_packet_hex=native['factory_packet'].hex(),supported_stop_packet_hex=native['supported_packet'].hex())
         return result
 

@@ -345,11 +345,6 @@ class Motion:
             for sample in self.recovery_envelope(start,point,holding):
                 planning_cancel()
                 refusal = world.reason(sample,**policy)
-                if refusal is None:
-                    stop_command = self.robot.synchronized_command(sample,self.recovery_mapping)
-                    refusal = world.reason(stop_command,**policy)
-                    if refusal:
-                        refusal = 'load-supported STOP target: '+refusal
                 if refusal:
                     self.recovery_report.update(rejected_waypoint=index,rejected_nominal_pose=point,
                         rejected_response_pose=sample,rejected_response_gaps_m=self.recovery_gaps(world,sample))
@@ -368,8 +363,7 @@ class Motion:
         # a stopped compensated target may not cross the fixed finger plane.
         placed = policy['placed_cube']
         for sample in self.recovery_envelope(start,joints,holding):
-            command = self.robot.synchronized_command(sample,self.recovery_mapping)
-            for q in (sample,command):
+            for q in (sample,):
                 if self.planner._fixed_jaw_clearance(q,placed)<0.:
                     frame = self.robot.backend.model.frames(q)['gripper_link']
                     points = self.robot.backend._transform_points(frame,self.robot.backend.meshes['gripper_link'])
@@ -414,9 +408,10 @@ class Motion:
         contact = next((key for key,value in stop_gaps.items() if value<=0.),None)
         supported = self.recovery_mapping.get('supported_stop_packet_checked') is True
         if supported:
-            self.recovery_report.update(stop_policy='load_supported_hold',
+            self.recovery_report.update(stop_policy='last_checked_hardware_goals',
                 default_freeze_rejected=contact is not None,
                 supported_stop_goals=self.recovery_mapping['supported_stop_goals'],
+                stop_response_model='trajectory aborted; last checked targets retained; settling enclosed by native tracking and command-response envelope',
                 physical_supported_stop_tested=False)
         if contact and not supported:
             self.recovery_report.update(status='BLOCKED',code='STOP_SETTLING_CLEARANCE',pair=contact,

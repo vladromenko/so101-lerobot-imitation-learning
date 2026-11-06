@@ -2,12 +2,12 @@
 +++ b/python/so101ik/_arm.c
 @@ -9,0 +10 @@
 +#include "sts.h"
-@@ -29,0 +31,3 @@
+@@ -29,0 +31,4 @@
 +    int supported_stop;
 +    int supported_grip;
++    int supported_goals[SO101_NJ];
 +    so101_real stop_offset[SO101_NJ];
-@@ -34,0 +39,44 @@
-+
+@@ -35,0 +41,42 @@
 +/* Wristlab HAL adapter. The factory follower and freeze() are unchanged.
 + * Only an explicitly armed, empty-tool recovery uses the measured hold reference. */
 +static int adapter_raw(const so101_servo_cal *cal,int joint,so101_real angle) {
@@ -39,9 +39,7 @@
 +        if (input[7+3*j]!=o->arm.cal[j].id ||
 +            so101_sts_u16(input+8+3*j)!=adapter_raw(&o->arm.cal[j],j,o->arm.goal[j])) return 0;
 +    }
-+    int raw[SO101_NJ];
-+    if (!supported_raw(o,o->arm.goal,o->stop_offset,raw)) return 0;
-+    raw[SO101_GRIP]=o->supported_grip;
++    const int *raw=o->supported_goals;
 +    memcpy(output,input,n);
 +    for (int j=0;j<SO101_NJ;j++) {
 +        output[8+3*j]=(uint8_t)(raw[j]&255);
@@ -51,11 +49,25 @@
 +    output[n-1]=(uint8_t)~sum;
 +    return 1;
 +}
-@@ -39 +87,2 @@
++
+@@ -36,0 +84,7 @@
++static int record_supported_goals(ArmObject *o,const uint8_t *b,int n) {
++    if (!o->supported_stop || n!=8+3*SO101_NJ || b[0]!=255 || b[1]!=255 ||
++        b[2]!=254 || b[4]!=0x83 || b[5]!=STS_GOAL_POSITION || b[6]!=2) return 0;
++    for (int j=0;j<SO101_NJ;j++) if (b[7+3*j]!=o->arm.cal[j].id) return 0;
++    for (int j=0;j<SO101_NJ;j++) o->supported_goals[j]=so101_sts_u16(b+8+3*j);
++    return 1;
++}
+@@ -39 +93,2 @@
 -    int r;
 +    int r;uint8_t supported[260];
 +    if (supported_packet(o,b,n,supported)) b=supported;
-@@ -271,0 +321,129 @@
+@@ -41 +96,3 @@
+-    Py_END_ALLOW_THREADS return r;
++    Py_END_ALLOW_THREADS
++    if (r==n) record_supported_goals(o,b,n);
++    return r;
+@@ -271,0 +329,144 @@
 +}
 +
 +/* Read-only reconnect: preserve hardware goals, torque and RAM settings. */
@@ -90,11 +102,14 @@
 +            GIVE(self);PyErr_SetString(PyExc_ValueError,"hold reference exceeds native start bound");return NULL;
 +        }
 +    }
-+    int grip;
-+    if (so101_sts_read2(&self->arm.hal,(uint8_t)self->arm.cal[SO101_GRIP].id,STS_GOAL_POSITION,&grip)) {
-+        GIVE(self);PyErr_SetString(Fault,"cannot read existing jaw holding goal");return NULL;
++    int goals[SO101_NJ];
++    for (int j=0;j<SO101_NJ;j++) {
++        if (so101_sts_read2(&self->arm.hal,(uint8_t)self->arm.cal[j].id,STS_GOAL_POSITION,&goals[j])) {
++            GIVE(self);PyErr_SetString(Fault,"cannot read existing powered holding goals");return NULL;
++        }
 +    }
-+    memcpy(self->stop_offset,offset,sizeof offset);self->supported_grip=grip;self->supported_stop=1;
++    memcpy(self->stop_offset,offset,sizeof offset);memcpy(self->supported_goals,goals,sizeof goals);
++    self->supported_grip=goals[SO101_GRIP];self->supported_stop=1;
 +    GIVE(self);Py_RETURN_NONE;
 +}
 +static void goal_packet(ArmObject *o,const int *raw,uint8_t *packet) {
@@ -116,19 +131,29 @@
 +    if (!supported_raw(self,actual,offset,raw)) {GIVE(self);PyErr_SetString(PyExc_ValueError,"hold goal outside calibration limits");return NULL;}
 +    so101_real saved_goal[SO101_NJ],saved_offset[SO101_NJ];
 +    memcpy(saved_goal,self->arm.goal,sizeof saved_goal);memcpy(saved_offset,self->stop_offset,sizeof saved_offset);
-+    int saved_on=self->supported_stop,saved_grip=self->supported_grip;
++    int saved_on=self->supported_stop,saved_grip=self->supported_grip,saved_raw[SO101_NJ];
++    memcpy(saved_raw,self->supported_goals,sizeof saved_raw);
 +    self->supported_stop=1;memcpy(self->stop_offset,offset,sizeof offset);
 +    so101_servo_cal *gc=&self->arm.cal[SO101_GRIP];
 +    self->supported_grip=adapter_raw(gc,SO101_GRIP,grip+50.0/(gc->range_max-gc->range_min));
 +    raw[SO101_GRIP]=self->supported_grip;
++    memcpy(self->supported_goals,raw,sizeof raw);
 +    for (int j=0;j<SO101_NJ;j++) {self->arm.goal[j]=actual[j];plain[j]=adapter_raw(&self->arm.cal[j],j,actual[j]);}
 +    uint8_t before[8+3*SO101_NJ],after[8+3*SO101_NJ],normal[8+3*SO101_NJ],ignored[260];
 +    goal_packet(self,plain,before);int transformed=supported_packet(self,before,sizeof before,after);
 +    goal_packet(self,raw,normal);
 +    for (int j=0;j<SO101_NJ;j++) self->arm.goal[j]=actual[j]+offset[j];
 +    int ordinary_changed=supported_packet(self,normal,sizeof normal,ignored);
++    int changed[SO101_NJ];memcpy(changed,raw,sizeof changed);
++    changed[0]+=changed[0]<self->arm.cal[0].range_max?1:-1;
++    uint8_t updated[8+3*SO101_NJ],retained[8+3*SO101_NJ];
++    goal_packet(self,changed,updated);
++    int recorded=record_supported_goals(self,updated,sizeof updated);
++    memcpy(self->arm.goal,actual,sizeof actual);
++    int kept=recorded && supported_packet(self,before,sizeof before,retained) && !memcmp(retained,updated,sizeof updated);
 +    memcpy(self->arm.goal,saved_goal,sizeof saved_goal);memcpy(self->stop_offset,saved_offset,sizeof saved_offset);
 +    self->supported_stop=saved_on;self->supported_grip=saved_grip;
++    memcpy(self->supported_goals,saved_raw,sizeof saved_raw);
 +    GIVE(self);
 +    if (!transformed) {PyErr_SetString(PyExc_RuntimeError,"native stop packet was not recognized");return NULL;}
 +    so101_real goals[SO101_NJ];
@@ -137,10 +162,12 @@
 +        goals[j]=j==SO101_GRIP?(raw[j]-cal->range_min)*100.0/(cal->range_max-cal->range_min):
 +            (raw[j]-(cal->range_min+cal->range_max)/2.0)*360/4095;
 +    }
-+    return Py_BuildValue("{s:N,s:N,s:N,s:O}","goals",by_joint(goals),
++    return Py_BuildValue("{s:N,s:N,s:N,s:O,s:O,s:s}","goals",by_joint(goals),
 +        "factory_packet",PyBytes_FromStringAndSize((char*)before,sizeof before),
 +        "supported_packet",PyBytes_FromStringAndSize((char*)after,sizeof after),
-+        "ordinary_packet_unchanged",ordinary_changed?Py_False:Py_True);
++        "ordinary_packet_unchanged",ordinary_changed?Py_False:Py_True,
++        "last_packet_retained",kept?Py_True:Py_False,
++        "stop_policy","last_checked_hardware_goals");
 +}
 +
 +static PyObject *arm_adopt_hold(ArmObject *self, PyObject *noargs) {
@@ -185,11 +212,11 @@
 +    a->have_pose=0; a->have_target=0; a->folded=0; a->torque=1;
 +    h_log(self,"adopt_hold: stationary powered servos; all hardware goals preserved");
 +    GIVE(self); Py_RETURN_TRUE;
-@@ -676,0 +855,3 @@
+@@ -676,0 +878,3 @@
 +    {"supported_stop",(PyCFunction)arm_supported_stop,METH_O,"scope a load-supported native STOP to the measured holding reference; None restores the default"},
 +    {"preview_supported_stop",(PyCFunction)arm_preview_supported_stop,METH_VARARGS,"read-only native holding-goal prediction"},
 +    {"read_registers", (PyCFunction)arm_read_registers, METH_VARARGS, "same-owner read-only servo register block"},
-@@ -679,0 +861 @@
+@@ -679,0 +884 @@
 +    {"adopt_hold", (PyCFunction)arm_adopt_hold, METH_NOARGS, "read-only adoption of stationary already-powered servos; False if all torque is off"},
 --- a/python/so101ik/_core.c
 +++ b/python/so101ik/_core.c
