@@ -291,11 +291,12 @@ class Runtime:
                         'startup path checked; no motion' if payload.get('dry') else 'folded exit physically completed; ordinary margins satisfied')
         except Exception as exc:
             self.report('failed',str(exc))
+            self.results = [{'success':False,'reason':str(exc),'physical_verified':False}]
             held_planning = isinstance(exc,ValueError) and self.scene.held is not None and self.motion.driver is not None and self.motion.driver.retention.armed
             if held_planning:
                 self.motion.driver.confirm_retention()
                 self.report('recovering',str(exc))
-            elif self.robot.first_command_at is not None and (payload.get('grasp_mode')!='overhead_grasp' or payload.get('recover_empty_approach') or payload.get('resume_supported_grasp')):
+            elif self.robot.first_command_at is not None and (payload.get('grasp_mode')!='overhead_grasp' or payload.get('recover_empty_approach') or payload.get('resume_supported_grasp') or payload.get('resume_released_placement')):
                 self.stop(reason='startup: '+str(exc),hardware_fault=True)
         finally:
             if self.robot.first_command_at is not None:

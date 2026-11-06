@@ -182,6 +182,20 @@ class RelocateContract(unittest.TestCase):
 
 
 class GeometryPolicy(unittest.TestCase):
+    def test_released_placement_guard_failure_latches_stop(self):
+        rt=Runtime.__new__(Runtime)
+        rt.check_cancel=Mock();rt.cameras=NS(check=Mock());rt.refresh=Mock()
+        rt.robot=NS(first_command_at=None);rt.scene=NS(held=None)
+        rt.report=Mock();rt.stop=Mock();rt.persist=Mock();rt.metrics={}
+        def fail_after_command(attendance):
+            rt.robot.first_command_at=time.monotonic()
+            raise RuntimeError('retract pos: wrist_camera_board_lens: box rear wall')
+        rt.resume_released_placement=fail_after_command
+        rt.perform_prepare({'grasp_mode':'overhead_grasp','resume_released_placement':True})
+        rt.stop.assert_called_once()
+        self.assertTrue(rt.stop.call_args.kwargs['hardware_fault'])
+        self.assertFalse(rt.results[0]['physical_verified'])
+
     def test_passive_current_image_does_not_invent_hidden_depth(self):
         record=json.loads((ROOT/'runtime/visual-measurement.json').read_text())
         feedback=json.loads((ROOT/'runtime/initial-feedback.json').read_text())['positions']

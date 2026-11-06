@@ -186,6 +186,11 @@ class Motion:
                     reason = self.edge_is_valid(start,goal,phase,plan,world)
                     if reason:
                         raise ValueError(f'{phase.name}: {reason}')
+                if phase.name=='retract':
+                    reason = self.planner._tracking_robust(phase.joints,world,target=plan.target_id,
+                        jaw_contact=phase.jaw_contact,placed_cube=phase.placed_cube)
+                    if reason:
+                        raise ValueError('retract: '+reason)
             finally:
                 world.release_origin = None
         return True
