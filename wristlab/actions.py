@@ -48,7 +48,7 @@ class Actions:
             raise ValueError('fresh target observation is required')
         return obj
 
-    def relocate(self, object_id, placement, dry=False, recovery_attempt=0):
+    def relocate(self, object_id, placement, dry=False, recovery_attempt=0, resume_held=False):
         rt = self.runtime
         started, motion_started = time.monotonic(), False
         executing,last_phase = False,None
@@ -56,8 +56,9 @@ class Actions:
         plan = world = None
         aligned,active_refined = False,False
         try:
-            obj = self.observe_object(object_id)
-            self.scene.reserve_object(object_id)
+            obj = self.scene.state.objects[object_id] if resume_held else self.observe_object(object_id)
+            if not resume_held:
+                self.scene.reserve_object(object_id)
             rt.report(stage,object_id)
             self.robot.read_state()
             reasons = self.motion.qualification_reasons(self.scene.geometry)
@@ -69,13 +70,21 @@ class Actions:
                 rt.ensure_driver()
             start = self.robot.read_state()['positions']
             choices = [placement]
-            if placement.support_surface in self.scene.state.boxes:
+            if placement.support_surface in self.scene.state.boxes and not resume_held:
                 for patch in self.scene.find_free_box_slots(placement.support_surface,obj.dimensions):
                     center = np.r_[np.mean(patch.polygon_xy_m,axis=0),patch.height_m+obj.dimensions[2]/2]
                     if np.linalg.norm(center-placement.object_pose[:3,3])>.015:
                         pose = placement.object_pose.copy();pose[:3,3] = center
                         choices.append(replace(placement,object_pose=pose))
             failures = []
+            if resume_held:
+                original = rt.resume_original
+                native_scene = self.scene.native_scene(object_id,placement)
+                native_scene = replace(native_scene,cubes=native_scene.cubes|{object_id:original})
+                previous = replace(rt.resume_plan,payload_local=self.motion.driver.payload_local_override)
+                plan,native_scene,world = rt.resume_remainder
+                start = dict(rt.resume_plan.phases[0].joints[0])
+                motion_started = True
             for choice in choices:
                 if plan is None:
                     native_scene = self.scene.native_scene(object_id,choice)
@@ -89,19 +98,25 @@ class Actions:
                 raise ValueError('; '.join(failures[-3:]))
             stage = 'path_check'
             rt.last_plan = plan
-            self.motion.check_path(plan,world)
+            if not resume_held:
+                self.motion.check_path(plan,world)
             if dry:
                 return ActionResult(True,'geometric path checked; no actuator commands',object_id,self.scene.state,
                                     {'physical_verified':False,'motion_started':False})
-            if not self.motion.contact_free_passed:
+            approached = not resume_held and not self.motion.contact_free_passed
+            if approached:
                 motion_started = True
                 executing = True
                 self.motion.contact_free_trial(plan,world,start)
                 executing = False
             self.motion.plan,self.motion.world = plan,world
+            if hasattr(rt,'output'):
+                import pickle
+                with (rt.output/'active-relocate.pkl').open('wb') as handle:
+                    pickle.dump({'plan':plan,'native_scene':native_scene,'object':obj,'placement':placement,'start':start},handle)
             held_verified = False
-            wrist_anchor = None
-            queue = list(plan.phases)
+            wrist_anchor = self.capture_grip_view(obj,time.time()) if resume_held else None
+            queue = [p for p in plan.phases if not approached or p.name not in ('open','approach')]
             while queue:
                 rt.wait_pause()
                 phase = queue.pop(0)
@@ -109,13 +124,15 @@ class Actions:
                 if stage == 'enter' and not aligned:
                     stage = 'visual_alignment'
                     try:
-                        observation = visual_alignment(obj,rt.cameras,self.robot,self.motion,plan,world,self.scene.geometry)
+                        observation = visual_alignment(obj,rt.cameras,self.robot,self.motion,plan,world,self.scene.geometry,
+                                                       allow_self_occlusion=object_id in self.scene.reserved)
                     except ValueError:
                         if active_refined or not hasattr(rt,'refine_object'):
                             raise
                         obj = rt.refine_object(object_id,plan,world)
                         active_refined,observation = True,None
-                    if observation is not None:
+                    continuation = observation is not None and observation.get('continuation_only',False)
+                    if observation is not None and not continuation:
                         observed_top = np.asarray(observation['observed_top_m'])
                         delta = observed_top-(obj.pose[:3,3]+[0.,0.,obj.dimensions[2]/2])
                         if hasattr(rt,'record_action_measurement'):
@@ -128,22 +145,31 @@ class Actions:
                         original = native_scene.cubes[object_id]
                         updated = replace(original,center_m=original.center_m+delta,vertices_m=original.vertices_m+delta)
                         self.scene.metric_objects[object_id] = updated
-                    rt.refresh()
-                    obj = self.scene.state.objects[object_id]
-                    native_scene = self.scene.native_scene(object_id,placement)
-                    current = self.robot.read_state()['positions']
-                    world = self.motion.make_world(native_scene)
-                    stage = 'grasp_planning'
-                    candidate,plan,world = choose_grasp(obj,native_scene,self.robot,self.motion.planner,current,rt.check_cancel,world)
-                    stage = 'path_check'
-                    self.motion.check_path(plan,world)
-                    queue = list(plan.phases)
-                    aligned = observation is not None
-                    phase = None
+                    if continuation:
+                        aligned,stage = True,phase.name
+                        rt.report('visual_alignment','reserved overhead plan retained; self-occlusion, fresh wrist identity, no spatial correction')
+                    else:
+                        rt.refresh()
+                        obj = self.scene.state.objects[object_id]
+                        native_scene = self.scene.native_scene(object_id,placement)
+                        current = self.robot.read_state()['positions']
+                        world = self.motion.make_world(native_scene)
+                        stage = 'grasp_planning'
+                        candidate,plan,world = choose_grasp(obj,native_scene,self.robot,self.motion.planner,current,rt.check_cancel,world)
+                        stage = 'path_check'
+                        self.motion.check_path(plan,world)
+                        queue = list(plan.phases)
+                        aligned = observation is not None
+                        phase = None
                 if phase is not None:
                     if stage == 'release' and not held_verified:
                         raise RuntimeError('release refused: independent holding evidence is missing')
                     motion_started = True
+                    pending = getattr(rt,'pending_grasp_file',None)
+                    if stage in ('lift_off','extract_vertical') and pending is not None and pending.exists():
+                        import json
+                        checkpoint = json.loads(pending.read_text());checkpoint['lift_performed'] = True
+                        pending.write_text(json.dumps(checkpoint,indent=2))
                     executing = True
                     self.motion.execute_trajectory(phase,plan,world)
                     executing,last_phase = False,phase
@@ -154,7 +180,7 @@ class Actions:
                         actual = self.robot.arm.read()[0]
                         transform = np.linalg.inv(self.robot.backend.model.frames(actual)['gripper_frame_link']) @ obj.pose
                         transform[:3,3] = local.mean(0)
-                        self.scene.attach_object(object_id,transform)
+                        self.scene.attach_object(object_id,transform,obj)
                         plan = replace(plan,payload_local=local)
                         wrist_anchor = self.capture_grip_view(obj,time.time())
                         # Post-contact attachment is derived from measured encoders.
@@ -180,6 +206,10 @@ class Actions:
                         self.motion.driver.release_confirmed()
                         self.scene.held = None
                         self.scene.pending_placement = (object_id,obj.color)
+                        pending = getattr(rt,'pending_grasp_file',None)
+                        if pending is not None and pending.exists():
+                            pending.unlink()
+                        rt.pending_grasp = None
             stage = 'verify_placement'
             verify_started = time.monotonic()
             verified,observed = self.verify_placement(obj,placement)
@@ -248,7 +278,7 @@ class Actions:
             if self.scene.held is None:
                 self.scene.release_reservation(object_id)
 
-    def capture_grip_view(self, obj, after_time):
+    def capture_grip_view(self, obj, after_time, camera_id=None):
         from .vision import track_color_in_grip
         import cv2
         cameras = self.runtime.cameras
@@ -256,6 +286,13 @@ class Actions:
         cameras.wait_for_frame('wrist',after_time,self.runtime.check_cancel)
         state = self.robot.read_state();cameras.record_state(state['timestamp'],state['q'],state['gripper'])
         if self.motion.grasp_mode=='overhead_grasp':
+            def wrist_image():
+                frame = cameras.get_latest_frame('wrist')
+                center = np.array(frame.image.shape[1::-1])/2
+                result = track_color_in_grip(frame,obj.color,center,radius_px=float(np.linalg.norm(frame.image.shape[:2])))
+                return dict(result,relative_error_px=result['center_px'],camera_id='wrist',spatial_update=False)
+            if camera_id=='wrist':
+                return wrist_image()
             if self.scene.held is None:
                 raise ValueError('no force-confirmed payload attachment')
             base_object = self.robot.backend.model.frames(state['positions'])['gripper_frame_link']@self.scene.held[1]
@@ -263,8 +300,11 @@ class Actions:
             predicted = self.scene.geometry.project(top[None])[0]
             cameras.wait_for_frame('overview',after_time,self.runtime.check_cancel)
             frame = cameras.get_latest_frame('overview')
-            result = track_color_in_grip(frame,obj.color,predicted,radius_px=45.)
-            return dict(result,relative_error_px=(np.asarray(result['center_px'])-predicted).tolist(),camera_id='overview')
+            try:
+                result = track_color_in_grip(frame,obj.color,predicted,radius_px=45.)
+                return dict(result,relative_error_px=(np.asarray(result['center_px'])-predicted).tolist(),camera_id='overview')
+            except ValueError:
+                return wrist_image()
         frame = cameras.get_latest_frame('wrist')
         record = self.scene.geometry.projection_for_frame(frame,self.robot)
         camera = np.asarray(record['camera_from_robot']);rotation,_ = cv2.Rodrigues(camera[:3,:3])
@@ -280,11 +320,13 @@ class Actions:
         self.motion.driver.confirm_retention()
         if anchor is None:
             return False
-        observed = self.capture_grip_view(obj,after_time)
+        observed = self.capture_grip_view(obj,after_time,camera_id=anchor.get('camera_id'))
         if observed['frame_id']==anchor['frame_id']:
             return False
         field = 'relative_error_px' if self.motion.grasp_mode=='overhead_grasp' else 'center_px'
         visible_attached = np.linalg.norm(np.asarray(observed[field])-anchor[field])<12.
+        if observed.get('camera_id')!=anchor.get('camera_id'):
+            return False
         actual = self.robot.arm.read()[0]
         blocked = self.motion.driver.blocked_grip
         jaw_retained = blocked is not None and abs(actual['gripper']-blocked)<3.

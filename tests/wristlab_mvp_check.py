@@ -184,12 +184,13 @@ class RelocateContract(unittest.TestCase):
 class GeometryPolicy(unittest.TestCase):
     def test_passive_current_image_does_not_invent_hidden_depth(self):
         record=json.loads((ROOT/'runtime/visual-measurement.json').read_text())
+        feedback=json.loads((ROOT/'runtime/initial-feedback.json').read_text())['positions']
         robot=Robot('/home/jetsonnx/Projects/so101_autonomous_pick_place',ROOT/'runtime/unit')
         geometry=Geometry(robot.root)
         image=cv2.imread(str(ROOT/'runtime/visibility-current.jpg'))
         frame=Frame('overview',record['frame_id'],image,sum(record['capture_interval'])/2,
             record['capture_interval'][1],tuple(record['capture_interval']),np.asarray(record['joints_rad']),
-            record['feedback_error_s'],Q['gripper'],0.)
+            record['feedback_error_s'],feedback['gripper'],0.)
         report=geometry.measure_visible_attachment(frame,robot,json.loads((ROOT/'runtime/attachment-candidate.json').read_text()),now=frame.received_at)
         self.assertTrue(report['overview_fk_control']['passed'])
         self.assertGreater(report['visible_board_pixels'],100)
@@ -310,6 +311,7 @@ class GeometryPolicy(unittest.TestCase):
     def test_planning_cache_never_applies_to_live_guard_checks(self):
         world = AccessoryWorld.__new__(AccessoryWorld)
         world.cache={};world.cache_enabled=True;world.metrics={'collision_checking_s':None}
+        world.release_origin=None
         world._reason=Mock(return_value=None)
         world.reason(Q,target='recorded');world.reason(Q,target='recorded')
         self.assertEqual(world._reason.call_count,1)

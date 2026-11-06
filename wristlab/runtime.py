@@ -27,6 +27,8 @@ class Runtime:
         self.config = json.loads((self.root/'wristlab/config.yaml').read_text())
         self.output = self.root/'runtime'
         self.output.mkdir(exist_ok=True)
+        self.pending_grasp_file = self.output/'pending-supported-grasp.json'
+        self.pending_grasp = json.loads(self.pending_grasp_file.read_text()) if self.pending_grasp_file.exists() else None
         self.geometry = Geometry(self.config['native_root'])
         self.cameras = Cameras(self.config['api'],self.config['frame_max_age_s'],self.config.get('camera_controls'))
         self.robot = Robot(self.config['native_root'],self.output/'controller')
@@ -195,6 +197,9 @@ class Runtime:
         if self.scene.held is not None and not self.running:
             add('PAYLOAD_HELD','RECOVERY','после ошибки планирования предмет удерживается',
                 'предмет установлен по отдельно проверенному плану восстановления; автоматическое раскрытие запрещено')
+        if self.pending_grasp is not None and self.scene.held is None:
+            add('HELD_RECOVERY_PENDING','RECOVERY','сохранён поддерживаемый захват; требуется продолжение этого переноса',
+                'проверены фактические углы и усилие, восстановлена привязка удерживаемого кубика')
         if self.stop_event.is_set():
             add('STOP_LATCHED','STOP','STOP зафиксирован','явный сброс STOP при простое; новый Start и все проверки безопасности всё равно обязательны')
         return reasons
@@ -235,7 +240,7 @@ class Runtime:
             if self.running or not self.commands.empty():
                 raise ValueError('another task is running or queued')
             self.check_cancel()
-            if not self.initialized or self.scene.held is not None:
+            if not self.initialized or (self.scene.held is not None and not payload.get('resume_supported_grasp')):
                 raise ValueError('startup requires initialized feedback and an empty hand')
             if payload.get('cable_and_hidden_surfaces_clear') is not True:
                 raise ValueError('operator observation is required for this attended startup')
@@ -255,9 +260,17 @@ class Runtime:
             self.started = time.monotonic()
             self.robot.first_command_at = None
             if payload.get('grasp_mode')=='overhead_grasp':
-                recovery = bool(payload.get('recover_empty_approach'))
-                result = self.prepare_overhead(attendance,recovery=recovery)
-                if recovery:
+                if payload.get('resume_released_placement'):
+                    self.preparing_scene = False
+                    self.results = [self.resume_released_placement(attendance)]
+                    return
+                recovery = bool(payload.get('recover_empty_approach') or payload.get('resume_supported_grasp'))
+                result = {} if payload.get('resume_supported_grasp') and self.scene.held is not None else self.prepare_overhead(attendance,recovery=recovery)
+                if payload.get('resume_supported_grasp'):
+                    self.preparing_scene = False
+                    self.results = [self.resume_supported_grasp()]
+                    return
+                if payload.get('recover_empty_approach'):
                     import pickle
                     with (self.output/'last-relocate-plan.pkl').open('rb') as handle:
                         plan = pickle.load(handle)
@@ -278,7 +291,11 @@ class Runtime:
                         'startup path checked; no motion' if payload.get('dry') else 'folded exit physically completed; ordinary margins satisfied')
         except Exception as exc:
             self.report('failed',str(exc))
-            if self.robot.first_command_at is not None and (payload.get('grasp_mode')!='overhead_grasp' or payload.get('recover_empty_approach')):
+            held_planning = isinstance(exc,ValueError) and self.scene.held is not None and self.motion.driver is not None and self.motion.driver.retention.armed
+            if held_planning:
+                self.motion.driver.confirm_retention()
+                self.report('recovering',str(exc))
+            elif self.robot.first_command_at is not None and (payload.get('grasp_mode')!='overhead_grasp' or payload.get('recover_empty_approach') or payload.get('resume_supported_grasp')):
                 self.stop(reason='startup: '+str(exc),hardware_fault=True)
         finally:
             if self.robot.first_command_at is not None:
@@ -309,7 +326,8 @@ class Runtime:
             reference_frame = Frame('overview','retained-before-contact-free-approach',pixels,stamp,stamp,(stamp,stamp))
             self.geometry.grasp_mode = 'overhead_grasp'
             self.scene.update_scene({'overview':reference_frame,'wrist':self.scene.frames['wrist']})
-            wrist_colors = {d['color'] for d in detect_cubes(self.scene.frames['wrist'])}
+            from .vision import color_masks
+            wrist_colors = {color for color,mask in color_masks(self.scene.frames['wrist'].image).items() if np.count_nonzero(mask)>100}
             for obj in self.scene.state.objects.values():
                 if obj.color in observed and np.linalg.norm(observed[obj.color]-obj.pose[:3,3])>.003:
                     raise ValueError('visible cube moved since the noncontact route was checked')
@@ -394,6 +412,176 @@ class Runtime:
         return {'grasp_mode':'overhead_grasp','wrist_refinement':False,'overview_control':control,
                 'sources':[s['artifacts'] for s in sources],'assumptions':params.__dict__,
                 'operator_observation':attendance,'physical_pick_place_completed':False}
+
+    def resume_supported_grasp(self):
+        """Same native supported regrasp used by the successful held-cube resume."""
+        import pickle
+        from dataclasses import replace
+        from .types import Placement
+        from box_extract.planning import flush_local
+        from so101_pick_place.experiments.box_extraction.planner import Phase
+        saved = self.pending_grasp
+        if saved is None or saved['calibration_sha256']!=self.geometry.fingerprint:
+            raise ValueError('no matching supported-grasp checkpoint')
+        with (self.output/'last-relocate-plan.pkl').open('rb') as handle:
+            plan = pickle.load(handle)
+        target = saved['target_id']
+        evidence = next(p.placed_cube.evidence for p in reversed(plan.phases) if p.placed_cube is not None)
+        quad = np.asarray(evidence['quad'])
+        frame = self.cameras.get_latest_frame('overview')
+        mask = np.zeros(frame.image.shape[:2],np.uint8);cv2.fillConvexPoly(mask,np.int32(quad),255)
+        obj = self.geometry.estimate_cube_pose({'quad':quad,'mask':mask,'color':saved['color'],'confidence':.98},frame,evidence['support_z_m'])
+        obj.id,obj.timestamp = target,float(evidence.get('spatial_timestamp',saved['feedback_time']))
+        obj.evidence.update(evidence,metric_qualified=True)
+        with self.scene_lock:
+            self.scene.state.objects[target] = obj
+            self.scene.track_memory[target] = obj
+            self.resume_original = self.scene.native_object(target)
+        pose = obj.pose.copy();pose[:3,3] = plan.placement_center_m
+        placement = Placement(pose,'box-1')
+        native = self.scene.native_scene(target,placement)
+        self.motion.qualification_blockers(self.geometry)
+        world = self.motion.make_world(native)
+        self.ensure_driver()
+        state = self.robot.read_state();current=state['positions']
+        if max(abs(current[j]-saved['positions'][j]) for j in current if j!='gripper')>1.5 or abs(current['gripper']-saved['positions']['gripper'])>2.:
+            raise ValueError('supported grasp changed since the force-confirmed checkpoint')
+        # A lift may have been commanded but refused at the next phase boundary.
+        # Regrasp is permissible only while the actual attached cube is still on
+        # the original support, never merely because the old phase was lift_off.
+        previous_frame = self.robot.backend.model.frames(saved['positions'])['gripper_frame_link']
+        previous_local = np.asarray(saved.get('payload_local',flush_local(
+            (self.resume_original.vertices_m-previous_frame[:3,3])@previous_frame[:3,:3])))
+        supported = self.robot.backend._transform_points(
+            self.robot.backend.model.frames(current)['gripper_frame_link'],previous_local)
+        support_error = float(supported[:,2].min()-evidence['support_z_m'])
+        if abs(support_error)>.001:
+            raise ValueError(f'supported regrasp refused: actual cube bottom {support_error:.4f} m from original support')
+        self.metrics['supported_resume_bottom_error_m'] = support_error
+        driver = self.motion.driver
+        driver.phase,driver.plan,driver.world = Phase('grasp',(current,current),jaw_contact=True),plan,world
+        if self.scene.held is None or not driver.retention.armed:
+            self.robot.enable()
+            driver.force_close_active = True
+            try:
+                self.robot.arm.grasp(rate=6.,past=2.,squeeze=1.,empty=4.,step='resume_grasp')
+            finally:
+                driver.force_close_active = False
+        actual,_,_ = self.robot.arm.read()
+        if actual['gripper']<5. or abs(actual['gripper']-saved['positions']['gripper'])>4.:
+            raise RuntimeError('supported regrasp differs from the confirmed cube width')
+        for attempt in range(5):
+            self.check_cancel();self.cameras.check()
+            try:
+                local = flush_local(driver.confirm_grasp())
+                break
+            except RuntimeError as exc:
+                if 'grasp contact force is not confirmed' not in str(exc):
+                    raise
+                time.sleep(.04)
+        else:
+            raise RuntimeError('grasp contact force is not confirmed; transport is blocked')
+        driver.payload_local_override = local
+        actual = self.robot.read_state()['positions']
+        transform = np.linalg.inv(self.robot.backend.model.frames(actual)['gripper_frame_link'])@obj.pose
+        transform[:3,3] = local.mean(0)
+        self.scene.attach_object(target,transform,obj)
+        saved.update(positions=actual,feedback_time=time.time(),payload_local=local.tolist())
+        self.pending_grasp_file.write_text(json.dumps(saved,indent=2))
+        trial = json.loads((self.output/'contact-free-trial.json').read_text())
+        if not trial.get('passed') or trial['attachment_sha256']!=self.motion.attachment.fingerprint:
+            raise ValueError('matching physical approach evidence is missing')
+        self.motion.contact_free_passed = True
+        self.motion.trial_attachment_sha256 = self.motion.attachment.fingerprint
+        self.resume_plan = plan
+        self.mode = 'relocate'
+        failures = []
+        for patch in self.scene.find_free_box_slots('box-1',obj.dimensions):
+            center = np.r_[np.mean(patch.polygon_xy_m,axis=0),patch.height_m+obj.dimensions[2]/2]
+            candidate_pose = obj.pose.copy();candidate_pose[:3,3] = center
+            candidate = Placement(candidate_pose,'box-1')
+            native = self.scene.native_scene(target,candidate)
+            native = replace(native,cubes=native.cubes|{target:self.resume_original})
+            candidate_world = self.motion.make_world(native)
+            attached_frame = self.robot.backend.model.frames(actual)['gripper_frame_link']
+            vertices = self.robot.backend._transform_points(attached_frame,local)
+            cube = replace(self.resume_original,center_m=vertices.mean(0),vertices_m=vertices)
+            policy = {'target':target,'jaw_contact':True,'payload_local':local,'support_contact':True}
+            rejections = []
+            def acceptable(q):
+                for name,pose in (('pose',q),('command',self.motion.planner._command_pose(q))):
+                    reason = candidate_world.reason(pose,**policy)
+                    if reason:
+                        rejections.append(name+': '+reason)
+                        return False
+                return True
+            try:
+                self.motion.planner.placement_pose(actual,local,cube,center+[0.,0.,.001],accept_pose=acceptable)
+                previous = replace(plan,payload_local=local)
+                remainder,updated = self.motion.replan_held(replace(native,cubes={k:v for k,v in native.cubes.items() if k!=target}),actual,previous,self.resume_original)
+                checked_world = self.motion.make_world(updated)
+                self.motion.check_path(remainder,checked_world)
+                self.resume_remainder = remainder,updated,checked_world
+                placement = candidate
+                break
+            except ValueError as exc:
+                failures.append(str(exc)+'; '+'; '.join(rejections[-1:]))
+                self.metrics['placement_rejections'] = failures[-6:]
+        else:
+            raise ValueError('held placement IK/compensated clearance: '+'; '.join(failures[-3:]))
+        return self.actions.relocate(target,placement,resume_held=True)
+
+    def resume_released_placement(self, attendance):
+        """Finish only the empty-jaw retreat and verification after release."""
+        import pickle
+        from dataclasses import replace
+        from .types import ActionResult
+        from so101_pick_place.experiments.box_extraction.planner import Phase
+        with (self.output/'released-placement.pkl').open('rb') as handle:
+            saved = pickle.load(handle)
+        if saved['calibration_sha256']!=self.geometry.fingerprint or self.scene.held is not None:
+            raise ValueError('released-placement recovery has no matching empty-hand checkpoint')
+        actual = self.robot.read_state()['positions']
+        if actual['gripper']<30. or max(abs(actual[j]-saved['release_actual'][j]) for j in actual)>.75:
+            raise ValueError('released-placement recovery pose differs from the recorded STOP')
+        self.geometry.grasp_mode = self.motion.grasp_mode = 'overhead_grasp'
+        self.motion.operator_observation = attendance
+        self.motion.qualification_blockers(self.geometry)
+        self.ensure_driver()
+        self.scene.state.boxes = saved['boxes']
+        self.scene.metric_boxes = saved['boxes'].copy()
+        self.scene.boxes_semantically_seeded = True
+        self.scene.state.objects[saved['object'].id] = saved['object']
+        self.scene.track_memory[saved['object'].id] = saved['object']
+        self.scene.metric_objects.update(saved['native_scene'].cubes)
+        self.scene.pending_placement = saved['object'].id,saved['object'].color
+        self.refresh()
+        world = self.motion.make_world(saved['native_scene'])
+        original = saved['plan']
+        placed = next(p.placed_cube for p in reversed(original.phases) if p.placed_cube is not None)
+        trial = json.loads((self.output/'contact-free-trial.json').read_text())
+        if not trial.get('passed') or trial['attachment_sha256']!=self.motion.attachment.fingerprint:
+            raise ValueError('matching physical approach evidence is missing')
+        self.motion.contact_free_passed = True
+        self.motion.trial_attachment_sha256 = self.motion.attachment.fingerprint
+        self.robot.enable()
+        actual = self.robot.read_state()['positions']
+        world.release_origin = actual
+        path = self.motion.planner._retract_path(actual,original.payload_local.mean(0),world,
+            target=original.target_id,jaw_contact=True,placed_cube=placed)
+        phase = Phase('retract',path,jaw_contact=True,placed_cube=placed)
+        plan = replace(original,phases=(phase,))
+        self.motion.check_path(plan,world)
+        self.motion.execute_trajectory(phase,plan,world)
+        verified,pose = self.actions.verify_placement(saved['object'],saved['placement'])
+        if not verified:
+            raise ValueError('released cube is not observed within placement tolerance')
+        self.scene.detach_object(original.target_id,pose)
+        self.motion.return_to_start(saved['start'],plan,world,self.scene.native_object(original.target_id))
+        self.physical_relocate_count += 1
+        self.report('completed','Зелёный кубик в белой коробке; положение подтверждено, рука возвращена')
+        return ActionResult(True,'released placement observed and empty arm returned',original.target_id,self.scene.state,
+                            {'physical_verified':True,'returned_to_start':True,'motion_started':True})
 
     def check_cancel(self):
         if self.stop_event.is_set():

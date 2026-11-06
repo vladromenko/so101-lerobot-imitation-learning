@@ -90,6 +90,18 @@ class Scene:
         frame = frames['overview']
         detected = detect_cubes(frame)
         wrist_detections = detect_cubes(frames['wrist'])
+        # A visible colour patch need not expose a complete top face. Keep it
+        # for image tracking; a clipped patch never supplies metric geometry.
+        from .vision import color_masks
+        for color,mask in color_masks(frames['wrist'].image).items():
+            if not any(d['color']==color for d in wrist_detections):
+                contours,_ = cv2.findContours(mask,cv2.RETR_EXTERNAL,cv2.CHAIN_APPROX_SIMPLE)
+                contours = [c for c in contours if cv2.contourArea(c)>450]
+                if len(contours)==1:
+                    contour = contours[0];moments = cv2.moments(contour)
+                    wrist_detections.append({'color':color,'mask':mask,'image_only':True,
+                        'quad':cv2.convexHull(contour).reshape(-1,2),
+                        'center_px':[moments['m10']/moments['m00'],moments['m01']/moments['m00']]})
         objects, rejected = [], []
         for detection in detected:
             try:
@@ -100,7 +112,7 @@ class Scene:
                         support_z = float((measured.base_from_box@np.r_[0.,0.,measured.floor_interval_m[1],1.])[2])
                 obj = self.geometry.estimate_cube_pose(detection,frame,support_z)
                 wrist = [d for d in wrist_detections if d['color']==obj.color]
-                if self.geometry.wrist is not None and self.robot is not None and len(wrist)==1:
+                if self.geometry.wrist is not None and self.robot is not None and len(wrist)==1 and not wrist[0].get('image_only'):
                     try:
                         obj = self.geometry.localize_cube_centers(obj,[(frame,detection),(frames['wrist'],wrist[0])],self.robot)
                     except ValueError as exc:
@@ -126,7 +138,7 @@ class Scene:
                     obj.pose[:3,:3],obj.pose[:3,3] = cube.rotation,cube.center_m
                     obj.dimensions = np.full(3,cube.side_m)
                     obj.evidence.update(cube.evidence,metric_qualified=True,metric_confirmation_iou=overlap)
-        old = list({**{key:o for key,o in self.track_memory.items() if frame.timestamp-o.timestamp < 3.},**self.state.objects}.values())
+        old = list({**{key:o for key,o in self.track_memory.items() if frame.timestamp-o.timestamp < 3. or key in self.metric_objects},**self.state.objects}.values())
         if old and objects:
             costs = np.array([[np.linalg.norm(a.pose[:3,3]-b.pose[:3,3]) + (0. if a.color == b.color else 10.) for b in objects] for a in old])
             rows, columns = linear_sum_assignment(costs)
@@ -146,7 +158,7 @@ class Scene:
         seen_overview = {obj.id for obj in objects}
         if self.held is not None and self.robot is not None:
             held_id,transform = self.held
-            previous = self.state.objects.get(held_id)
+            previous = self.state.objects.get(held_id) or self.track_memory.get(held_id)
             if previous is not None:
                 measured = next((obj for obj in objects if obj.id==held_id),previous)
                 pose = self.robot.backend.model.frames(self.robot.last_state['positions'])['gripper_frame_link']@transform
@@ -157,10 +169,10 @@ class Scene:
             from box_extract.scene_builder import robot_mask
             occluder = robot_mask(self.robot.backend,self.robot.last_state['positions'],self.geometry.calibration,frame.image.shape[:2])
             visible = {o.id for o in objects}
-            for previous in self.state.objects.values():
+            for previous in {**self.track_memory,**self.state.objects}.values():
                 if previous.id not in visible and previous.id in self.metric_objects and previous.status!='held':
                     covered = np.count_nonzero((previous.mask>0)&(occluder>0))/max(1,np.count_nonzero(previous.mask))
-                    if covered>.5:
+                    if covered>.05:
                         measured = self.metric_objects[previous.id]
                         pose = previous.pose.copy();pose[:3,:3] = measured.rotation;pose[:3,3] = measured.center_m
                         objects.append(replace(previous,status='occluded',pose=pose,dimensions=np.full(3,measured.side_m),
@@ -185,7 +197,7 @@ class Scene:
                 vertices = cube_vertices(obj.pose[:2,3],obj.dimensions[0],yaw,obj.pose[2,3]-obj.dimensions[2]/2)
                 self.metric_objects[obj.id] = SpatialCube(obj.pose[:3,3],obj.dimensions[0],obj.pose[:3,:3],vertices,dict(obj.evidence))
         self.track_memory.update({o.id:o for o in objects})
-        self.track_memory = {key:o for key,o in self.track_memory.items() if frame.timestamp-o.timestamp < 3.}
+        self.track_memory = {key:o for key,o in self.track_memory.items() if frame.timestamp-o.timestamp < 3. or key in self.metric_objects}
         # Reuse box edges between periodic background measurements.
         if frame.timestamp != self.state.timestamp:
             proposals = self.track_box_edges(frame)
@@ -203,11 +215,14 @@ class Scene:
                     if overlap < .05:
                         retained.append(proposal)
                 proposals = retained
-            boxes = {key:replace(box,evidence={**box.evidence,'visibility':'untracked'}) for key,box in self.state.boxes.items()} if retained_boxes else {}
+            boxes = {key:replace(box,evidence={**box.evidence,'visibility':'untracked'}) for key,box in self.state.boxes.items()} if self.boxes_semantically_seeded else {}
+            assigned = set()
             for i, proposal in enumerate(proposals):
                 center = self.geometry.intersect_ray_with_plane(self.geometry.pixel_ray_in_base(proposal['center_px'], frame), ([0,0,1],-self.geometry.table_z))
                 pose = np.eye(4);pose[:3,3] = center
-                box = BoxState(f'box-{i+1}',pose,np.array([np.nan,np.nan,np.nan]),None,evidence=proposal | {'metric_qualified':False})
+                key = min((key for key in boxes if key not in assigned),key=lambda key:np.linalg.norm(np.mean(boxes[key].evidence['polygon'],axis=0)-proposal['center_px']),default=f'box-{i+1}')
+                assigned.add(key)
+                box = BoxState(key,pose,np.array([np.nan,np.nan,np.nan]),None,evidence=proposal | {'metric_qualified':False})
                 measured = self.metric_boxes.get(box.id)
                 if measured is not None:
                     previous = np.asarray(measured.evidence['polygon'])
@@ -255,8 +270,13 @@ class Scene:
         self.reserved.discard(object_id)
         self.reserved_slots = {s for s in self.reserved_slots if s[0] != object_id}
 
-    def attach_object(self, object_id, transform):
+    def attach_object(self, object_id, transform, object_state=None):
         with self.lock:
+            if object_id not in self.state.objects:
+                previous = object_state or self.track_memory.get(object_id)
+                if previous is None:
+                    raise ValueError('held-object identity has no retained observation')
+                self.state.objects[object_id] = replace(previous,id=object_id)
             self.held = (object_id,np.asarray(transform))
             self.state.objects[object_id].status = 'held'
 
@@ -295,6 +315,27 @@ class Scene:
                 center = (a+b)/2
                 resized.append(replace(resized[0],polygon_xy_m=center+
                     np.array([[-1,-1],[1,-1],[1,1],[-1,1]])*half))
+            centers = sorted([np.mean(p.polygon_xy_m,axis=0) for p in resized],key=lambda p:p[0])
+            for a,b in zip(centers,centers[1:]):
+                if np.linalg.norm(a-b)>float(np.min(object_shape[:2])/2):
+                    resized.append(replace(resized[0],polygon_xy_m=(a+b)/2+
+                        np.array([[-1,-1],[1,-1],[1,1],[-1,1]])*half))
+            from box_extract.stow import WALL_KEEPOUT_LONG_M,WALL_KEEPOUT_SHORT_M
+            bound = box.evidence['native_box']
+            long_axis = int(np.argmax(bound.inner_max_xy-bound.inner_min_xy))
+            short_axis = 1-long_axis
+            keep = np.array([WALL_KEEPOUT_SHORT_M]*2);keep[long_axis] = WALL_KEEPOUT_LONG_M
+            lo,hi = bound.inner_min_xy+keep,bound.inner_max_xy-keep
+            inverse = np.linalg.inv(bound.base_from_box)
+            for patch in tuple(resized):
+                center = np.mean(patch.polygon_xy_m,axis=0)
+                local = (inverse@np.r_[center,patch.height_m,1.])[:2]
+                count = max(2,int(np.ceil(max(0.,hi[short_axis]-lo[short_axis])/(float(np.min(object_shape[:2]))/2))))
+                for value in np.linspace(lo[short_axis],hi[short_axis],count+1):
+                    candidate = local.copy();candidate[short_axis] = value
+                    if np.all(candidate>=lo) and np.all(candidate<=hi):
+                        xy = bound.base_from_box[:2,:2]@candidate+bound.base_from_box[:2,3]
+                        resized.append(replace(patch,polygon_xy_m=xy+np.array([[-1,-1],[1,-1],[1,1],[-1,1]])*half))
         return resized
 
     def find_free_table_slots(self, object_shape):
@@ -511,7 +552,10 @@ class BoxUnion:
         self.upper = np.array([part[1] for part in self.parts])
 
     def __getattr__(self, name):
-        return getattr(self.primary,name)
+        primary = self.__dict__.get('primary')
+        if primary is None:
+            raise AttributeError(name)
+        return getattr(primary,name)
 
     def solid_parts(self):
         return self.parts

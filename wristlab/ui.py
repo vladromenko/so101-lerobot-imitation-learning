@@ -101,7 +101,9 @@ def live():
     state = runtime.robot.last_state
     return {'time':None if state is None else state['timestamp'],
             'age_s':None if state is None else time.time()-state['timestamp'],
-            'pos':None if state is None else state['positions'],'source':'wristlab native encoder read'}
+            'pos':None if state is None else state['positions'],
+            'loads':None if state is None else state['loads'],'currents':None if state is None else state['currents'],
+            'source':'wristlab native encoder read'}
 
 
 @app.get('/snapshot.jpg')

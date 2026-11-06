@@ -179,11 +179,15 @@ class Motion:
             self.report('checking',phase.name)
             if not phase.joints:
                 raise ValueError(phase.name+': empty trajectory')
-            edges = zip(phase.joints,phase.joints[1:]) if len(phase.joints)>1 else [(phase.joints[0],phase.joints[0])]
-            for start,goal in edges:
-                reason = self.edge_is_valid(start,goal,phase,plan,world)
-                if reason:
-                    raise ValueError(f'{phase.name}: {reason}')
+            world.release_origin = phase.joints[0] if phase.name=='retract' and phase.placed_cube is not None else None
+            try:
+                edges = zip(phase.joints,phase.joints[1:]) if len(phase.joints)>1 else [(phase.joints[0],phase.joints[0])]
+                for start,goal in edges:
+                    reason = self.edge_is_valid(start,goal,phase,plan,world)
+                    if reason:
+                        raise ValueError(f'{phase.name}: {reason}')
+            finally:
+                world.release_origin = None
         return True
 
     def plan_direct_transfer(self, start, goal, world, **policy):
@@ -249,10 +253,12 @@ class Motion:
         world.cache.clear()
         begin = time.perf_counter()
         try:
+            world.release_origin = self.robot.arm.read()[0] if phase.name=='retract' and phase.placed_cube is not None else None
             self.driver.move_phase(phase,plan,world,self.check_cancel)
         except ValueError as exc:
             raise RuntimeError('native execution: '+str(exc)) from exc
         finally:
+            world.release_origin = None
             self.metrics['actual_motion_s'] = (self.metrics.get('actual_motion_s',0.) or 0.)+time.perf_counter()-begin
 
     def prepare_driver(self, watchdog):
@@ -311,7 +317,7 @@ class Motion:
                     abs(goal['gripper']-start['gripper'])<1e-6)
 
     def contact_free_trial(self, plan, world, start):
-        """Physically exercise only the free-space approach and its checked reverse."""
+        """Qualify the empty-hand approach, ending at its checked pregrasp."""
         outward = tuple(p for p in plan.phases if p.name in ('open','approach'))
         if not outward or any(p.carrying or p.jaw_contact for p in outward):
             raise ValueError('contact-free trial must contain only clear approach phases')
@@ -323,24 +329,14 @@ class Motion:
         for phase in outward:
             self.report('contact_free',phase.name)
             self._execute_native(phase,plan,world)
-        current = self.robot.arm.read()[0]
-        reverse = tuple(reversed(outward[-1].joints))
-        join = self.planner.edge(current,reverse[0],world,target=plan.target_id)
-        back = Phase('contact_free_return',tuple(join)+reverse[1:])
-        self.check_path(replace(plan,phases=(back,)),world)
-        self._execute_native(back,plan,world)
-        current = self.robot.arm.read()[0]
-        restore = Phase('open',self.planner.edge(current,start,world,target=plan.target_id))
-        self.check_path(replace(plan,phases=(restore,)),world)
-        self._execute_native(restore,plan,world)
         actual = self.robot.arm.read()[0]
-        error = float(np.max(np.abs(self.robot.from_native(actual)-self.robot.from_native(start))))
-        if error > np.pi/240.:
-            raise RuntimeError('contact-free trial did not return within tracking tolerance')
+        reason = world.reason(actual,target=plan.target_id)
+        if reason:
+            raise RuntimeError('noncontact pregrasp endpoint: '+reason)
         self.contact_free_passed = True
         self.trial_attachment_sha256 = self.attachment.fingerprint
         evidence = {'passed':True,'timestamp':time.time(),'target_id':plan.target_id,
-                    'start':start,'returned':actual,'tracking_error_rad':error,
+                    'start':start,'pregrasp_measured':actual,'ended_at':'pregrasp',
                     'attachment_sha256':self.attachment.fingerprint,'contact_was_commanded':False}
         (self.qualification_file.parent/'contact-free-trial.json').write_text(json.dumps(evidence,indent=2))
         return evidence
@@ -361,22 +357,38 @@ class Motion:
         rim = float((scene.box.base_from_box@np.r_[0.,0.,scene.box.obstacle_top_m,1.])[2])
         safe_bottom = max(rim+self.planner.rim_margin_m, float(scene.placement.height_m)+.025)
         rise = max(.025,safe_bottom-float(vertices[:,2].min()))
-        lift = self.planner.vertical_center(current,rise,local.mean(0),world,**policy)
+        try:
+            lift = self.planner.vertical_center(current,rise,local.mean(0),world,support_contact=True,**policy)
+        except ValueError as exc:
+            raise ValueError('extract_vertical: '+str(exc)) from exc
         patch = scene.placement
         center = np.r_[np.mean(patch.polygon_xy_m,axis=0),patch.height_m+patch.uncertainty_m+cube.side_m/2+.001]
-        down = self.planner.placement_pose(current,local,cube,center)
+        def admissible(q):
+            return all(world.reason(pose,support_contact=True,**policy) is None
+                       for pose in (q,self.planner._command_pose(q)))
+        down = self.planner.placement_pose(current,local,cube,center,accept_pose=admissible)
         placed_frame = self.robot.backend.model.frames(down)['gripper_frame_link']
         placed_vertices = self.robot.backend._transform_points(placed_frame,local)
         if not patch.contains(placed_vertices):
             raise ValueError('support cannot stably contain the held payload')
         rise_at_place = max(.025,safe_bottom-float(placed_vertices[:,2].min()))
-        up = self.planner.vertical_center(down,rise_at_place,local.mean(0),world,support_contact=True,**policy)
-        transfer,search = self.planner.transport(lift[-1],up[-1],world,**policy)
+        try:
+            up = self.planner.vertical_center(down,rise_at_place,local.mean(0),world,support_contact=True,**policy)
+        except ValueError as exc:
+            raise ValueError('lower_to_support: '+str(exc)) from exc
+        try:
+            transfer,search = self.planner.transport(lift[-1],up[-1],world,**policy)
+        except ValueError as exc:
+            raise ValueError('transfer: '+str(exc)) from exc
         opening = next(p.joints[-1]['gripper'] for p in previous.phases if p.name=='release')
         goal,release = self.planner._release(down,world,first=opening,support_contact=True,**policy)
         placed = replace(cube,center_m=placed_vertices.mean(0),vertices_m=placed_vertices,rotation=placed_frame[:3,:3]@rotation_local)
         retreat = self.planner._retract_path(goal,local.mean(0),world,target=target,jaw_contact=True,placed_cube=placed)
-        phases = (Phase('extract_vertical',lift,True,True),Phase('transfer',transfer,True,True),
+        # Keep the native support-contact policy throughout this upward escape.
+        # Splitting at the first nominal millimetre of clearance switches policy
+        # before geared servos have actually left the support. The native guard
+        # still forbids penetration below support - 1 mm and checks every wall.
+        phases = (Phase('extract_vertical',lift,True,True,True),Phase('transfer',transfer,True,True),
                   Phase('lower_to_support',up[::-1],True,True,True),Phase('release',release,True,True,True),
                   Phase('retract',retreat,jaw_contact=True,placed_cube=placed))
         return ExtractionPlan(scene.revision,target,phases,local,center,(search,)),updated
@@ -511,6 +523,7 @@ class AccessoryWorld(ExtractionCollisionWorld):
         self.ground_scene = replace(scene,placement=ground)
         self.native_checks = ExtractionCollisionWorld(robot.backend,self.ground_scene)
         self.grasp_worlds = {}
+        self.release_origin = None
 
     def grasp_contact_reason(self,joints,target,placed_cube=None):
         """Permit only target/jaw contact; independently check everything else."""
@@ -549,7 +562,8 @@ class AccessoryWorld(ExtractionCollisionWorld):
         if self.cache_enabled:
             key = (tuple(sorted(joints.items())),policy.get('target'),policy.get('jaw_contact',False),
                    policy.get('support_contact',False),None if payload is None else np.asarray(payload).tobytes(),
-                   None if placed is None else (float(placed.side_m),placed.vertices_m.tobytes(),placed.rotation.tobytes()))
+                   None if placed is None else (float(placed.side_m),placed.vertices_m.tobytes(),placed.rotation.tobytes()),
+                   None if self.release_origin is None else tuple(sorted(self.release_origin.items())))
             if key in self.cache:
                 self.metrics['collision_cache_hits'] = self.metrics.get('collision_cache_hits',0)+1
                 return self.cache[key]
@@ -568,6 +582,17 @@ class AccessoryWorld(ExtractionCollisionWorld):
     def _reason(self, joints, **policy):
         native = self.native_checks.reason(joints,**policy)
         target = policy.get('target')
+        placed = policy.get('placed_cube')
+        if native=='gripper_link: cube '+str(target) and placed is not None and self.release_origin is not None and policy.get('jaw_contact') and policy.get('payload_local') is None:
+            from box_extract.driver import BoxArmDriver
+            origin = self.release_origin
+            model = self.robot.backend.model
+            distance = np.linalg.norm(np.asarray(model.pose(joints).tip)-model.pose(origin).tip)
+            def gap(q):
+                frame = model.frames(q)['gripper_frame_link']
+                return float(-((placed.vertices_m-frame[:3,3])@frame[:3,:3])[:,0].max())
+            if distance<=BoxArmDriver.SEPARATION_ZONE_M and gap(joints)>=gap(origin)-1e-6 and joints['gripper']>=origin['gripper']-.7:
+                native = self.grasp_contact_reason(joints,target,placed)
         jaw_contact = native in {'gripper_link: cube '+str(target),'moving_jaw_so101_v1_link: cube '+str(target)}
         if jaw_contact and policy.get('jaw_contact') and policy.get('payload_local') is None:
             other = self.grasp_contact_reason(joints,target,policy.get('placed_cube'))

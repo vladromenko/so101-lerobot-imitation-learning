@@ -62,7 +62,7 @@ def choose_grasp(obj, scene, robot, planner, current, check_cancel, world):
         metrics['grasp_planning_s'] = (metrics.get('grasp_planning_s',0.) or 0.)+time.perf_counter()-started
 
 
-def visual_alignment(object_state, cameras, robot, motion, plan, world, geometry):
+def visual_alignment(object_state, cameras, robot, motion, plan, world, geometry, allow_self_occlusion=False):
     """Align at pregrasp, before fingers descend. No full-scene micro replans."""
     import time
     import cv2
@@ -75,6 +75,17 @@ def visual_alignment(object_state, cameras, robot, motion, plan, world, geometry
         frame = cameras.get_latest_frame('overview')
         matches = [d for d in detect_cubes(frame) if d['color']==object_state.color]
         if len(matches)!=1:
+            if not matches and allow_self_occlusion and motion.contact_free_passed:
+                from box_extract.scene_builder import robot_mask
+                occluder = robot_mask(robot.backend,state['positions'],geometry.calibration,frame.image.shape[:2])
+                fraction = np.count_nonzero((object_state.mask>0)&(occluder>0))/max(1,np.count_nonzero(object_state.mask))
+                wrist = cameras.get_latest_frame('wrist')
+                seen = [d for d in detect_cubes(wrist) if d['color']==object_state.color]
+                safety = world.reason(state['positions'],target=object_state.id)
+                if fraction>.5 and len(seen)==1 and safety is None and not motion.driver.retention.armed:
+                    return {'continuation_only':True,'frame_id':frame.frame_id,'wrist_frame_id':wrist.frame_id,
+                            'source_pose_observed_at':object_state.timestamp,'spatial_update':False,
+                            'reason':'reserved static target hidden by the checked noncontact approach; wrist confirms image identity'}
             raise ValueError('overhead target is missing or ambiguous')
         measured = geometry.estimate_cube_pose(matches[0],frame,object_state.evidence['support_z_m'])
         if not measured.evidence.get('metric_qualified'):
