@@ -1,0 +1,12 @@
+[Unit]
+Description=SO-101 Wristlab independent panel and local runtime
+After=network.target
+[Service]
+WorkingDirectory=/home/jetsonnx/Projects/so101_wristlab
+ExecStart=/home/jetsonnx/Projects/so101_autonomous_pick_place/.venv/bin/python -m wristlab.ui
+Environment=PORT=8031
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+Restart=on-failure
+[Install]
+WantedBy=default.target

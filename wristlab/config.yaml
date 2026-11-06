@@ -1,0 +1,10 @@
+{
+  "native_root": "/home/jetsonnx/Projects/so101_autonomous_pick_place",
+  "api": "http://127.0.0.1:8010",
+  "poll_interval_s": 0.35,
+  "frame_max_age_s": 0.5,
+  "max_recovery_attempts": 2,
+  "placement_tolerance_m": 0.008,
+  "qualification_file": "runtime/qualification.json",
+  "attachment_file": "runtime/attachment-candidate.json"
+}

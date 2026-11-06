@@ -75,3 +75,9 @@ code.tex{font:13px ui-monospace,Menlo,monospace}
 .bar i{position:absolute;top:-3px;width:4px;height:12px;border-radius:2px;background:var(--accent);margin-left:-2px}
 .rowmat{display:flex;flex-wrap:wrap;align-items:center;gap:6px;font-size:13px;color:var(--muted);margin:6px 0}
 .toc a.active{color:var(--accent)}
+
+/* Both native feeds remain visible beside STOP in the work panel. */
+.lab-feeds{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.lab-feeds h3{margin-top:0;font-size:12px}
+#destination{font:inherit;max-width:100%;padding:8px;border-radius:8px}
+@media(max-width:650px){.lab-feeds{grid-template-columns:1fr}}

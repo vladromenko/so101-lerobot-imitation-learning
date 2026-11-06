@@ -3,13 +3,13 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>SO-101: коробка</title>
+<title>SO-101 Wristlab</title>
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.9/katex.min.css">
 <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
 <header>
-  <h1>SO-101 · кубики и коробка</h1>
+  <h1>SO-101 · Wristlab · 8031</h1>
   <nav>
     <button class="tab active" data-tab="work">Работа</button>
     <button class="tab" data-tab="learn">Как это считается</button>
@@ -18,33 +18,43 @@
 
 <main id="work" class="panel active">
   <section class="card left">
+    <div class="lab-feeds"><div><h3>Обзорная камера</h3>
     <div class="camera">
       <img id="cam" alt="обзорная камера">
       <canvas id="overlay"></canvas>
     </div>
+    </div><div><h3>Wrist-камера · точное наведение</h3>
+    <div class="camera"><img id="wrist-cam" alt="камера запястья"><canvas id="wrist-overlay"></canvas></div>
+    </div></div>
     <div class="counts">
       <div><b id="n-out">–</b><span>на столе</span></div>
       <div><b id="n-in">–</b><span>в коробке</span></div>
       <button id="scene-btn" class="ghost">Обновить сцену</button>
     </div>
-    <p class="hint" id="scene-hint">Сцена измеряется кнопкой (3 скана SAM, около 20 с). Пока работает программа, камера занята распознаванием.</p>
+    <p class="hint" id="scene-hint">HSV-маски и ID обновляются локально. Контуры коробок — предложения; метрическая проверка отмечается отдельно.</p>
   </section>
 
   <section class="card right">
     <h2>Что сделать</h2>
-    <label class="check"><input type="checkbox" id="attended"> Я рядом с рукой и могу нажать STOP</label>
+    <p class="hint">Разрешение на испытания со STOP принято из текущего задания. Start доступен после геометрической проверки.</p>
+    <div id="selected" class="state">Нажмите на кубик в любой камере.</div>
+    <p><label>Цель: <select id="destination"><option value="">Коробки ещё не измерены</option></select></label></p>
+    <button id="relocate" class="primary">Start · выбранный кубик → коробка</button>
     <div class="actions">
       <button id="stow" class="primary">Сложить все кубики в коробку</button>
       <button id="extract" class="primary">Вытащить все кубики из коробки</button>
     </div>
-    <label class="check"><input type="checkbox" id="dry"> Только проверить (рассчитать и просимулировать, рука не двигается)</label>
-    <button id="stop" class="danger">STOP</button>
+    <label class="check"><input type="checkbox" id="dry" checked> Только геометрическая проверка, без движения</label>
+    <div class="actions"><button id="pause">Pause</button><button id="reset">Сброс STOP</button></div>
+    <button id="stop" class="danger">STOP · остановить оба исполнителя</button>
 
     <div id="state" class="state">
       <div class="state-line"><span id="state-dot" class="dot"></span><b id="state-text">Ожидание</b></div>
-      <div id="state-detail" class="muted"></div>
+      <div id="state-detail" class="muted">Подключение общего ядра; движение заблокировано до проверки.</div>
       <div id="chips" class="chips"></div>
     </div>
+    <div id="metrics" class="hint"></div>
+    <div id="blockers" class="note"></div>
     <h3>Журнал</h3>
     <pre id="log">Журнал появится здесь.</pre>
   </section>
