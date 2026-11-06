@@ -24,6 +24,35 @@ class Scene:
         self.metric_objects = {}
         self.metric_boxes = {}
         self.measured_surfaces = []
+        self.boxes_semantically_seeded = False
+
+    def install_box_proposals(self, scan):
+        """One native semantic fallback at startup; track its actual source image."""
+        from pathlib import Path
+        from .types import Frame
+        image = cv2.imread(str(Path(scan['artifacts'])/'frame.jpg'))
+        if image is None:
+            raise ValueError('native box observation image is missing')
+        captured = float(scan['frame']['captured_at_unix_s'])
+        if not 0. <= time.time()-captured <= 30.:
+            raise ValueError('native box observation is stale')
+        proposals = [d for d in scan['detections'] if d['label']=='box' and d['score']>=.7]
+        if not proposals:
+            raise ValueError('native fallback found no unambiguous box bodies')
+        boxes = {}
+        for index,detected in enumerate(sorted(proposals,key=lambda d:d['center_px'][0])):
+            points = np.vstack(detected['silhouette_polygons_px']).astype(np.float32)
+            polygon = cv2.convexHull(points).reshape(-1,2)
+            key = 'box-'+str(index+1)
+            boxes[key] = BoxState(key,np.eye(4),np.full(3,np.nan),None,evidence={
+                'polygon':polygon.tolist(),'center_px':polygon.mean(0).tolist(),'metric_qualified':False,
+                'opening_verified':False,'height_verified':False,'association_source':'native semantic box body, optical-flow tracked',
+                'source_timestamp':captured})
+        self.state.boxes = boxes
+        self.state.timestamp = captured
+        self.state.evidence['boxes_at'] = captured
+        self.frames['overview'] = Frame('overview','native:'+str(scan['frame']['sequence']),image,captured,time.time(),(captured,captured))
+        self.boxes_semantically_seeded = True
 
     def track_box_edges(self, frame):
         previous = self.frames.get('overview')
@@ -119,7 +148,7 @@ class Scene:
         if frame.timestamp != self.state.timestamp:
             proposals = self.track_box_edges(frame)
             if proposals is None:
-                proposals = detect_boxes(frame)
+                proposals = [] if self.boxes_semantically_seeded else detect_boxes(frame)
             if self.robot is not None and self.robot.last_state is not None:
                 from box_extract.scene_builder import robot_mask
                 mask = robot_mask(self.robot.backend,self.robot.last_state['positions'],self.geometry.calibration,frame.image.shape[:2])

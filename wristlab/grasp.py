@@ -1,5 +1,6 @@
 """One grasp candidate source for every task: existing measured jaw geometry."""
 import numpy as np
+import time
 from so101_pick_place.vision.wrist_servo import WristVisualServo, ServoCalibration, ServoLimits, WristObservation
 from so101_pick_place.experiments.box_extraction.planner import Phase
 from .types import GraspCandidate
@@ -26,15 +27,23 @@ def rank_grasps(candidates):
 
 def choose_grasp(obj, scene, robot, planner, current, check_cancel, world):
     failures = []
-    for candidate in generate_grasps(obj,scene,robot,planner,current,world):
-        check_cancel()
-        grasp,closed = candidate.native
-        try:
-            plan = planner._candidate(scene,current,obj.id,scene.cubes[obj.id],grasp,closed,world)
-            return candidate,plan,world
-        except ValueError as exc:
-            failures.append(str(exc))
-    raise ValueError('no full-arm grasp/approach/lift/placement path: '+('; '.join(failures[-3:]) or 'no admissible opposing-face grasp'))
+    metrics = getattr(planner,'timings',{})
+    started = time.perf_counter()
+    try:
+        for candidate in generate_grasps(obj,scene,robot,planner,current,world):
+            check_cancel()
+            grasp,closed = candidate.native
+            begin = time.perf_counter()
+            try:
+                plan = planner._candidate(scene,current,obj.id,scene.cubes[obj.id],grasp,closed,world)
+                return candidate,plan,world
+            except ValueError as exc:
+                failures.append(str(exc))
+            finally:
+                metrics['motion_planning_s'] = (metrics.get('motion_planning_s',0.) or 0.)+time.perf_counter()-begin
+        raise ValueError('no full-arm grasp/approach/lift/placement path: '+('; '.join(failures[-3:]) or 'no admissible opposing-face grasp'))
+    finally:
+        metrics['grasp_planning_s'] = (metrics.get('grasp_planning_s',0.) or 0.)+time.perf_counter()-started
 
 
 def visual_alignment(object_state, cameras, robot, motion, plan, world, geometry):

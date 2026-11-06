@@ -22,6 +22,7 @@ class Actions:
     def relocate(self, object_id, placement, dry=False, recovery_attempt=0):
         rt = self.runtime
         started, motion_started = time.monotonic(), False
+        executing,last_phase = False,None
         stage = 'observe'
         plan = world = None
         aligned = False
@@ -40,7 +41,7 @@ class Actions:
             start = self.robot.read_state()['positions']
             world = self.motion.make_world(native_scene)
             candidate,plan,world = choose_grasp(obj,native_scene,self.robot,self.motion.planner,start,rt.check_cancel,world)
-            rt.metrics['grasp_planning_s'] = time.monotonic()-started
+            stage = 'path_check'
             self.motion.check_path(plan,world)
             rt.last_plan = plan
             if dry:
@@ -48,7 +49,9 @@ class Actions:
                                     {'physical_verified':False,'motion_started':False})
             if not self.motion.contact_free_passed:
                 motion_started = True
+                executing = True
                 self.motion.contact_free_trial(plan,world,start)
+                executing = False
             self.motion.plan,self.motion.world = plan,world
             held_verified = False
             wrist_anchor = None
@@ -58,12 +61,13 @@ class Actions:
                 phase = queue.pop(0)
                 stage = phase.name
                 if stage == 'enter' and not aligned:
+                    stage = 'visual_alignment'
                     observation = visual_alignment(obj,rt.cameras,self.robot,self.motion,plan,world,self.scene.geometry)
                     observed_top = np.asarray(observation['observed_top_m'])
                     delta = observed_top-(obj.pose[:3,3]+[0.,0.,obj.dimensions[2]/2])
                     maximum = 3*max(np.asarray(obj.evidence.get('position_sigma_m',[.003]*3))[:2])
                     if np.linalg.norm(delta[:2])>maximum:
-                        raise RuntimeError('wrist correction exceeds measured localization uncertainty')
+                        raise ValueError('wrist correction exceeds measured localization uncertainty')
                     original = native_scene.cubes[object_id]
                     updated = replace(original,center_m=original.center_m+delta,vertices_m=original.vertices_m+delta)
                     self.scene.metric_objects[object_id] = updated
@@ -72,7 +76,9 @@ class Actions:
                     native_scene = self.scene.native_scene(object_id,placement)
                     current = self.robot.read_state()['positions']
                     world = self.motion.make_world(native_scene)
+                    stage = 'grasp_planning'
                     candidate,plan,world = choose_grasp(obj,native_scene,self.robot,self.motion.planner,current,rt.check_cancel,world)
+                    stage = 'path_check'
                     self.motion.check_path(plan,world)
                     queue = list(plan.phases)
                     aligned = True
@@ -81,7 +87,9 @@ class Actions:
                     if stage == 'release' and not held_verified:
                         raise RuntimeError('release refused: independent holding evidence is missing')
                     motion_started = True
+                    executing = True
                     self.motion.execute_trajectory(phase,plan,world)
+                    executing,last_phase = False,phase
                     if stage == 'grasp':
                         from box_extract.planning import flush_local
                         local = flush_local(self.motion.driver.confirm_grasp())
@@ -90,16 +98,25 @@ class Actions:
                         transform = np.linalg.inv(self.robot.backend.model.frames(actual)['gripper_frame_link']) @ obj.pose
                         transform[:3,3] = local.mean(0)
                         self.scene.attach_object(object_id,transform)
+                        plan = replace(plan,payload_local=local)
                         wrist_anchor = self.capture_grip_view(obj,time.time())
                         # Post-contact attachment is derived from measured encoders.
-                        adjusted = replace(plan,payload_local=local)
-                        remainder,new_scene = self.motion.replan_held(replace(native_scene,cubes={key:value for key,value in native_scene.cubes.items() if key!=object_id}),actual,adjusted,native_scene.cubes[object_id])
+                        adjusted = plan
+                        stage = 'held_planning'
+                        planning_started = time.perf_counter()
+                        try:
+                            remainder,new_scene = self.motion.replan_held(replace(native_scene,cubes={key:value for key,value in native_scene.cubes.items() if key!=object_id}),actual,adjusted,native_scene.cubes[object_id])
+                        finally:
+                            rt.metrics['motion_planning_s'] = (rt.metrics.get('motion_planning_s') or 0.)+time.perf_counter()-planning_started
                         world = self.motion.make_world(new_scene)
+                        stage = 'path_check'
                         self.motion.check_path(remainder,world)
                         plan = remainder
                         queue = list(remainder.phases)
                     elif stage == 'extract_vertical':
+                        verify_started = time.perf_counter()
                         held_verified = self.verify_pick(obj,wrist_anchor,time.time())
+                        rt.metrics['verification_s'] = (rt.metrics.get('verification_s') or 0.)+time.perf_counter()-verify_started
                         if not held_verified:
                             raise RuntimeError('holding not confirmed by jaw feedback and wrist observation')
                     elif stage == 'release':
@@ -107,17 +124,20 @@ class Actions:
                         self.scene.held = None
                         self.scene.pending_placement = (object_id,obj.color)
             stage = 'verify_placement'
+            verify_started = time.monotonic()
             verified,observed = self.verify_placement(obj,placement)
+            rt.metrics['verification_s'] = (rt.metrics.get('verification_s',0.) or 0.)+time.monotonic()-verify_started
             if not verified and recovery_attempt < rt.recovery.max_attempts:
                 candidates = [o for o in self.scene.state.objects.values() if o.color==obj.color and o.evidence.get('metric_qualified')]
                 if len(candidates)==1:
                     self.scene.release_reservation(object_id)
                     return self.relocate(candidates[0].id,placement,recovery_attempt=recovery_attempt+1)
             if not verified:
-                raise RuntimeError('object was not observed at placement within tolerance')
+                raise ValueError('object was not observed at placement within tolerance')
             self.scene.detach_object(object_id,observed)
             returned = rt.physical_relocate_count==0 or rt.mode=='relocate'
             if returned:
+                stage = 'return_planning'
                 self.motion.return_to_start(start,plan,world,self.scene.native_object(object_id))
             rt.physical_relocate_count += 1
             rt.metrics['cycle_s'] = time.monotonic()-started
@@ -135,12 +155,33 @@ class Actions:
                             {'motion_started':True,'recovered':True,'critical':False,'physical_verified':False})
                 except Exception as recovery_error:
                     reason += '; recovery refused: '+str(recovery_error)
-            if motion_started:
+            cancelled = rt.stop_event.is_set()
+            routine = isinstance(exc,(ValueError,KeyError)) and not executing
+            holding = self.scene.held is not None
+            if routine and motion_started and not cancelled:
+                try:
+                    rt.cameras.check()
+                    actual = self.robot.read_state()
+                    if holding:
+                        self.motion.driver.confirm_retention()
+                    if last_phase is not None:
+                        policy_phase = replace(last_phase,carrying=holding,jaw_contact=holding or last_phase.jaw_contact,
+                                               support_contact=last_phase.support_contact or (holding and last_phase.name=='grasp'))
+                        safety = self.motion.state_is_valid(actual['positions'],policy_phase,plan,world)
+                        if safety:
+                            raise RuntimeError('stationary recovery pose: '+safety)
+                except Exception as safety_error:
+                    routine = False
+                    reason += '; feedback/recovery check: '+str(safety_error)
+            hazardous = motion_started and not routine and not cancelled
+            if hazardous:
                 rt.stop(reason=reason,hardware_fault=True)
             recovery = rt.recovery.recover(object_id,reason,self.scene,motion_started,self.scene.held is not None)
-            rt.report('blocked',reason)
+            rt.report('recovering' if routine and holding else 'failed' if routine else 'blocked',reason)
             return ActionResult(False,reason,object_id,self.scene.state,{'motion_started':motion_started,
-                'critical':motion_started or stage=='observe','physical_verified':False,'recovery':recovery})
+                'critical':hazardous or holding or cancelled,'physical_verified':False,'recovery':recovery,
+                'recovered':bool(routine and motion_started and not holding),'failure_kind':'OPERATOR_STOP' if cancelled else 'PLANNING_OR_OBSERVATION' if routine else 'SAFETY',
+                'hardware_fault':hazardous})
         finally:
             if self.scene.held is None:
                 self.scene.release_reservation(object_id)

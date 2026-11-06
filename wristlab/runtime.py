@@ -54,7 +54,11 @@ class Runtime:
         self.running,self.initialized = False,False
         self.phase,self.detail = 'initializing','Загрузка калибровки и детекторов'
         self.mode = None
-        self.metrics,self.results = {},[]
+        self.metrics = {key:None for key in ('first_command_s','vision_s','grasp_planning_s','ik_s',
+            'collision_checking_s','motion_planning_s','actual_motion_s','verification_s')}
+        self.results = []
+        self.motion.metrics = self.metrics
+        self.motion.planner.timings = self.metrics
         self.log = deque(maxlen=160)
         self.frame_history = deque(maxlen=24)
         self.last_plan = None
@@ -87,10 +91,21 @@ class Runtime:
         try:
             self.metrics['camera_controls'] = self.cameras.apply_controls()
             self.cameras.start_capture()
+            self.cameras.on_native_stop = self.native_stop
+            # The line-only detector confused table/cable edges with boxes in
+            # this scene. Reuse the already-loaded native model once, before
+            # Ready; experiments only track the resulting current observation.
+            self.scene.boxes_semantically_seeded = True
+            box_started = time.perf_counter()
+            try:
+                scan = self.cameras.json('/api/scan-hybrid',{},timeout=30.)
+                self.scene.install_box_proposals(scan)
+                (self.output/'box-observation.json').write_text(json.dumps(scan))
+            finally:
+                self.metrics['box_detection_startup_s'] = time.perf_counter()-box_started
             wrist_path = self.output/'wrist-camera-calibration.json'
             if wrist_path.exists():
                 self.geometry.install_wrist_calibration(json.loads(wrist_path.read_text()),self.robot)
-            self.cameras.on_native_stop = self.native_stop
             self.refresh()
         except Exception as exc:
             self.report('blocked',str(exc))
@@ -123,17 +138,25 @@ class Runtime:
             raise
 
     def blockers(self):
-        reasons = self.motion.qualification_reasons(self.geometry)
+        return [item['reason'] for item in self.blocking_conditions()]
+
+    def blocking_conditions(self):
+        reasons = self.motion.qualification_blockers(self.geometry)
+        def add(code,category,reason,condition):
+            reasons.append({'code':code,'category':category,'reason':reason,'clear_when':condition})
         if self.camera_error:
-            reasons.append(self.camera_error)
+            add('CAMERA_FEEDBACK','FEEDBACK',self.camera_error,'обе камеры дают свежие кадры с допустимым качеством')
         if self.last_refresh is None or time.time()-self.last_refresh > 2.:
-            reasons.append('нет актуального наблюдения сцены')
+            add('SCENE_STALE','FEEDBACK','нет актуального наблюдения сцены','сцена обновлена по свежим кадрам не более 2 с назад')
         if not self.scene.state.boxes:
-            reasons.append('проёмы коробок ещё не измерены')
+            add('BOX_MISSING','GEOMETRY','коробки не обнаружены','актуальное наблюдение содержит целевую коробку')
         elif any(not b.evidence.get('metric_qualified') for b in self.scene.state.boxes.values()):
-            reasons.append('геометрия дна/бортов коробок не квалифицирована')
+            add('BOX_GEOMETRY','QUALIFICATION','геометрия дна/бортов коробок не квалифицирована','все видимые коробки имеют текущий метрический обзор дна и стенок')
+        if self.scene.held is not None and not self.running:
+            add('PAYLOAD_HELD','RECOVERY','после ошибки планирования предмет удерживается',
+                'предмет установлен по отдельно проверенному плану восстановления; автоматическое раскрытие запрещено')
         if self.stop_event.is_set():
-            reasons.append('STOP зафиксирован')
+            add('STOP_LATCHED','STOP','STOP зафиксирован','явный сброс STOP при простое; новый Start и все проверки безопасности всё равно обязательны')
         return reasons
 
     def ensure_driver(self):
@@ -193,15 +216,20 @@ class Runtime:
                 raise ValueError('STOP is latched; reset while idle before a new check')
             if not self.initialized:
                 raise ValueError('runtime is initializing')
-            if not dry and self.blockers():
-                raise ValueError('; '.join(self.blockers()))
+            reasons = self.blockers() if not dry else []
+            if reasons:
+                raise ValueError('; '.join(reasons))
             self.robot.first_command_at = None
             self.started = time.monotonic()
             self.finished = None
             self.mode = mode
             self.scene.remember_reset_layout()
             self.running = True
-            self.metrics = {'first_command_s':None,'cycle_s':None}
+            self.metrics = {key:None for key in ('first_command_s','vision_s','grasp_planning_s','ik_s',
+                'collision_checking_s','motion_planning_s','actual_motion_s','verification_s','cycle_s')}
+            self.metrics['timing_scope'] = 'inclusive stages; IK includes native IK geometry, with collision calls subtracted in vertical IK'
+            self.motion.metrics = self.metrics
+            self.motion.planner.timings = self.metrics
             self.results = []
             self.commands.put_nowait(payload | {'mode':mode,'dry':dry})
             self.report('queued',mode+(' · geometric check' if dry else ''))
@@ -293,9 +321,10 @@ class Runtime:
             else:
                 self.results = tasks.run_task(payload['mode'],self.scene,self.actions,self.refresh,self.check_cancel,selected,destination)
             ok = all(result.success for result in self.results)
-            self.report('completed' if ok else 'blocked','Все запрошенные переносы подтверждены' if ok else self.results[-1].reason)
+            self.report('completed' if ok else 'blocked' if self.stop_event.is_set() else 'recovering' if self.scene.held is not None else 'failed',
+                'Все запрошенные переносы подтверждены' if ok else self.results[-1].reason)
         except Exception as exc:
-            self.report('blocked',f'{type(exc).__name__}: {exc}')
+            self.report('blocked' if self.stop_event.is_set() or self.blockers() else 'failed',f'{type(exc).__name__}: {exc}')
             self.results = [{'success':False,'reason':str(exc),'physical_verified':False}]
         finally:
             self.finished = time.monotonic()
@@ -334,17 +363,34 @@ class Runtime:
         return proposal
 
     def status(self):
-        reasons = self.blockers()
+        conditions = self.blocking_conditions()
+        reasons = [item['reason'] for item in conditions]
         audit = None if self.robot.last_state is None else self.robot.audit_state(self.robot.last_state)
+        if not self.initialized:
+            state = 'NOT_INITIALIZED'
+        elif self.stop_event.is_set():
+            state = 'SAFETY_BLOCKED'
+        elif not self.running and self.scene.held is not None:
+            state = 'RECOVERING'
+        elif self.running:
+            state = 'EXECUTING' if self.phase in ('moving','contact_free') else 'RECOVERING' if self.phase in ('recovering','recovered') else 'PLANNING'
+        elif reasons:
+            state = 'SAFETY_BLOCKED'
+        else:
+            state = {'completed':'COMPLETED','failed':'FAILED'}.get(self.phase,'READY')
         physical_blocker = None
         if audit is not None and not audit['planning_valid']:
             physical_blocker = {'code':'UNQUALIFIED_FOLDED_START','automatic_exit_authorized':False,
                 'clearance_m':audit['minimum_model_clearance_m'],'required_clearance_m':audit['required_clearance_m'],
-                'required_action':'При выключенном моменте вручную вывести предплечье из сложенной позы; запястье не поворачивать, камеру и кабель держать свободными. Затем убрать руки из рабочей области.',
+                'classification':'SOFTWARE_MARGIN' if not audit['hardware_limit_problems'] and not audit['zero_gap_sample_contact'] else 'GEOMETRY_OR_LIMIT',
+                'physical_clearance_measured':False,
+                'missing_measurement':'3D-положение текущей камеры/крепления на звене и объём петли кабеля вдоль начального выхода с учётом отставания приводов',
+                'required_action':'Для автоматического выхода необходима измеренная геометрия камеры/крепления и кабеля на начальном участке. Возможный временный выход — вручную разложить предплечье при выключенном моменте, без поворота запястья и натяжения кабеля.',
                 'recheck':'Свежие энкодеры и штатная проверка всего пути; сброс STOP сам по себе движение не разрешает.'}
         return {'running':self.running,'mode':self.mode,'dry':None,'started':self.started,'finished':self.finished,
-            'phase':self.phase,'project_detail':self.detail,'project_state':self.phase,'detail':self.detail,
-            'ready':self.initialized and not reasons,'blockers':reasons,'paused':self.pause_event.is_set(),
+            'phase':self.phase,'state':state,'blocking_conditions':conditions,
+            'project_detail':self.detail,'project_state':state,'detail':self.detail,
+            'ready':self.initialized and not self.running and not reasons,'blockers':reasons,'paused':self.pause_event.is_set(),
             'stop_latched':self.stop_event.is_set(),'hardware_fault_latched':self.fault_latched,'log':list(self.log),'exit_code':0 if self.phase=='completed' else None,
             'metrics':self.metrics,'selected':self.selected,'scene_version':self.scene.state.version,
             'robot_audit':audit,'physical_blocker':physical_blocker,
@@ -377,6 +423,8 @@ class Runtime:
                     if self.robot.arm is not None:
                         state = self.robot.read_state()
                         self.cameras.record_state(state['timestamp'],state['q'],state['gripper'])
+                        if self.scene.held is not None and self.motion.driver is not None:
+                            self.motion.driver.retention.check(state['loads']['gripper'],state['currents']['gripper'])
                     if time.monotonic()-last_vision >= self.config['poll_interval_s']:
                         self.refresh()
                         last_vision = time.monotonic()

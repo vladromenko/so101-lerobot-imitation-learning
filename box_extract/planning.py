@@ -1,5 +1,6 @@
 """Planner variant: identical phases, but the extraction lift is sized by the cube's lowest point."""
 from dataclasses import replace
+import time
 import numpy as np
 from scipy.optimize import least_squares
 from so101_pick_place.experiments.box_extraction.planner import ExtractionPlanner, Phase, ExtractionPlan
@@ -25,6 +26,33 @@ def flush_local(local):
 
 
 class TunedExtractionPlanner(ExtractionPlanner):
+    timings = None
+
+    def translated(self, *args, **kwargs):
+        begin = time.perf_counter()
+        try:
+            return super().translated(*args,**kwargs)
+        finally:
+            if self.timings is not None:
+                self.timings['ik_s'] = (self.timings.get('ik_s',0.) or 0.)+time.perf_counter()-begin
+
+    def vertical_center(self, start, height, local_center, world, **policy):
+        begin = time.perf_counter()
+        collisions = (getattr(world,'metrics',{}).get('collision_checking_s',0.) or 0.)
+        try:
+            return super().vertical_center(start,height,local_center,world,**policy)
+        finally:
+            if self.timings is not None:
+                collision_time = (getattr(world,'metrics',{}).get('collision_checking_s',0.) or 0.)-collisions
+                self.timings['ik_s'] = (self.timings.get('ik_s',0.) or 0.)+max(0.,time.perf_counter()-begin-collision_time)
+
+    def placement_pose(self, *args, **kwargs):
+        begin = time.perf_counter()
+        try:
+            return super().placement_pose(*args,**kwargs)
+        finally:
+            if self.timings is not None:
+                self.timings['ik_s'] = (self.timings.get('ik_s',0.) or 0.)+time.perf_counter()-begin
     rim_margin_m = .020          # lift clearance above the rim beyond the guard's own: a held cube hangs ~3 mm lower than planned
     fixed_jaw_gap_m = .0025      # clearance to the cube in the gravity-compensated command pose; the stand-off grows by the command shift per candidate
     opening_margin_m = .008      # jaw opening beyond the cube width (original: 14 mm); the box leaves little room
@@ -181,7 +209,12 @@ class TunedExtractionPlanner(ExtractionPlanner):
                         def residual(q):
                             frame = self.model.frames(self.joints(q, opening))['gripper_frame_link']
                             return np.r_[(frame[:3, 3]+frame[:3, :3]@local-cube.center_m)*1000., (frame[:3, 0]-frame_x)*30.]
-                        result = least_squares(residual, self.vector(seed_pose.deg), bounds=(self.limits[:, 0], self.limits[:, 1]), max_nfev=80)
+                        solve_started = time.perf_counter()
+                        try:
+                            result = least_squares(residual, self.vector(seed_pose.deg), bounds=(self.limits[:, 0], self.limits[:, 1]), max_nfev=80)
+                        finally:
+                            if self.timings is not None:
+                                self.timings['ik_s'] = (self.timings.get('ik_s',0.) or 0.)+time.perf_counter()-solve_started
                         error = residual(result.x)
                         joints = self.joints(result.x, opening)
                         actual = self.model.frames(joints)['gripper_frame_link']
@@ -190,10 +223,14 @@ class TunedExtractionPlanner(ExtractionPlanner):
                         return (joints if good else None), result.x
                     for pitch, roll in seeds:
                         target_tip = cube.center_m-desired@np.array([-(cube.side_m/2.+self.fixed_jaw_gap_m), 0., contact_z])
+                        solve_started = time.perf_counter()
                         try:
                             seed = self.model.ik(*target_tip, pitch=pitch, roll=float(roll), gripper=opening)
                         except self.backend._unreachable:
                             seed = None
+                        finally:
+                            if self.timings is not None:
+                                self.timings['ik_s'] = (self.timings.get('ik_s',0.) or 0.)+time.perf_counter()-solve_started
                         if seed is None:
                             continue
                         joints, x = fit(seed, self.fixed_jaw_gap_m)

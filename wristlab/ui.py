@@ -7,7 +7,7 @@ import threading
 import time
 import cv2
 from fastapi import HTTPException
-from fastapi.responses import Response
+from fastapi.responses import Response,JSONResponse
 from box_extract.ui.server import app
 from .runtime import Runtime
 
@@ -23,7 +23,9 @@ def run(payload: dict):
         runtime.start(payload)
         return {'started':True}
     except (ValueError,RuntimeError) as exc:
-        raise HTTPException(409,str(exc)) from exc
+        return JSONResponse(
+            status_code=409,content={'detail':str(exc),'state':runtime.status()['state'],
+                                    'blocking_conditions':runtime.blocking_conditions()})
 
 
 @app.post('/api/task-plan')

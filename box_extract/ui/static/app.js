@@ -78,18 +78,19 @@ function gate(){
 async function poll(){
   try{
     const s=await api('/api/status');statusData=s;lastRunning=s.running;gate();
-    document.getElementById('state-text').textContent=s.ready?'Ready':({blocked:'Движение заблокировано',stopped:'STOP',checking:'Проверка без движения',initializing:'Инициализация',completed:'Завершено'}[s.phase]||s.phase);
+    document.getElementById('state-text').textContent=({NOT_INITIALIZED:'Инициализация',READY:'Ready',PLANNING:'Планирование',EXECUTING:'Движение',RECOVERING:'Восстановление',SAFETY_BLOCKED:'Движение заблокировано',COMPLETED:'Завершено',FAILED:'Задача не выполнена'}[s.state]||s.phase);
     document.getElementById('state-dot').className='dot '+(s.running?'run':s.ready?'ok':'bad');
     document.getElementById('state-detail').textContent=s.detail;
     document.getElementById('blockers').textContent=s.physical_blocker?
-      'Исходная поза: '+(1000*s.physical_blocker.clearance_m).toFixed(1)+' мм при требуемых '+(1000*s.physical_blocker.required_clearance_m).toFixed(0)+' мм. '+s.physical_blocker.required_action+' '+s.physical_blocker.recheck:
+      'Программный запас исходной позы: выборка поверхности '+(1000*s.physical_blocker.clearance_m).toFixed(1)+' мм при требуемых '+(1000*s.physical_blocker.required_clearance_m).toFixed(0)+' мм. '+s.physical_blocker.required_action+' '+s.physical_blocker.recheck:
       s.blockers.join(' · ');
-    document.getElementById('qualification').textContent=s.blockers.join(' · ');
+    const qualification=document.getElementById('qualification');qualification.style.whiteSpace='pre-line';
+    qualification.textContent=(s.blocking_conditions||[]).map(b=>b.code+' ['+b.category+']: '+b.reason+'\nСнятие: '+b.clear_when).join('\n\n');
     document.getElementById('action-result').textContent=s.results.length?
       s.results.map(r=>(r.success?'Успех: ':'Не выполнено: ')+r.reason+' · физически подтверждено: '+(r.evidence?.physical_verified?'да':'нет')).join('\n'):
       'Физически подтверждённых переносов пока нет.';
     document.getElementById('pause').textContent=s.paused?'Resume':'Pause';
-    const m=s.metrics;document.getElementById('metrics').textContent='Vision: '+(m.vision_s===undefined?'—':(1000*m.vision_s).toFixed(0)+' мс')+' · Start → первая команда: '+(m.first_command_s==null?'команд не было':m.first_command_s.toFixed(3)+' с');
+    const m=s.metrics;document.getElementById('metrics').textContent=[['Start → команда','first_command_s'],['Vision','vision_s'],['Захват','grasp_planning_s'],['IK','ik_s'],['Коллизии','collision_checking_s'],['Путь','motion_planning_s'],['Движение','actual_motion_s'],['Проверка','verification_s']].map(([label,key])=>label+': '+(m[key]==null?'не выполнялось':(1000*m[key]).toFixed(1)+' мс')).join(' · ');
     document.getElementById('log').textContent=s.log.join('\n');
     const live=await api('/api/live');document.getElementById('joints').textContent=live.pos?'Суставы · '+Object.entries(live.pos).map(([k,v])=>k+': '+v.toFixed(1)).join(' · '):'Нет свежей обратной связи';
     await refreshScene();

@@ -1,4 +1,4 @@
-"""Measured hard limits, soft clearances and separating escape proposals. No writes."""
+"""Hardware limits, sampled model margins and unapproved escape proposals."""
 import json
 import time
 import numpy as np
@@ -23,11 +23,21 @@ def audit_pose(robot, state):
     pose = m.pose(q)
     hard = m.problems(pose,margin=0.)
     exact = m.collides(pose,gap=0.)
+    hardware = [name+' outside encoder-calibrated range' for name,(lo,hi) in zip(
+        ('shoulder_pan','shoulder_lift','elbow_flex','wrist_flex','wrist_roll'),m.ranges) if not lo<=q[name]<=hi]
+    if not 0.<=q['gripper']<=100.:
+        hardware.append('gripper outside encoder-calibrated range')
+    separation = minimum_clearance(m,q)
     return {'timestamp':state['timestamp'],'joints_native':q,'q_rad':robot.from_native(q).tolist(),
-            'hard_limit_problems':hard,'actual_mesh_collision':exact,
+            'hard_limit_problems':hard,'hardware_limit_problems':hardware,
+            'hardware_limit_status':'VIOLATED' if hardware else 'WITHIN_LIMITS',
+            'actual_mesh_collision':None,'mesh_intersection_status':'NOT_ESTABLISHED',
+            'zero_gap_sample_contact':exact,'collision_method':'native sampled surfaces; zero gap is not an exact triangle intersection test',
             'planning_margin_problems':m.problems(pose),'planning_clearance_collision':m.collides(pose),
+            'software_margin_status':'VIOLATED' if m.problems(pose) or m.collides(pose) else 'SATISFIED',
             'required_joint_margin_rad':np.deg2rad(m.margin),'required_clearance_m':float(m.gap),
-            'minimum_model_clearance_m':minimum_clearance(m,q),
+            'minimum_model_clearance_m':separation,'physical_clearance_measured':False,
+            'minimum_sample_pair':m.collides(pose,gap=separation+.0001),
             'hard_valid':not hard and exact is None,'planning_valid':not m.problems(pose) and m.collides(pose) is None,
             'tip_m':list(pose.tip),'kinematic_offsets_native':list(m.offsets)}
 

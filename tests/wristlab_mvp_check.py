@@ -7,20 +7,24 @@ import json
 from pathlib import Path
 import sys
 import time
+import threading
 from types import SimpleNamespace as NS
 import unittest
 from unittest.mock import Mock, patch
 import numpy as np
+import cv2
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(ROOT))
 from wristlab.actions import Actions
-from wristlab.motion import Motion
+from wristlab.motion import Motion,AccessoryWorld
 from wristlab.robot import Robot
+from wristlab.geometry import Geometry
 from wristlab.scene import Scene
 from wristlab.recovery import Recovery
+from wristlab.runtime import Runtime
 from wristlab import tasks,experiments
-from wristlab.types import ObjectState,Placement,SceneState,ActionResult
+from wristlab.types import ObjectState,Placement,SceneState,ActionResult,Frame
 from so101_pick_place.geometry.cuboid_vision import cube_vertices
 from so101_pick_place.geometry.spatial_cube import SpatialCube
 from so101_pick_place.experiments.box_extraction.planner import Phase,ExtractionPlan
@@ -54,13 +58,13 @@ def action_contract():
                           local,np.array([.3,0.,SIDE/2]),())
     rest = ExtractionPlan('recorded',obj.id,tuple(phase(s) for s in ('extract_vertical','transfer','release','retract')),
                           local,np.array([.3,0.,SIDE/2]),())
-    driver = NS(confirm_grasp=Mock(return_value=local),release_confirmed=Mock(),retention=NS(armed=True))
+    driver = NS(confirm_grasp=Mock(return_value=local),release_confirmed=Mock(),confirm_retention=Mock(),retention=NS(armed=True))
     motion = NS(qualification_reasons=Mock(return_value=[]),make_world=Mock(return_value=NS()),
         check_path=Mock(),contact_free_passed=True,driver=driver,planner=NS(),execute_trajectory=Mock(),
-        replan_held=Mock(return_value=(rest,NS())),return_to_start=Mock())
+        replan_held=Mock(return_value=(rest,NS())),return_to_start=Mock(),state_is_valid=Mock(return_value=None))
     rt = NS(scene=scene,robot=robot,motion=motion,metrics={},report=Mock(),refresh=Mock(),
         check_cancel=Mock(),wait_pause=Mock(),ensure_driver=Mock(),stop=Mock(),recovery=Recovery(),
-        mode='relocate',physical_relocate_count=0,cameras=NS())
+        mode='relocate',physical_relocate_count=0,cameras=NS(check=Mock()),stop_event=threading.Event())
     action = Actions(rt)
     action.capture_grip_view = Mock(return_value={'frame_id':'anchor'})
     action.verify_pick = Mock(return_value=True)
@@ -120,8 +124,102 @@ class RelocateContract(unittest.TestCase):
         rt.motion.execute_trajectory.assert_not_called()
         rt.motion.driver.confirm_grasp.assert_not_called()
 
+    def test_missing_visual_target_after_approach_does_not_latch_hardware_fault(self):
+        setup = action_contract();obj,rt,action,placement,plan,_ = setup
+        with patch('wristlab.actions.choose_grasp',return_value=(None,plan,NS())),patch('wristlab.actions.visual_alignment',side_effect=ValueError('wrist target is missing')):
+            result = action.relocate(obj.id,placement)
+        self.assertFalse(result.success)
+        self.assertEqual(result.evidence['failure_kind'],'PLANNING_OR_OBSERVATION')
+        self.assertFalse(result.evidence['critical'])
+        rt.stop.assert_not_called()
+        self.assertNotIn('grasp',[call.args[0].name for call in rt.motion.execute_trajectory.call_args_list])
+
+    def test_post_grasp_ik_failure_holds_without_hardware_alarm(self):
+        setup = action_contract();_,rt,*_ = setup
+        rt.motion.replan_held.side_effect = ValueError('no placement IK')
+        result = self.invoke(setup)
+        self.assertFalse(result.success)
+        self.assertTrue(result.evidence['critical'])
+        self.assertFalse(result.evidence['hardware_fault'])
+        self.assertIsNotNone(rt.scene.held)
+        rt.motion.driver.confirm_retention.assert_called_once()
+        rt.stop.assert_not_called()
+
+    def test_operator_stop_is_not_reclassified_as_hardware_fault(self):
+        setup = action_contract();_,rt,*_ = setup
+        def stop_during_approach(*args):
+            rt.stop_event.set()
+            raise RuntimeError('STOP')
+        rt.motion.execute_trajectory.side_effect = stop_during_approach
+        result = self.invoke(setup)
+        self.assertEqual(result.evidence['failure_kind'],'OPERATOR_STOP')
+        self.assertFalse(result.evidence['hardware_fault'])
+        rt.stop.assert_not_called()
+
 
 class GeometryPolicy(unittest.TestCase):
+    def test_saved_native_box_observation_keeps_two_bodies_without_qualifying_depth(self):
+        scan=json.loads((ROOT/'runtime/boxes-native-current.json').read_text())
+        captured=scan['frame']['captured_at_unix_s']
+        image=cv2.imread(str(Path(scan['artifacts'])/'frame.jpg'))
+        wrist=cv2.imread(str(ROOT/'runtime/wrist-lit-8ms.jpg'))
+        scene=Scene(Geometry('/home/jetsonnx/Projects/so101_autonomous_pick_place'))
+        with patch('wristlab.scene.time.time',return_value=captured+1.):
+            scene.install_box_proposals(scan)
+            frames={name:Frame(name,'recorded:'+name,pixels,captured+1.,captured+1.,(captured+1.,captured+1.))
+                    for name,pixels in (('overview',image),('wrist',wrist))}
+            scene.update_scene(frames)
+        self.assertEqual(len(scene.state.boxes),2)
+        self.assertEqual(len(scene.state.objects),4)
+        self.assertTrue(all(not box.evidence['metric_qualified'] for box in scene.state.boxes.values()))
+
+    def test_runtime_states_distinguish_planning_execution_and_failure(self):
+        rt = Runtime.__new__(Runtime)
+        rt.blocking_conditions=Mock(return_value=[])
+        rt.robot=NS(last_state=None);rt.scene=NS(held=None,state=SceneState())
+        rt.initialized=False;rt.running=False;rt.phase='initializing';rt.detail='check'
+        rt.stop_event=threading.Event();rt.pause_event=threading.Event();rt.fault_latched=False
+        rt.mode=rt.started=rt.finished=rt.selected=None
+        rt.metrics={};rt.log=[];rt.results=[]
+        self.assertEqual(rt.status()['state'],'NOT_INITIALIZED')
+        rt.initialized=True
+        self.assertEqual(rt.status()['state'],'READY')
+        rt.running=True;rt.phase='grasp_planning'
+        self.assertEqual(rt.status()['state'],'PLANNING')
+        rt.phase='moving'
+        rt.blocking_conditions.return_value=[{'code':'SCENE_STALE','reason':'readiness observation stale during transfer'}]
+        self.assertEqual(rt.status()['state'],'EXECUTING')
+        rt.blocking_conditions.return_value=[];rt.phase='recovering'
+        self.assertEqual(rt.status()['state'],'RECOVERING')
+        rt.stop_event.set()
+        self.assertEqual(rt.status()['state'],'SAFETY_BLOCKED')
+        rt.stop_event.clear();rt.running=False;rt.phase='completed'
+        self.assertEqual(rt.status()['state'],'COMPLETED')
+        rt.phase='failed'
+        self.assertEqual(rt.status()['state'],'FAILED')
+
+    def test_native_auto_unfold_is_disabled_without_enabling_torque(self):
+        robot = Robot.__new__(Robot)
+        robot.arm=None;robot.acquire=Mock();robot.release=Mock();robot.output=ROOT/'runtime/unit'
+        robot.config=NS(robot={'port':'unused','calibration':'unused'})
+        with patch('wristlab.robot.TaskArm') as native:
+            robot.connect_once(lambda record:None)
+        self.assertIs(native.return_value.unfold_first,False)
+        native.return_value.torque_on.assert_not_called()
+        native.return_value.move_joints.assert_not_called()
+
+    def test_planning_cache_never_applies_to_live_guard_checks(self):
+        world = AccessoryWorld.__new__(AccessoryWorld)
+        world.cache={};world.cache_enabled=True;world.metrics={'collision_checking_s':None}
+        world._reason=Mock(return_value=None)
+        world.reason(Q,target='recorded');world.reason(Q,target='recorded')
+        self.assertEqual(world._reason.call_count,1)
+        self.assertEqual(world.metrics['collision_cache_hits'],1)
+        world.cache_enabled=False
+        world._reason.return_value='new contact'
+        self.assertEqual(world.reason(Q,target='recorded'),'new contact')
+        self.assertEqual(world._reason.call_count,2)
+
     def test_intermediate_compensated_command_cannot_cross_obstacle(self):
         motion = Motion.__new__(Motion)
         motion.robot = NS(native_edge_samples=Robot.native_edge_samples)

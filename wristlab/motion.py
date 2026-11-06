@@ -16,6 +16,8 @@ class Motion:
     def __init__(self, robot, check_cancel, report, qualification_file):
         self.robot, self.check_cancel, self.report = robot, check_cancel, report
         self.planner = TunedExtractionPlanner(robot.backend,check_cancel=check_cancel)
+        self.metrics = {}
+        self.planner.timings = self.metrics
         self.driver = None
         self.qualification_file = Path(qualification_file)
         self.world = self.plan = None
@@ -25,45 +27,48 @@ class Motion:
         self.attachment_path = self.qualification_file.parent/'attachment-candidate.json'
 
     def qualification_reasons(self, geometry):
-        reasons = []
+        return [item['reason'] for item in self.qualification_blockers(geometry)]
+
+    def qualification_blockers(self, geometry):
+        blockers = []
+        def add(code,category,reason,condition):
+            blockers.append({'code':code,'category':category,'reason':reason,'clear_when':condition})
         state = self.robot.last_state
         if state is None:
-            reasons.append('нет свежей обратной связи приводов')
+            add('FEEDBACK_MISSING','FEEDBACK','нет обратной связи приводов','эксклюзивный native-драйвер прочитал все энкодеры')
         else:
             if time.time()-state['timestamp']>.5:
-                reasons.append('обратная связь приводов устарела')
+                add('FEEDBACK_STALE','FEEDBACK','обратная связь приводов устарела','возраст измеренных углов не более 0,5 с')
             audit = self.robot.audit_state(state)
-            if audit['hard_valid']:
-                reasons.extend('не выдержан запас '+str(round(np.rad2deg(audit['required_joint_margin_rad'])))+'°: '+reason for reason in audit['planning_margin_problems'])
-                if audit['planning_clearance_collision']:
-                    reasons.append('зазор '+str(round(1000*audit['minimum_model_clearance_m'],1))+' мм меньше штатных '+str(round(1000*audit['required_clearance_m']))+' мм: '+audit['planning_clearance_collision'])
-            else:
-                reasons.extend(audit['hard_limit_problems'])
-                if audit['actual_mesh_collision']:
-                    reasons.append(audit['actual_mesh_collision'])
-        try:
-            evidence = json.loads(self.qualification_file.read_text())
-        except (OSError, ValueError):
-            evidence = {}
-        if evidence.get('overview_calibration_sha256') != geometry.fingerprint:
-            reasons.append('не подтверждена независимая проверка текущей геометрии камеры/крепления/кабеля')
-        for key, text in (('accessory_geometry_verified','геометрия крепления и камеры не квалифицирована'),
-                          ('cable_sweep_verified','объём и движение кабеля не квалифицированы'),
-                          ('wrist_alignment_verified','wrist-наведение для текущего крепления не квалифицировано')):
-            if evidence.get(key) is not True:
-                reasons.append(text)
+            if audit['hardware_limit_problems']:
+                add('HARD_LIMIT','HARD_LIMIT','; '.join(audit['hardware_limit_problems']),'все энкодеры внутри сохранённых аппаратных диапазонов')
+            if audit['hard_limit_problems'] and not audit['hardware_limit_problems']:
+                add('KINEMATIC_CONSTRAINT','GEOMETRY','; '.join(audit['hard_limit_problems']),'выполнены native-ограничения геометрии без дополнительного запаса')
+            if audit['zero_gap_sample_contact']:
+                add('MODEL_CONTACT','GEOMETRY',audit['zero_gap_sample_contact'],'подтверждено отсутствие контакта всей руки; нулевой порог не обходить')
+            if audit['planning_margin_problems']:
+                add('JOINT_PLANNING_MARGIN','SOFTWARE_MARGIN','не выдержан планировочный запас 5°: '+'; '.join(audit['planning_margin_problems']),
+                    'поза внутри штатного запаса или отдельно квалифицирован весь выход, включая отставание приводов и принадлежности')
+            if audit['planning_clearance_collision']:
+                add('SELF_CLEARANCE_MARGIN','SOFTWARE_MARGIN',
+                    f"выборка поверхности: {1000*audit['minimum_model_clearance_m']:.2f} мм при штатном запасе {1000*audit['required_clearance_m']:.0f} мм; {audit['planning_clearance_collision']}",
+                    'штатный запас по всей траектории или отдельно квалифицированный выход без новых опасных сближений')
         try:
             self.attachment = AttachmentGeometry(self.attachment_path,self.qualification_file,geometry.fingerprint)
         except (OSError,ValueError,KeyError,TypeError) as exc:
-            reasons.append('нет проверенной геометрии камеры/кабеля: '+str(exc))
+            self.attachment = None
+            add('ACCESSORY_GEOMETRY','QUALIFICATION','нет квалифицированного объёма камеры/крепления/кабеля',
+                'измеренная геометрия совпадает с калибровкой и независимо проверена для всего диапазона пути')
+            blockers[-1]['evidence_error'] = str(exc)
         if geometry.wrist is None:
-            reasons.append('нет wrist hand-eye, прошедшей независимую проверку текущего крепления')
-        return reasons
+            add('WRIST_CALIBRATION','QUALIFICATION','нет независимо проверенной wrist hand-eye для текущего крепления',
+                'установлена калибровка с независимой проверкой текущего крепления; отдельный флаг допуска наведения не требуется')
+        return blockers
 
     def make_world(self, scene):
         if self.attachment is None:
             raise ValueError('accessory collision geometry is not qualified')
-        return AccessoryWorld(self.robot,scene,self.attachment)
+        return AccessoryWorld(self.robot,scene,self.attachment,self.metrics)
 
     def state_is_valid(self, q, phase, plan, world):
         return world.reason(q,target=plan.target_id,jaw_contact=phase.jaw_contact,
@@ -103,7 +108,18 @@ class Motion:
         if not self.contact_free_passed or self.attachment is None or self.trial_attachment_sha256!=self.attachment.fingerprint:
             raise RuntimeError('contact-free approach has not been physically qualified')
         self.report('moving',phase.name)
-        self.driver.move_phase(phase,plan,world,self.check_cancel)
+        self._execute_native(phase,plan,world)
+
+    def _execute_native(self, phase, plan, world):
+        world.cache_enabled = False
+        world.cache.clear()
+        begin = time.perf_counter()
+        try:
+            self.driver.move_phase(phase,plan,world,self.check_cancel)
+        except ValueError as exc:
+            raise RuntimeError('native execution: '+str(exc)) from exc
+        finally:
+            self.metrics['actual_motion_s'] = (self.metrics.get('actual_motion_s',0.) or 0.)+time.perf_counter()-begin
 
     def prepare_driver(self, watchdog):
         if self.robot.arm is None:
@@ -127,21 +143,23 @@ class Motion:
         if not outward or any(p.carrying or p.jaw_contact for p in outward):
             raise ValueError('contact-free trial must contain only clear approach phases')
         self.check_path(replace(plan,phases=outward),world)
+        world.cache_enabled = False
+        world.cache.clear()
         self.driver.phase,self.driver.plan,self.driver.world = outward[0],plan,world
         self.robot.enable()
         for phase in outward:
             self.report('contact_free',phase.name)
-            self.driver.move_phase(phase,plan,world,self.check_cancel)
+            self._execute_native(phase,plan,world)
         current = self.robot.arm.read()[0]
         reverse = tuple(reversed(outward[-1].joints))
         join = self.planner.edge(current,reverse[0],world,target=plan.target_id)
         back = Phase('contact_free_return',tuple(join)+reverse[1:])
         self.check_path(replace(plan,phases=(back,)),world)
-        self.driver.move_phase(back,plan,world,self.check_cancel)
+        self._execute_native(back,plan,world)
         current = self.robot.arm.read()[0]
         restore = Phase('open',self.planner.edge(current,start,world,target=plan.target_id))
         self.check_path(replace(plan,phases=(restore,)),world)
-        self.driver.move_phase(restore,plan,world,self.check_cancel)
+        self._execute_native(restore,plan,world)
         actual = self.robot.arm.read()[0]
         error = float(np.max(np.abs(self.robot.from_native(actual)-self.robot.from_native(start))))
         if error > np.pi/240.:
@@ -201,10 +219,12 @@ class Motion:
 
 
 class AccessoryWorld(ExtractionCollisionWorld):
-    def __init__(self, robot, scene, attachment):
+    def __init__(self, robot, scene, attachment, metrics=None):
         from types import SimpleNamespace
         super().__init__(robot.backend,scene)
         self.robot,self.attachment = robot,attachment
+        self.metrics = {} if metrics is None else metrics
+        self.cache,self.cache_enabled = {},True
         # The general payload floor is the calibrated table. A destination's
         # elevated support applies only at placement, never at the source pick.
         ground = SimpleNamespace(height_m=float(robot.backend.model.table_z),uncertainty_m=0.)
@@ -225,6 +245,28 @@ class AccessoryWorld(ExtractionCollisionWorld):
         return bool(np.all(center@hull.equations[:,:2].T+hull.equations[:,2] <= -margin))
 
     def reason(self, joints, **policy):
+        payload,placed = policy.get('payload_local'),policy.get('placed_cube')
+        key = None
+        if self.cache_enabled:
+            key = (tuple(sorted(joints.items())),policy.get('target'),policy.get('jaw_contact',False),
+                   policy.get('support_contact',False),None if payload is None else np.asarray(payload).tobytes(),
+                   None if placed is None else (float(placed.side_m),placed.vertices_m.tobytes(),placed.rotation.tobytes()))
+            if key in self.cache:
+                self.metrics['collision_cache_hits'] = self.metrics.get('collision_cache_hits',0)+1
+                return self.cache[key]
+        begin = time.perf_counter()
+        try:
+            result = self._reason(joints,**policy)
+        finally:
+            self.metrics['collision_checking_s'] = (self.metrics.get('collision_checking_s',0.) or 0.)+time.perf_counter()-begin
+            self.metrics['collision_checks'] = self.metrics.get('collision_checks',0)+1
+        if key is not None:
+            if len(self.cache)>=8192:
+                self.cache.clear()
+            self.cache[key] = result
+        return result
+
+    def _reason(self, joints, **policy):
         native = self.native_checks.reason(joints,**policy)
         support_id = getattr(self.scene.placement,'support_id',None)
         intended = support_id is not None and native == 'payload: cube '+support_id

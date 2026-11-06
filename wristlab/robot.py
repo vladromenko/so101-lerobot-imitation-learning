@@ -24,6 +24,7 @@ class Robot:
         self.last_state = None
         self.on_tick = None
         self.first_command_at = None
+        self.audit_cache = None
 
     @staticmethod
     def from_native(joints):
@@ -86,9 +87,13 @@ class Robot:
 
     def audit_state(self, state):
         from .diagnostics import audit_pose
-        data = audit_pose(self,state)
-        return data | {'valid':data['planning_valid'],'problems':data['planning_margin_problems'],
-                       'collision':data['planning_clearance_collision']}
+        model = self.backend.model
+        key = (tuple(state['positions'][j] for j in (*ARM_JOINTS,'gripper')),
+               model.margin,model.gap,model.table_z,tuple(model.offsets),str(model.ranges))
+        if self.audit_cache is None or self.audit_cache[0]!=key:
+            self.audit_cache = key,audit_pose(self,state)
+        data = self.audit_cache[1] | {'timestamp':state['timestamp']}
+        return data | {'valid':data['planning_valid'],'problems':data['planning_margin_problems']}
 
     def forward_kinematics(self, q):
         return self.link_pose(q, 'gripper_frame_link')
@@ -119,6 +124,9 @@ class Robot:
                 r = self.config.robot
                 self.arm = TaskArm(port=r['port'], calibration_file=r['calibration'], offsets=r.get('kinematic_offsets_deg'),
                     on_tick=tick, hold_on_success=True, out=self.output, name='wristlab')
+                # Arm._ready() otherwise silently invokes the stock unfold
+                # before move_joints/follow, outside our checked trajectory.
+                self.arm.unfold_first = False
                 self.arm._echo = False
                 self.arm.check()
             except BaseException:
