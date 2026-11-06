@@ -182,6 +182,25 @@ class RelocateContract(unittest.TestCase):
 
 
 class GeometryPolicy(unittest.TestCase):
+    def test_wrist_visibility_does_not_require_overview_identity(self):
+        scene=Scene(NS())
+        scene.raw={'wrist':[{'color':'green','quad':np.array([[0,0],[20,0],[20,20],[0,20]]),'center_px':[10,10]}]}
+        public=scene.public()
+        self.assertEqual(public['visible_wrist_count'],1)
+        self.assertEqual(public['visible_overview_count'],0)
+        self.assertIsNone(public['wrist_objects'][0]['associated_object_id'])
+        self.assertFalse(public['wrist_objects'][0]['spatial_update'])
+
+    def test_enable_preserves_an_existing_powered_hold(self):
+        robot=Robot.__new__(Robot)
+        robot.arm=NS(torque=True,torque_on=Mock())
+        robot.owns_lease=Mock(return_value=True)
+        robot.enable()
+        robot.arm.torque_on.assert_not_called()
+        robot.arm.torque=False
+        robot.enable()
+        robot.arm.torque_on.assert_called_once()
+
     def test_released_placement_guard_failure_latches_stop(self):
         rt=Runtime.__new__(Runtime)
         rt.check_cancel=Mock();rt.cameras=NS(check=Mock());rt.refresh=Mock()
@@ -314,6 +333,7 @@ class GeometryPolicy(unittest.TestCase):
         with patch('wristlab.robot.TaskArm') as native:
             robot.connect_once(lambda record:None)
         self.assertIs(native.return_value.unfold_first,False)
+        native.return_value.raw.adopt_hold.assert_called_once()
         native.return_value.torque_on.assert_not_called()
         native.return_value.move_joints.assert_not_called()
 

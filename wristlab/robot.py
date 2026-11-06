@@ -129,6 +129,10 @@ class Robot:
                 self.arm.unfold_first = False
                 self.arm._echo = False
                 self.arm.check()
+                adopt = getattr(self.arm.raw,'adopt_hold',None)
+                if not callable(adopt):
+                    raise RuntimeError('read-only native hold reconnect is unavailable; refusing to reset powered servo goals')
+                adopt()
             except BaseException:
                 if self.arm is not None:
                     self.arm.close()
@@ -140,7 +144,8 @@ class Robot:
     def enable(self):
         if self.arm is None or not self.owns_lease():
             raise RuntimeError('native driver is not the exclusive bus owner')
-        self.arm.torque_on()
+        if not self.arm.torque:
+            self.arm.torque_on()
 
     def send_joint_targets(self, q, gripper):
         if self.arm is None or not self.owns_lease():

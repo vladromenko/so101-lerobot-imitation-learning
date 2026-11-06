@@ -377,6 +377,15 @@ class Scene:
         return SpatialCube(o.pose[:3,3],float(o.dimensions[0]),o.pose[:3,:3],vertices,o.evidence|{'object_id':object_id})
 
     def public(self):
+        wrist = []
+        frame = self.frames.get('wrist')
+        for index,detection in enumerate(self.raw.get('wrist',())):
+            matches = [o for o in self.state.objects.values() if o.color==detection['color']]
+            object_id = matches[0].id if len(matches)==1 else f"wrist-{detection['color']}-{index+1}"
+            wrist.append({'id':object_id,'color':detection['color'],
+                'polygon':[np.asarray(detection['quad']).tolist()],'px':detection['center_px'],
+                'frame_id':None if frame is None else frame.frame_id,'spatial_update':False,
+                'associated_object_id':matches[0].id if len(matches)==1 else None})
         return {'version':self.state.version,'timestamp':self.state.timestamp,
             'cubes':[{'id':o.id,'color':o.color,'px':np.mean(o.evidence['quad'],axis=0).tolist(),'xy_m':o.pose[:2,3].tolist(),
                       'dimensions_m':o.dimensions.tolist(),'confidence':o.confidence,'polygon':[o.evidence['quad']],
@@ -388,12 +397,9 @@ class Scene:
                       'last_wrist_observed_at':o.evidence.get('wrist_observation',{}).get('timestamp'),
                       'spatial_status':'retained' if o.status=='occluded' else 'attached' if o.status=='held' else 'measured' if o.evidence.get('metric_qualified') else 'unqualified',
                       'visible_overview':o.evidence.get('visible_overview',False),'visible_wrist':o.evidence.get('visible_wrist',False)} for o in self.state.objects.values()],
-            'wrist_objects':[{'id':o.id,'color':o.color,'polygon':[o.evidence['wrist_observation']['quad']],
-                'px':o.evidence['wrist_observation']['center_px'],
-                'frame_id':o.evidence['wrist_observation']['frame_id'],'spatial_update':False} for o in self.state.objects.values()
-                if o.evidence.get('visible_wrist')],
+            'wrist_objects':wrist,
             'visible_overview_count':sum(o.evidence.get('visible_overview',False) for o in self.state.objects.values()),
-            'visible_wrist_count':sum(o.evidence.get('visible_wrist',False) for o in self.state.objects.values()),
+            'visible_wrist_count':len(wrist),
             'occluded_count':sum(o.status=='occluded' for o in self.state.objects.values()),
             'boxes':[{'id':b.id,'polygon':b.evidence['polygon'],'occupied':b.occupied_slots,'metric_qualified':b.evidence['metric_qualified'],
                 'visibility':b.evidence.get('visibility','observed'),'last_observed_at':b.evidence.get('last_observed_at',b.evidence.get('source_timestamp')),

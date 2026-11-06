@@ -1,0 +1,70 @@
+--- a/python/so101ik/_arm.c
++++ b/python/so101ik/_arm.c
+@@ -7,6 +7,7 @@
+ #include <string.h>
+ #include <sys/time.h>
+ #include "so101ik.h"
++#include "sts.h"
+ 
+ static PyObject *Fault, *Unreachable, *GripLost;
+ static PyTypeObject *PoseType;
+@@ -269,6 +270,51 @@
+     if (rc) return call_done(self, rc);
+     GIVE(self);
+     return Py_BuildValue("(dddd)", (double)tip[0], (double)tip[1], (double)tip[2], (double)pitch);
++}
++
++/* Read-only reconnect: preserve hardware goals, torque and RAM settings. */
++static PyObject *arm_adopt_hold(ArmObject *self, PyObject *noargs) {
++    OPEN(self); TAKE(self);
++    so101_arm *a = &self->arm;
++    int rc=so101_arm_check(a), enabled=0, goals[SO101_NJ];
++    if (rc) return call_done(self,rc);
++    for (int j=0;j<SO101_NJ;j++) {
++        uint8_t on,acceleration; int goal,present,limit;
++        uint8_t id=(uint8_t)a->cal[j].id;
++        if (so101_sts_read(&a->hal,id,STS_TORQUE_ENABLE,&on,1) ||
++            so101_sts_read2(&a->hal,id,STS_GOAL_POSITION,&goal) ||
++            so101_sts_read2(&a->hal,id,STS_PRESENT_POSITION,&present) ||
++            so101_sts_read(&a->hal,id,STS_ACCELERATION,&acceleration,1) ||
++            so101_sts_read2(&a->hal,id,STS_TORQUE_LIMIT,&limit)) {
++            GIVE(self); PyErr_SetString(Fault,"adopt_hold: servo feedback missing"); return NULL;
++        }
++        enabled += on==1; goals[j]=goal;
++        so101_real degrees_per_step = j==SO101_GRIP ? a->model.gripper_span_deg/(a->cal[j].range_max-a->cal[j].range_min) : 360.0/4095.0;
++        if (on && (abs(goal-present)*degrees_per_step>a->lag_max || goal<a->cal[j].range_min || goal>a->cal[j].range_max || acceleration!=a->acceleration || limit>a->torque_limit)) {
++            GIVE(self); PyErr_SetString(Fault,"adopt_hold: existing goal or RAM settings are not admissible"); return NULL;
++        }
++    }
++    if (!enabled) { GIVE(self); Py_RETURN_FALSE; }
++    if (enabled!=SO101_NJ) {
++        GIVE(self); PyErr_SetString(Fault,"adopt_hold: mixed torque state"); return NULL;
++    }
++    so101_real first[SO101_NJ],actual[SO101_NJ];
++    if ((rc=so101_arm_read(a,first,NULL,NULL))) return call_done(self,rc);
++    a->hal.sleep_us(a->hal.ctx,a->tick_us);
++    if ((rc=so101_arm_read(a,actual,NULL,NULL))) return call_done(self,rc);
++    for (int j=0;j<SO101_NJ;j++) {
++        int goal;
++        so101_real resolution = j==SO101_GRIP ? 100.0/(a->cal[j].range_max-a->cal[j].range_min) : 360.0/4095.0;
++        if (so101_sts_read2(&a->hal,(uint8_t)a->cal[j].id,STS_GOAL_POSITION,&goal) ||
++            goal!=goals[j] || fabs(actual[j]-first[j])>resolution+1e-9) {
++            GIVE(self); PyErr_SetString(Fault,"adopt_hold: arm or existing goals are moving"); return NULL;
++        }
++    }
++    memcpy(a->goal,actual,sizeof actual); memcpy(a->start,actual,sizeof actual);
++    memset(a->lead,0,sizeof a->lead);
++    a->have_pose=0; a->have_target=0; a->folded=0; a->torque=1;
++    h_log(self,"adopt_hold: stationary powered servos; all hardware goals preserved");
++    GIVE(self); Py_RETURN_TRUE;
+ }
+ 
+ static PyObject *arm_torque_on(ArmObject *self, PyObject *noargs) {
+@@ -677,6 +723,7 @@
+     {"check", (PyCFunction)arm_check, METH_NOARGS, "every servo answers and its EEPROM matches the calibration"},
+     {"read", (PyCFunction)arm_read, METH_NOARGS, "read() -> (degrees, load %, mA), dicts by joint"},
+     {"where", (PyCFunction)arm_where, METH_NOARGS, "where() -> (x, y, z, pitch): the tip from one read of the positions"},
++    {"adopt_hold", (PyCFunction)arm_adopt_hold, METH_NOARGS, "read-only adoption of stationary already-powered servos; False if all torque is off"},
+     {"torque_on", (PyCFunction)arm_torque_on, METH_NOARGS, "goals to the present positions, RAM settings, torque on"},
+     {"torque_off", (PyCFunction)arm_torque_off, METH_NOARGS, "torque off: the arm drops"},
+     {"move_joints", (PyCFunction)(void (*)(void))arm_move_joints, METH_VARARGS | METH_KEYWORDS,
