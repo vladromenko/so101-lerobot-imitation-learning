@@ -70,6 +70,10 @@ class Runtime:
         self.native_stop_seen = None
         self.camera_error = None
         self.hardware_error = None
+        try:
+            self.known_working_configuration = json.loads((self.output/'model-audit.json').read_text()).get('known_working_configuration')
+        except (OSError,ValueError):
+            self.known_working_configuration = None
         self.report('initializing','No LLM, SAM or subprocess in experiment execution')
 
     def report(self, phase, detail):
@@ -384,8 +388,8 @@ class Runtime:
                 'clearance_m':audit['minimum_model_clearance_m'],'required_clearance_m':audit['required_clearance_m'],
                 'classification':'SOFTWARE_MARGIN' if not audit['hardware_limit_problems'] and not audit['zero_gap_sample_contact'] else 'GEOMETRY_OR_LIMIT',
                 'physical_clearance_measured':False,
-                'missing_measurement':'3D-положение текущей камеры/крепления на звене и объём петли кабеля вдоль начального выхода с учётом отставания приводов',
-                'required_action':'Для автоматического выхода необходима измеренная геометрия камеры/крепления и кабеля на начальном участке. Возможный временный выход — вручную разложить предплечье при выключенном моменте, без поворота запястья и натяжения кабеля.',
+                'missing_measurement':'Минимальный зазор камеры/крепления/кабеля до руки на начальном участке выхода из текущей позы с учётом отставания приводов; wrist_flex сейчас 62,59°, в последнем записанном camera-aware старте было 15,38°',
+                'required_action':'Калибровка руки сохранена. Восстановлен MountedTaskArm.prepare_ready; его вход из сегодняшней позы требует проверки зазора на дополнительном начальном участке. Слепой native-unfold включать нельзя.',
                 'recheck':'Свежие энкодеры и штатная проверка всего пути; сброс STOP сам по себе движение не разрешает.'}
         return {'running':self.running,'mode':self.mode,'dry':None,'started':self.started,'finished':self.finished,
             'phase':self.phase,'state':state,'blocking_conditions':conditions,
@@ -394,6 +398,9 @@ class Runtime:
             'stop_latched':self.stop_event.is_set(),'hardware_fault_latched':self.fault_latched,'log':list(self.log),'exit_code':0 if self.phase=='completed' else None,
             'metrics':self.metrics,'selected':self.selected,'scene_version':self.scene.state.version,
             'robot_audit':audit,'physical_blocker':physical_blocker,
+            'known_working_configuration':getattr(self,'known_working_configuration',None),
+            'startup_driver':None if self.robot.arm is None else type(self.robot.arm).__name__,
+            'startup_preparation_available':self.robot.arm is not None and hasattr(self.robot.arm,'prepare_ready'),
             'physical_relocate_verified':any(not isinstance(r,dict) and r.success and r.evidence.get('physical_verified') for r in self.results),'experiments':{m:'blocked_pending_relocate_qualification' for m in self.MODES},
             'results':[r if isinstance(r,dict) else {'success':r.success,'reason':r.reason,'evidence':r.evidence} for r in self.results]}
 

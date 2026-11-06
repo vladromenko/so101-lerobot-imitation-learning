@@ -4,6 +4,7 @@ Run with the project's hardware Python. Actuator calls are recorded, never sent.
 This verifies software failure handling, not physical manipulation.
 """
 import json
+import hashlib
 from pathlib import Path
 import sys
 import time
@@ -176,7 +177,7 @@ class GeometryPolicy(unittest.TestCase):
     def test_runtime_states_distinguish_planning_execution_and_failure(self):
         rt = Runtime.__new__(Runtime)
         rt.blocking_conditions=Mock(return_value=[])
-        rt.robot=NS(last_state=None);rt.scene=NS(held=None,state=SceneState())
+        rt.robot=NS(last_state=None,arm=None);rt.scene=NS(held=None,state=SceneState())
         rt.initialized=False;rt.running=False;rt.phase='initializing';rt.detail='check'
         rt.stop_event=threading.Event();rt.pause_event=threading.Event();rt.fault_latched=False
         rt.mode=rt.started=rt.finished=rt.selected=None
@@ -201,12 +202,18 @@ class GeometryPolicy(unittest.TestCase):
     def test_native_auto_unfold_is_disabled_without_enabling_torque(self):
         robot = Robot.__new__(Robot)
         robot.arm=None;robot.acquire=Mock();robot.release=Mock();robot.output=ROOT/'runtime/unit'
+        robot.backend=NS()
         robot.config=NS(robot={'port':'unused','calibration':'unused'})
         with patch('wristlab.robot.TaskArm') as native:
             robot.connect_once(lambda record:None)
         self.assertIs(native.return_value.unfold_first,False)
         native.return_value.torque_on.assert_not_called()
         native.return_value.move_joints.assert_not_called()
+
+    def test_restored_startup_component_matches_physically_used_source(self):
+        previous=Path('/home/jetsonnx/Projects/so101_box_color_sorting_archived_20261106T085545/box_extract/mounted_arm.py')
+        restored=ROOT/'box_extract/mounted_arm.py'
+        self.assertEqual(hashlib.sha256(previous.read_bytes()).digest(),hashlib.sha256(restored.read_bytes()).digest())
 
     def test_planning_cache_never_applies_to_live_guard_checks(self):
         world = AccessoryWorld.__new__(AccessoryWorld)

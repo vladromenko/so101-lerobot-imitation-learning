@@ -85,7 +85,8 @@ async function poll(){
       'Программный запас исходной позы: выборка поверхности '+(1000*s.physical_blocker.clearance_m).toFixed(1)+' мм при требуемых '+(1000*s.physical_blocker.required_clearance_m).toFixed(0)+' мм. '+s.physical_blocker.required_action+' '+s.physical_blocker.recheck:
       s.blockers.join(' · ');
     const qualification=document.getElementById('qualification');qualification.style.whiteSpace='pre-line';
-    qualification.textContent=(s.blocking_conditions||[]).map(b=>b.code+' ['+b.category+']: '+b.reason+'\nСнятие: '+b.clear_when).join('\n\n');
+    qualification.textContent=(s.known_working_configuration?'Калибровка суставов и FK сохранены от физически работавшей системы. Восстановлен '+s.startup_driver+'; автоматическая подготовка позы ещё не разрешена.\n\n':'')+
+      (s.blocking_conditions||[]).map(b=>b.code+' ['+b.category+']: '+b.reason+'\nСнятие: '+b.clear_when).join('\n\n');
     document.getElementById('action-result').textContent=s.results.length?
       s.results.map(r=>(r.success?'Успех: ':'Не выполнено: ')+r.reason+' · физически подтверждено: '+(r.evidence?.physical_verified?'да':'нет')).join('\n'):
       'Физически подтверждённых переносов пока нет.';

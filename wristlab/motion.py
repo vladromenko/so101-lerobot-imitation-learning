@@ -46,13 +46,12 @@ class Motion:
                 add('KINEMATIC_CONSTRAINT','GEOMETRY','; '.join(audit['hard_limit_problems']),'выполнены native-ограничения геометрии без дополнительного запаса')
             if audit['zero_gap_sample_contact']:
                 add('MODEL_CONTACT','GEOMETRY',audit['zero_gap_sample_contact'],'подтверждено отсутствие контакта всей руки; нулевой порог не обходить')
-            if audit['planning_margin_problems']:
-                add('JOINT_PLANNING_MARGIN','SOFTWARE_MARGIN','не выдержан планировочный запас 5°: '+'; '.join(audit['planning_margin_problems']),
-                    'поза внутри штатного запаса или отдельно квалифицирован весь выход, включая отставание приводов и принадлежности')
-            if audit['planning_clearance_collision']:
-                add('SELF_CLEARANCE_MARGIN','SOFTWARE_MARGIN',
-                    f"выборка поверхности: {1000*audit['minimum_model_clearance_m']:.2f} мм при штатном запасе {1000*audit['required_clearance_m']:.0f} мм; {audit['planning_clearance_collision']}",
-                    'штатный запас по всей траектории или отдельно квалифицированный выход без новых опасных сближений')
+            if audit['hard_valid'] and not audit['planning_valid']:
+                add('STARTUP_PREPARATION','STARTUP',
+                    'штатная стартовая поза требует prepare_ready до применения рабочих запасов 5°/8 мм; это не отказ калибровки суставов',
+                    'проверен начальный путь MountedTaskArm.prepare_ready из текущих энкодеров с камерой и отставанием приводов; рабочая конечная поза проходит обычные ограничения')
+                blockers[-1]['working_margin_details'] = {'joints':audit['planning_margin_problems'],
+                    'sample_separation_m':audit['minimum_model_clearance_m'],'pair':audit['planning_clearance_collision']}
         try:
             self.attachment = AttachmentGeometry(self.attachment_path,self.qualification_file,geometry.fingerprint)
         except (OSError,ValueError,KeyError,TypeError) as exc:

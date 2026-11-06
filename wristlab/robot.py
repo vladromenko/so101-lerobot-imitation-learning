@@ -8,7 +8,7 @@ import numpy as np
 from so101_pick_place.config import load_config
 from so101_pick_place.kinematics import So101ModelPlanner
 from so101_pick_place.kinematics.so101_backend import ARM_JOINTS
-from so101_pick_place.hardware.task_arm import TaskArm
+from box_extract.mounted_arm import MountedTaskArm as TaskArm
 from so101_pick_place.hardware.robot import ReadOnlySO101
 
 
@@ -122,7 +122,7 @@ class Robot:
             self.acquire('wristlab_executor')
             try:
                 r = self.config.robot
-                self.arm = TaskArm(port=r['port'], calibration_file=r['calibration'], offsets=r.get('kinematic_offsets_deg'),
+                self.arm = TaskArm(mount_backend=self.backend,port=r['port'], calibration_file=r['calibration'], offsets=r.get('kinematic_offsets_deg'),
                     on_tick=tick, hold_on_success=True, out=self.output, name='wristlab')
                 # Arm._ready() otherwise silently invokes the stock unfold
                 # before move_joints/follow, outside our checked trajectory.
