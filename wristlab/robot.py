@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import time
 import uuid
+from contextlib import contextmanager
 import numpy as np
 from so101_pick_place.config import load_config
 from so101_pick_place.kinematics import So101ModelPlanner
@@ -135,6 +136,60 @@ class Robot:
             raw = min(4095,max(0,raw))
             result[name] = (raw-lo)/(hi-lo)*100. if name=='gripper' else (raw-(lo+hi)/2)*360./4095.
         return result
+
+    def synchronize_reference(self, state, sag):
+        """Rebase a native control reference onto the measured powered hold."""
+        from scipy.optimize import root
+        names = tuple(state['positions'])
+        goals = {name:state['motor_health'][name]['goal'] for name in names}
+        steps = self.encoder_steps()
+        # Native to_raw truncates: target the centre of each existing encoder
+        # bin so floating-point roundoff cannot change the first register.
+        centres = {name:goals[name]+steps[name]/2 for name in names}
+        def residual(values):
+            command = self.backend.driver_command_goal(dict(zip(names,values)),sag)
+            return [command[name]-centres[name] for name in names]
+        fit = root(residual,[state['positions'][name] for name in names])
+        reference = dict(zip(names,map(float,fit.x)))
+        first = self.quantized_command(self.backend.driver_command_goal(reference,sag))
+        if not fit.success or any(abs(first[name]-goals[name])>steps[name]/2 for name in names):
+            raise ValueError('native reference could not reproduce the existing hardware goal registers')
+        return {'offset':{name:reference[name]-state['positions'][name] for name in names},
+                'hardware_goals':goals,'start':dict(state['positions']),'sag':float(sag),
+                'first_command':first,'reference':reference}
+
+    @staticmethod
+    def control_reference(joints, synchronization, inverse=False):
+        direction = -1. if inverse else 1.
+        return {name:float(value+direction*synchronization['offset'][name]) for name,value in joints.items()}
+
+    def synchronized_command(self, joints, synchronization):
+        reference = self.control_reference(joints,synchronization)
+        return self.backend.driver_command_goal(reference,synchronization['sag'])
+
+    @contextmanager
+    def synchronized_follow(self, synchronization):
+        """Feed rebased references through the unchanged native follower."""
+        if float(self.arm.raw.sag)!=synchronization['sag']:
+            raise ValueError('native gravity compensation changed since synchronization')
+        follow,move = self.arm.follow,self.arm.move_joints
+        def checked_follow(poses,*args,**options):
+            if options.get('lead') or options.get('press',0.):
+                raise ValueError('synchronized empty-jaw recovery requires the native fixed-reference follower')
+            physical = [dict(p.deg if hasattr(p,'deg') else p) for p in poses]
+            health = self.read_motor_health(force=True)
+            first = self.quantized_command(self.synchronized_command(physical[0],synchronization))
+            if any(abs(first[j]-health[j]['goal'])>self.encoder_steps()[j]/2 for j in first):
+                raise ValueError('powered hold changed; refusing the first resumed packet')
+            references = [self.control_reference(q,synchronization) for q in physical]
+            return follow(references,*args,**options)
+        def refuse_move(*args,**options):
+            raise ValueError('synchronized recovery must use the native checked trajectory')
+        self.arm.follow,self.arm.move_joints = checked_follow,refuse_move
+        try:
+            yield
+        finally:
+            self.arm.follow,self.arm.move_joints = follow,move
 
     def audit_state(self, state):
         from .diagnostics import audit_pose

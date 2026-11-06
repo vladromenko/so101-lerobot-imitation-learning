@@ -88,6 +88,8 @@ class Motion:
         self.operator_observation = None
         self.release_phase,self.release_previous = None,None
         self.recovery_report = None
+        self.recovery_mapping = None
+        self.executing_recovery = False
 
     def prepare_ready(self, scene, geometry, attendance, dry=False):
         """Leave the folded soft-margin violation through an attended opening corridor.
@@ -298,7 +300,7 @@ class Motion:
         import itertools,inspect,re
         native = inspect.getsource(ExistingArmDriver._move)
         arrival = float(re.search(r'follow\(poses,.*?within=([\d.]+)',native,re.S).group(1))
-        command = self.robot.quantized_command(self.planner._command_pose(joints))
+        command = self.robot.quantized_command(self.robot.synchronized_command(joints,self.recovery_mapping))
         steps = self.robot.encoder_steps()
         names = list(start)
         limits = []
@@ -316,19 +318,22 @@ class Motion:
         baseline = self.recovery_gaps(world,start)
         minima = {key:float('inf') for key in baseline}
         previous = None
-        for point in points:
+        for index,point in enumerate(points):
             bounds = {key:float('inf') for key in baseline}
             for sample in self.recovery_envelope(start,point,holding):
                 planning_cancel()
                 refusal = world.reason(sample,**policy)
                 if refusal:
+                    self.recovery_report.update(rejected_waypoint=index,rejected_nominal_pose=point,
+                        rejected_response_pose=sample,rejected_response_gaps_m=self.recovery_gaps(world,sample))
                     raise ValueError('uncertainty: '+refusal)
                 gaps = self.recovery_gaps(world,sample)
                 bounds = {key:min(bounds[key],gaps[key]) for key in bounds}
-            if previous is not None and any(bounds[key]<previous[key]-world.recovery_numeric_resolution for key in bounds):
+            capped = {key:min(value,self.robot.backend.model.gap if key.startswith('native: ') else world.scene.box.clearance_m) for key,value in bounds.items()}
+            if previous is not None and any(capped[key]<previous[key]-world.recovery_numeric_resolution for key in capped):
                 raise ValueError('predicted deficient gap decreases')
             minima = {key:min(minima[key],bounds[key]) for key in bounds}
-            previous = bounds
+            previous = capped
         return minima
 
     def plan_invalid_start(self, native_scene, state, placed, planning_cancel):
@@ -338,11 +343,37 @@ class Motion:
         if not self.robot.audit_state(state)['hard_valid']:
             raise ValueError('RECOVERY_FROM_INVALID_START: hard native constraints fail')
         holding = {name:motor['goal'] for name,motor in state['motor_health'].items()}
+        self.recovery_mapping = self.robot.synchronize_reference(state,self.planner.command_sag)
         world = self.recovery_world(native_scene,start)
         target = next(key for key,cube in native_scene.cubes.items() if np.linalg.norm(cube.center_m-placed.center_m)<np.finfo(float).eps)
         policy = {'target':target,'jaw_contact':True,'placed_cube':placed}
         normal = self.make_world(native_scene)
         baseline = self.recovery_gaps(world,start)
+        # Every path starts with this same native gravity-compensated packet.
+        # Reject it once before searching endpoints; no later waypoint can fix
+        # a new contact in the initial response envelope.
+        self.recovery_report = {'status':'CHECKING','phase':'RECOVERY_FROM_INVALID_START',
+            'start':start,'goal':None,'initial_gaps_m':baseline,
+            'initial_gaps_with_execution_error_m':None,
+            'holding_hardware_goals':holding,
+            'first_hardware_command':self.recovery_mapping['first_command'],
+            'reference_synchronization':self.recovery_mapping,
+            'actuator_commands_sent':False,'stop_reset':False}
+        # A new STOP must also be safe at the very first recovery point.
+        # freeze() sends the encoder snapshot as raw goals without compensation.
+        # Replay the already measured post-STOP hold deflection as an uncertainty
+        # scenario; it is not a new calibration or an assumed exact prediction.
+        stop_goals = self.robot.quantized_command(start)
+        settling = {name:start[name]-holding[name] for name in start}
+        stop_pose = {name:stop_goals[name]+settling[name] for name in start}
+        stop_gaps = self.recovery_gaps(world,stop_pose)
+        self.recovery_report.update(native_stop_raw_goals=stop_goals,
+            measured_hold_deflection=settling,stop_settling_scenario=stop_pose,stop_settling_gaps_m=stop_gaps)
+        contact = next((key for key,value in stop_gaps.items() if value<=0.),None)
+        if contact:
+            self.recovery_report.update(status='BLOCKED',code='STOP_SETTLING_CLEARANCE',pair=contact,
+                reason='native STOP rewrites goals to encoders; observed hold deflection reaches '+contact)
+            raise ValueError('RECOVERY_FROM_INVALID_START: '+self.recovery_report['reason'])
         lower = dict(baseline)
         initial_states = list(self.recovery_envelope(start,start,holding))
         for q in initial_states:
@@ -358,15 +389,7 @@ class Motion:
             bound['minimum'] = lower[key[0]+': '+key[1]]
         world.native_checks.backend.model.minimums = world.recovery_native_minimums
         world.cache.clear()
-        # Every path starts with this same native gravity-compensated packet.
-        # Reject it once before searching endpoints; no later waypoint can fix
-        # a new contact in the initial response envelope.
-        self.recovery_report = {'status':'CHECKING','phase':'RECOVERY_FROM_INVALID_START',
-            'start':start,'goal':None,'initial_gaps_m':baseline,
-            'initial_gaps_with_execution_error_m':lower,
-            'holding_hardware_goals':holding,
-            'first_hardware_command':self.robot.quantized_command(self.planner._command_pose(start)),
-            'actuator_commands_sent':False,'stop_reset':False}
+        self.recovery_report['initial_gaps_with_execution_error_m'] = lower
         for sample in initial_states:
             planning_cancel()
             refusal = world.reason(sample,**policy)
@@ -595,7 +618,21 @@ class Motion:
         begin = time.perf_counter()
         try:
             world.release_origin = self.robot.arm.read()[0] if phase.name=='retract' and phase.placed_cube is not None else None
-            self.driver.move_phase(phase,plan,world,self.check_cancel)
+            if phase.name=='RECOVERY_FROM_INVALID_START':
+                import copy
+                original = self.driver.backend
+                backend = copy.copy(original)
+                backend.driver_command_goal = lambda q,sag:self.robot.synchronized_command(q,self.recovery_mapping)
+                self.driver.backend = backend
+                self.executing_recovery = True
+                try:
+                    with self.robot.synchronized_follow(self.recovery_mapping):
+                        self.driver.move_phase(phase,plan,world,self.check_cancel)
+                finally:
+                    self.executing_recovery = False
+                    self.driver.backend = original
+            else:
+                self.driver.move_phase(phase,plan,world,self.check_cancel)
         except ValueError as exc:
             raise RuntimeError('native execution: '+str(exc)) from exc
         finally:
@@ -614,6 +651,8 @@ class Motion:
 
     def guarded_tick(self, record):
         self.check_cancel()
+        if self.executing_recovery:
+            record = dict(record,goal=self.robot.control_reference(record['goal'],self.recovery_mapping,inverse=True))
         if self.startup_world is not None:
             for kind,q in (('goal',record['goal']),('pos',record['pos']),
                            ('command',self.robot.backend.driver_command_goal(record['goal'],self.robot.arm.raw.sag))):

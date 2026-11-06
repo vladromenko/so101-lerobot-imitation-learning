@@ -186,6 +186,55 @@ class RelocateContract(unittest.TestCase):
 
 
 class GeometryPolicy(unittest.TestCase):
+    def test_resumed_native_reference_preserves_all_powered_hardware_goals(self):
+        recorded=json.loads((ROOT/'runtime/retreat-park-before-restart.json').read_text())
+        robot=Robot('/home/jetsonnx/Projects/so101_autonomous_pick_place',ROOT/'runtime/unit')
+        state={'positions':recorded['pos'],'motor_health':recorded['motor_health']}
+        synchronization=robot.synchronize_reference(state,3.7)
+        expected={n:m['goal'] for n,m in recorded['motor_health'].items()}
+        self.assertEqual(synchronization['first_command'],expected)
+        native_follow=Mock()
+        robot.arm=NS(raw=NS(sag=3.7),follow=native_follow,move_joints=Mock())
+        robot.read_motor_health=Mock(return_value=recorded['motor_health'])
+        path=[state['positions'],dict(state['positions'],shoulder_pan=state['positions']['shoulder_pan']+.5)]
+        with robot.synchronized_follow(synchronization):
+            robot.arm.follow(path,duration=1.,lead=False)
+        sent=native_follow.call_args.args[0]
+        self.assertEqual(robot.quantized_command(robot.backend.driver_command_goal(sent[0],3.7)),expected)
+        self.assertAlmostEqual(sent[1]['shoulder_pan']-sent[0]['shoulder_pan'],.5)
+        self.assertIs(robot.arm.follow,native_follow)
+        self.assertEqual(robot.arm.raw.sag,3.7)
+
+    def test_changed_hold_is_rejected_before_the_native_follower(self):
+        recorded=json.loads((ROOT/'runtime/retreat-park-before-restart.json').read_text())
+        robot=Robot('/home/jetsonnx/Projects/so101_autonomous_pick_place',ROOT/'runtime/unit')
+        synchronization=robot.synchronize_reference({'positions':recorded['pos'],'motor_health':recorded['motor_health']},3.7)
+        native_follow=Mock();robot.arm=NS(raw=NS(sag=3.7),follow=native_follow,move_joints=Mock())
+        recorded['motor_health']['shoulder_lift']['goal']+=2*robot.encoder_steps()['shoulder_lift']
+        robot.read_motor_health=Mock(return_value=recorded['motor_health'])
+        with robot.synchronized_follow(synchronization):
+            with self.assertRaisesRegex(ValueError,'powered hold changed'):
+                robot.arm.follow([recorded['pos'],recorded['pos']],lead=False)
+        native_follow.assert_not_called()
+
+    def test_recorded_stop_settling_is_rejected_before_path_search_or_motion(self):
+        import pickle
+        from wristlab.geometry import AttachmentGeometry
+        recorded=json.loads((ROOT/'runtime/retreat-park-before-restart.json').read_text())
+        state={'positions':recorded['pos'],'motor_health':recorded['motor_health'],'timestamp':recorded['time']}
+        robot=Robot('/home/jetsonnx/Projects/so101_autonomous_pick_place',ROOT/'runtime/unit')
+        motion=Motion(robot,lambda:None,lambda *args:None,ROOT/'runtime/qualification.json')
+        motion.planner.command_sag=3.7
+        motion.attachment=AttachmentGeometry.attended(motion.attachment_path,robot,{'cable_and_hidden_surfaces_clear':True})
+        with (ROOT/'runtime/released-placement.pkl').open('rb') as handle:saved=pickle.load(handle)
+        placed=next(p.placed_cube for p in reversed(saved['plan'].phases) if p.placed_cube is not None)
+        motion.planner.vertical_center=Mock()
+        with self.assertRaisesRegex(ValueError,'native STOP rewrites goals'):
+            motion.plan_invalid_start(saved['native_scene'],state,placed,lambda:None)
+        self.assertEqual(motion.recovery_report['code'],'STOP_SETTLING_CLEARANCE')
+        motion.planner.vertical_center.assert_not_called()
+        self.assertIsNone(robot.arm)
+
     def test_incomplete_exit_blocks_before_any_actuator_call(self):
         setup=action_contract();obj,rt,action,placement,plan,_=setup
         rt.motion.preflight_cycle.side_effect=ValueError('retreat: no safe Park route')
