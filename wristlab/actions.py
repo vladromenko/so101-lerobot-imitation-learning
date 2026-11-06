@@ -226,13 +226,19 @@ class Actions:
                             temporary.replace(rt.output/'released-placement.pkl')
             stage = 'verify_placement'
             verify_started = time.monotonic()
+            observed_after = time.time()
             verified,observed = self.verify_placement(obj,placement)
             rt.metrics['verification_s'] = (rt.metrics.get('verification_s',0.) or 0.)+time.monotonic()-verify_started
             if not verified and recovery_attempt < rt.recovery.max_attempts:
-                candidates = [o for o in self.scene.state.objects.values() if o.color==obj.color and o.evidence.get('metric_qualified')]
+                with self.scene.lock:
+                    candidates = [o for o in self.scene.state.objects.values() if o.color==obj.color and self.fresh_metric_observation(o,observed_after)]
                 if len(candidates)==1:
                     self.scene.release_reservation(object_id)
-                    return self.relocate(candidates[0].id,placement,recovery_attempt=recovery_attempt+1)
+                    retry = self.relocate(candidates[0].id,placement,recovery_attempt=recovery_attempt+1)
+                    if not retry.evidence.get('motion_started'):
+                        retry.evidence.update(recovered=True)
+                    retry.evidence.update(motion_started=True,previous_retreat_completed=True)
+                    return retry
             if not verified:
                 raise ValueError('object was not observed at placement within tolerance')
             self.scene.detach_object(object_id,observed)
@@ -375,6 +381,17 @@ class Actions:
             self.motion.execute_trajectory(phase,recovery,world)
         rt.report('recovered','Empty jaw confirmed; retraced the checked approach')
 
+    def fresh_metric_observation(self, candidate, after_time):
+        evidence = candidate.evidence
+        overview_id = self.scene.state.evidence.get('overview_frame_id')
+        overview = overview_id is not None and evidence.get('visible_overview') is True and evidence.get('frame_id')==overview_id
+        wrist = evidence.get('wrist_observation',{})
+        wrist_id = self.scene.state.evidence.get('wrist_frame_id')
+        wrist_metric = wrist_id is not None and self.scene.geometry.wrist is not None and wrist.get('spatial_update') is True and wrist.get('frame_id')==wrist_id
+        return (evidence.get('metric_qualified') and candidate.timestamp>=after_time and
+                evidence.get('spatial_timestamp',candidate.timestamp)>=after_time and
+                candidate.status not in ('held','occluded') and (overview or wrist_metric))
+
     def verify_placement(self, obj, placement):
         before = self.robot.read_state()
         self.runtime.cameras.record_state(before['timestamp'],before['q'],before['gripper'])
@@ -384,12 +401,22 @@ class Actions:
         after = self.robot.read_state()
         self.runtime.cameras.record_state(after['timestamp'],after['q'],after['gripper'])
         self.runtime.refresh()
-        matches = [o for o in self.scene.state.objects.values() if o.color==obj.color and o.evidence.get('metric_qualified') and np.linalg.norm(o.pose[:3,3]-placement.object_pose[:3,3]) <= placement.tolerance]
-        if len(matches) != 1:
-            return False,None
-        observed = matches[0]
-        if observed.id != obj.id:
-            self.scene.state.objects.pop(observed.id)
-            observed.id = obj.id
-            self.scene.state.objects[obj.id] = observed
-        return True,observed.pose
+        with self.scene.lock:
+            matches = [o for o in self.scene.state.objects.values() if o.color==obj.color and self.fresh_metric_observation(o,after_motion) and
+                       np.linalg.norm(o.pose[:3,3]-placement.object_pose[:3,3])<=placement.tolerance]
+            if len(matches)!=1:
+                return False,None
+            observed = matches[0]
+            if observed.id!=obj.id:
+                old_id = observed.id
+                self.scene.state.objects.pop(old_id)
+                self.scene.track_memory.pop(old_id,None)
+                metric = self.scene.metric_objects.pop(old_id,None)
+                if metric is not None:
+                    self.scene.metric_objects[obj.id] = metric
+                observed.id = obj.id
+                self.scene.state.objects[obj.id] = observed
+                for box in self.scene.state.boxes.values():
+                    box.occupied_slots = [obj.id if key==old_id else key for key in box.occupied_slots]
+            self.scene.track_memory[obj.id] = observed
+            return True,observed.pose.copy()

@@ -4,6 +4,8 @@ from .types import Placement
 
 
 def box_for_color(color, boxes):
+    if color not in ('green','yellow','red','blue'):
+        raise ValueError('sorting requires a confidently classified supported cube color')
     ordered = sorted(boxes.values(),key=lambda b:np.mean(np.array(b.evidence['polygon']),axis=0)[0])
     if len(ordered) != 2:
         raise ValueError('sorting requires exactly two independently measured boxes')
@@ -39,10 +41,14 @@ def next_transfer(mode, scene, selected=None, destination=None, excluded=()):
         box = scene.state.boxes[destination]
         if not box.occupied_slots:
             return None
-        available = [key for key in box.occupied_slots if key not in excluded]
+        graph = scene.build_support_graph()
+        available = [scene.state.objects[key] for key in box.occupied_slots
+                     if key not in excluded and not graph[key] and scene.state.objects[key].status!='held']
         if not available:
+            if any(key not in excluded for key in box.occupied_slots):
+                raise ValueError('box contains objects with no top-accessible extraction; clear the support graph first')
             return None
-        obj = scene.state.objects[available[-1]]
+        obj = next((obj for obj in available if obj.id==selected),max(available,key=lambda obj:obj.pose[2,3]))
         slots = scene.find_free_table_slots(obj.dimensions)
         if not slots:
             raise ValueError('no independently surveyed free table support is available')
@@ -54,8 +60,15 @@ def next_transfer(mode, scene, selected=None, destination=None, excluded=()):
         wrong = [o for o in objects if o.id not in scene.state.boxes[box_for_color(o.color,scene.state.boxes)].occupied_slots]
         if not wrong:
             return None
-        obj = wrong[0]
-        return obj.id,placement_in_box(scene,obj.id,box_for_color(obj.color,scene.state.boxes))
+        graph = scene.build_support_graph()
+        available = [obj for obj in wrong if not graph[obj.id] and obj.status!='held']
+        failures = []
+        for obj in sorted(available,key=lambda obj:-obj.pose[2,3]):
+            try:
+                return obj.id,placement_in_box(scene,obj.id,box_for_color(obj.color,scene.state.boxes))
+            except ValueError as exc:
+                failures.append(obj.id+': '+str(exc))
+        raise ValueError('sorting has no accessible destination: '+('; '.join(failures) or 'support graph blocks the remaining objects'))
     raise ValueError('experiment has not reached implementation/qualification stage')
 
 

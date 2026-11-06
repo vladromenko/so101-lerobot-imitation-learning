@@ -133,6 +133,15 @@ class RelocateContract(unittest.TestCase):
         self.assertTrue(rt.stop.call_args.kwargs['hardware_fault'])
         self.assertIsNotNone(rt.scene.held)
 
+    def test_failed_placement_observation_does_not_regrasp_retained_coordinates(self):
+        setup=action_contract();_,rt,action,*_=setup
+        action.verify_placement.return_value=(False,None)
+        result=self.invoke(setup)
+        self.assertFalse(result.success)
+        self.assertTrue(result.evidence['motion_started'])
+        self.assertEqual([c.args[0].name for c in rt.motion.execute_trajectory.call_args_list].count('grasp'),1)
+        rt.stop.assert_not_called()
+
     def test_qualification_failure_never_prepares_or_moves_driver(self):
         setup = action_contract();_,rt,*_ = setup
         rt.motion.qualification_reasons.return_value = ['start clearance below 8mm']
@@ -186,6 +195,61 @@ class RelocateContract(unittest.TestCase):
 
 
 class GeometryPolicy(unittest.TestCase):
+    def test_placement_cannot_be_proved_by_retained_or_old_metric_coordinates(self):
+        scene=Scene(NS(wrist=None))
+        obj=object_at('target','green',.25,0.)
+        placement=Placement(obj.pose.copy(),'table')
+        scene.state=SceneState({obj.id:obj},timestamp=20.,evidence={'overview_frame_id':'current'})
+        robot=NS(read_state=Mock(return_value={'timestamp':20.,'q':np.zeros(5),'gripper':44.}))
+        rt=NS(scene=scene,robot=robot,motion=NS(),refresh=Mock(),check_cancel=Mock(),
+              cameras=NS(record_state=Mock(),wait_for_frame=Mock()))
+        action=Actions(rt)
+        cases=[('occluded',False,21.,'current'),('observed',True,19.,'current'),('observed',True,21.,'previous')]
+        with patch('wristlab.actions.time.time',return_value=20.):
+            for status,visible,stamp,frame_id in cases:
+                obj.status,obj.timestamp=status,stamp
+                obj.evidence.update(visible_overview=visible,frame_id=frame_id,spatial_timestamp=stamp)
+                self.assertFalse(action.verify_placement(obj,placement)[0])
+            obj.status,obj.timestamp='observed',21.
+            obj.evidence.update(visible_overview=True,frame_id='current',spatial_timestamp=21.)
+            self.assertTrue(action.verify_placement(obj,placement)[0])
+
+    def test_placement_id_reassociation_removes_the_duplicate_obstacle_identity(self):
+        scene=Scene(NS(wrist=None))
+        target=object_at('target','green',.25,0.)
+        seen=object_at('new-id','green',.25,0.);seen.timestamp=21.
+        seen.evidence.update(visible_overview=True,frame_id='current',spatial_timestamp=21.)
+        scene.state=SceneState({seen.id:seen},boxes={'box':NS(occupied_slots=[seen.id])},
+            timestamp=21.,evidence={'overview_frame_id':'current'})
+        scene.track_memory[seen.id]=seen;scene.metric_objects[seen.id]=NS()
+        robot=NS(read_state=Mock(return_value={'timestamp':20.,'q':np.zeros(5),'gripper':44.}))
+        rt=NS(scene=scene,robot=robot,motion=NS(),refresh=Mock(),check_cancel=Mock(),
+              cameras=NS(record_state=Mock(),wait_for_frame=Mock()))
+        with patch('wristlab.actions.time.time',return_value=20.):
+            result=Actions(rt).verify_placement(target,Placement(target.pose.copy(),'table'))
+        self.assertTrue(result[0])
+        self.assertNotIn('new-id',scene.track_memory)
+        self.assertNotIn('new-id',scene.metric_objects)
+        self.assertEqual(scene.state.boxes['box'].occupied_slots,['target'])
+        self.assertIs(scene.track_memory['target'],scene.state.objects['target'])
+
+    def test_extraction_prioritizes_selected_accessible_cube_and_keeps_top_first(self):
+        scene=Scene(NS())
+        base=object_at('base','green',.25,0.)
+        top=object_at('top','yellow',.25,0.,base.pose[2,3]+SIDE)
+        other=object_at('other','blue',.35,0.)
+        scene.state.objects={o.id:o for o in (base,top,other)}
+        scene.state.boxes={'box':NS(occupied_slots=['top','other','base'])}
+        patch_data=SupportPatch(np.array([[.4,-.05],[.5,-.05],[.5,.05],[.4,.05]]),0.,.001,
+            {'independent_metric_views':3,'free_surface_verified':True})
+        scene.find_free_table_slots=Mock(return_value=[{'id':'table','height_m':0.,'patch':patch_data}])
+        self.assertEqual(tasks.next_transfer('extract',scene,'base','box')[0],'top')
+        self.assertEqual(tasks.next_transfer('extract',scene,'other','box')[0],'other')
+
+    def test_unknown_color_is_not_silently_assigned_to_the_right_box(self):
+        with self.assertRaisesRegex(ValueError,'classified'):
+            tasks.box_for_color('unknown',{})
+
     def test_resumed_native_reference_preserves_all_powered_hardware_goals(self):
         recorded=json.loads((ROOT/'runtime/retreat-park-before-restart.json').read_text())
         robot=Robot('/home/jetsonnx/Projects/so101_autonomous_pick_place',ROOT/'runtime/unit')

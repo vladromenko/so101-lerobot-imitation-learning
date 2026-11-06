@@ -134,10 +134,13 @@ class Scene:
                 centered = np.linalg.norm(self.geometry.project(top).mean(0)-np.mean(obj.evidence['quad'],axis=0))<3.
                 known_silhouette = getattr(self.geometry,'grasp_mode',None)=='overhead_grasp' and contained>.95 and centered
                 if overlap > .85 or known_silhouette:
+                    observed_quad = obj.evidence['quad']
                     obj.id = key
                     obj.pose[:3,:3],obj.pose[:3,3] = cube.rotation,cube.center_m
                     obj.dimensions = np.full(3,cube.side_m)
-                    obj.evidence.update(cube.evidence,metric_qualified=True,metric_confirmation_iou=overlap)
+                    obj.evidence.update(cube.evidence,metric_qualified=True,metric_confirmation_iou=overlap,
+                        metric_reference_frame_id=cube.evidence.get('frame_id'),
+                        frame_id=frame.frame_id,quad=observed_quad)
         old = list({**{key:o for key,o in self.track_memory.items() if frame.timestamp-o.timestamp < 3. or key in self.metric_objects},**self.state.objects}.values())
         if old and objects:
             costs = np.array([[np.linalg.norm(a.pose[:3,3]-b.pose[:3,3]) + (0. if a.color == b.color else 10.) for b in objects] for a in old])
@@ -282,11 +285,11 @@ class Scene:
 
     def detach_object(self, object_id, observed_pose):
         with self.lock:
-            self.state.objects[object_id].pose = np.asarray(observed_pose)
-        self.state.objects[object_id].status = 'observed'
-        self.held = None
-        self.pending_placement = None
-        self.release_reservation(object_id)
+            self.state.objects[object_id].pose = np.asarray(observed_pose).copy()
+            self.state.objects[object_id].status = 'observed'
+            self.held = None
+            self.pending_placement = None
+            self.release_reservation(object_id)
 
     def find_free_box_slots(self, box_id, object_shape):
         box = self.state.boxes[box_id]
