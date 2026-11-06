@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SO-101: коробка</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.9/katex.min.css">
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header>
+  <h1>SO-101 · кубики и коробка</h1>
+  <nav>
+    <button class="tab active" data-tab="work">Работа</button>
+    <button class="tab" data-tab="learn">Как это считается</button>
+  </nav>
+</header>
+
+<main id="work" class="panel active">
+  <section class="card left">
+    <div class="camera">
+      <img id="cam" alt="обзорная камера">
+      <canvas id="overlay"></canvas>
+    </div>
+    <div class="counts">
+      <div><b id="n-out">–</b><span>на столе</span></div>
+      <div><b id="n-in">–</b><span>в коробке</span></div>
+      <button id="scene-btn" class="ghost">Обновить сцену</button>
+    </div>
+    <p class="hint" id="scene-hint">Сцена измеряется кнопкой (3 скана SAM, около 20 с). Пока работает программа, камера занята распознаванием.</p>
+  </section>
+
+  <section class="card right">
+    <h2>Что сделать</h2>
+    <label class="check"><input type="checkbox" id="attended"> Я рядом с рукой и могу нажать STOP</label>
+    <div class="actions">
+      <button id="stow" class="primary">Сложить все кубики в коробку</button>
+      <button id="extract" class="primary">Вытащить все кубики из коробки</button>
+    </div>
+    <label class="check"><input type="checkbox" id="dry"> Только проверить (рассчитать и просимулировать, рука не двигается)</label>
+    <button id="stop" class="danger">STOP</button>
+
+    <div id="state" class="state">
+      <div class="state-line"><span id="state-dot" class="dot"></span><b id="state-text">Ожидание</b></div>
+      <div id="state-detail" class="muted"></div>
+      <div id="chips" class="chips"></div>
+    </div>
+    <h3>Журнал</h3>
+    <pre id="log">Журнал появится здесь.</pre>
+  </section>
+</main>
+
+<main id="learn" class="panel">
+  <aside class="toc" id="toc"></aside>
+  <div class="content" id="content"></div>
+</main>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.9/katex.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.9/contrib/auto-render.min.js"></script>
+<script src="/static/vendor/three.min.js"></script>
+<script src="/static/vendor/STLLoader.js"></script>
+<script src="/static/vendor/OrbitControls.js"></script>
+<script src="/static/view3d.js"></script>
+<script src="/static/rrt.js"></script>
+<script src="/static/learn.js"></script>
+<script src="/static/app.js"></script>
+</body>
+</html>
