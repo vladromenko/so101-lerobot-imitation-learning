@@ -179,8 +179,11 @@ class TunedExtractionPlanner(ExtractionPlanner):
         reference = self.model.pose(current)
         center = cube.center_m if contact_center is None else np.asarray(contact_center)
         # Jaw contact height leaves the real distal mesh above the floor.
-        floor_world = scene.box.base_from_box @ np.r_[0., 0., scene.box.floor_interval_m[1], 1.]
-        contact_z = self.backend.fixed_jaw_distal_z_m + floor_world[2]+self.model.gap+.003-cube.center_m[2]
+        # The destination box can be at a different height from the source.
+        # Size the contact from the measured cube's bottom and the table,
+        # then check the actual support and walls in the collision world.
+        source_z = max(float(self.model.table_z),float(cube.vertices_m[:,2].min()))
+        contact_z = self.backend.fixed_jaw_distal_z_m + source_z+self.model.gap+.003-cube.center_m[2]
         for _ in range(3):
             opening, _ = self.backend.expected_block_gripper(reference, cube.side_m+self.opening_margin_m, contact_z)
             closed, _ = self.backend.expected_block_gripper(reference, cube.side_m, contact_z)
@@ -189,7 +192,7 @@ class TunedExtractionPlanner(ExtractionPlanner):
                 frames = self.model.frames(dict(current, gripper=float(gripper)))
                 moving = self.backend._transform_points(np.linalg.inv(frames['gripper_frame_link']) @ frames['moving_jaw_so101_v1_link'], self.backend.meshes['moving_jaw_so101_v1_link'])
                 distal = max(distal, float(moving[:, 2].max()))
-            contact_z = distal+floor_world[2]+max(self.model.gap, scene.box.clearance_m)+.003-cube.center_m[2]
+            contact_z = distal+source_z+max(self.model.gap, scene.box.clearance_m)+.003-cube.center_m[2]
         if not 4. <= closed < opening <= 45.:
             raise ValueError('measured cube does not fit the reliable jaw range')
         angle_for = self._jaw_angle_curve(reference, contact_z)

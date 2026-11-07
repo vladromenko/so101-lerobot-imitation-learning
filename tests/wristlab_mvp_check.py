@@ -92,6 +92,23 @@ def proposed_grasp(plan):
 
 
 class RelocateContract(unittest.TestCase):
+    def test_grasp_height_uses_source_support_not_destination_floor(self):
+        from box_extract.planning import TunedExtractionPlanner
+        obj = object_at('table-cube','red',.26,0.)
+        vertices = cube_vertices(obj.pose[:2,3],SIDE,0.,0.)
+        cube = SpatialCube(obj.pose[:3,3],SIDE,np.eye(3),vertices,dict(obj.evidence))
+        aperture = Mock(side_effect=ValueError('captured source aperture probe'))
+        model = NS(pose=Mock(),table_z=0.,gap=.006)
+        planner = TunedExtractionPlanner.__new__(TunedExtractionPlanner)
+        planner.model = model
+        planner.backend = NS(fixed_jaw_distal_z_m=.03,expected_block_gripper=aperture)
+        for height in (.002,.05):
+            box = NS(base_from_box=np.eye(4),floor_interval_m=(height,height))
+            with self.assertRaisesRegex(ValueError,'captured source aperture probe'):
+                next(planner.grasp_candidates(NS(box=box),cube,Q))
+        self.assertEqual(aperture.call_args_list[0].args,aperture.call_args_list[1].args)
+        self.assertAlmostEqual(aperture.call_args.args[-1],.03+.006+.003-SIDE/2)
+
     def test_unsafe_source_is_rejected_before_placement_ik(self):
         from wristlab.grasp import choose_grasp, SourceRejected
         obj,rt,_,placement,_,_ = action_contract()
