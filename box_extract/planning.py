@@ -296,17 +296,8 @@ class TunedExtractionPlanner(ExtractionPlanner):
         radius = float(np.linalg.norm(cube.vertices_m-cube.center_m, axis=1).max())
         # The cube only has to clear the rim: its lowest point, not its corner radius, sets the lift.
         rise = max(.025, rim+scene.box.clearance_m+self.rim_margin_m+cube.side_m/2-cube.center_m[2])
-        entry_up = self.vertical_center(grasp, rise, local.mean(0), world, **policy)
-        enter = Phase('enter',entry_up[::-1],jaw_contact=True)
         if check_pick is not None:
-            check_pick(enter,None)
-        failure = self._tracking_robust(entry_up, world, **policy)
-        if failure:
-            raise ValueError('enter is not robust to arm tracking error: '+failure)
-        approach = entry_up[-1]
-        opened = dict(current, gripper=grasp['gripper'])
-        open_path = self.edge(current, opened, world)
-        approach_path, search1 = self.transport(opened, approach, world)
+            check_pick(Phase('enter',(grasp,),jaw_contact=True),None)
         # The existing contact-band estimate initializes the aperture. Refine
         # first contact against the original, concave moving-jaw triangles;
         # never ask a geometric path to pass through the measured cube.
@@ -329,10 +320,22 @@ class TunedExtractionPlanner(ExtractionPlanner):
         held = dict(closure[-1], gripper=min(closure[-1]['gripper'], self.last_clamp_deg))
         closure = [*closure, held]
         flush = flush_local(local)
+        if check_pick is not None:
+            check_pick(Phase('extract_vertical',(held,),True,True),flush)
+        entry_up = self.vertical_center(grasp, rise, local.mean(0), world, **policy)
+        enter = Phase('enter',entry_up[::-1],jaw_contact=True)
+        if check_pick is not None:
+            check_pick(enter,None)
+        failure = self._tracking_robust(entry_up, world, **policy)
+        if failure:
+            raise ValueError('enter is not robust to arm tracking error: '+failure)
         lift = self.vertical_center(held, rise, flush.mean(0), world, payload_local=flush, **policy)
         extract = Phase('extract_vertical',lift,True,True)
         if check_pick is not None:
             check_pick(extract,flush)
+        opened = dict(current, gripper=grasp['gripper'])
+        open_path = self.edge(current, opened, world)
+        approach_path, search1 = self.transport(opened,entry_up[-1],world)
         # Select a point from the measured support polygon, then verify the
         # complete cube footprint; no nominal table coordinates are used.
         patch = scene.placement
