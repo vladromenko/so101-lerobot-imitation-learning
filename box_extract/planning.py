@@ -169,7 +169,7 @@ class TunedExtractionPlanner(ExtractionPlanner):
         frame = self.model.frames(joints)['gripper_frame_link']
         return float(-((cube.vertices_m - frame[:3, 3]) @ frame[:3, :3])[:, 0].max())
 
-    def grasp_candidates(self, scene, cube, current):
+    def grasp_candidates(self, scene, cube, current, *, contact_center=None, stopped_pose=None):
         """Solve opposing measured cube faces against the real jaw frame.
 
         The fixed jaw's stand-off is sized per candidate so that the gravity-compensated register command
@@ -177,6 +177,7 @@ class TunedExtractionPlanner(ExtractionPlanner):
         and the expected contact angle follow from that stand-off.
         """
         reference = self.model.pose(current)
+        center = cube.center_m if contact_center is None else np.asarray(contact_center)
         # Jaw contact height leaves the real distal mesh above the floor.
         floor_world = scene.box.base_from_box @ np.r_[0., 0., scene.box.floor_interval_m[1], 1.]
         contact_z = self.backend.fixed_jaw_distal_z_m + floor_world[2]+self.model.gap+.003-cube.center_m[2]
@@ -208,7 +209,7 @@ class TunedExtractionPlanner(ExtractionPlanner):
                         local = np.array([-(cube.side_m/2.+gap), 0., contact_z])
                         def residual(q):
                             frame = self.model.frames(self.joints(q, opening))['gripper_frame_link']
-                            return np.r_[(frame[:3, 3]+frame[:3, :3]@local-cube.center_m)*1000., (frame[:3, 0]-frame_x)*30.]
+                            return np.r_[(frame[:3, 3]+frame[:3, :3]@local-center)*1000., (frame[:3, 0]-frame_x)*30.]
                         solve_started = time.perf_counter()
                         try:
                             result = least_squares(residual, self.vector(seed_pose.deg), bounds=(self.limits[:, 0], self.limits[:, 1]), max_nfev=80)
@@ -222,7 +223,7 @@ class TunedExtractionPlanner(ExtractionPlanner):
                                 and np.linalg.norm(error[3:6])/30. <= np.sin(np.deg2rad(2.)) and actual[2, 2] < -self.min_tool_down)
                         return (joints if good else None), result.x
                     for pitch, roll in seeds:
-                        target_tip = cube.center_m-desired@np.array([-(cube.side_m/2.+self.fixed_jaw_gap_m), 0., contact_z])
+                        target_tip = center-desired@np.array([-(cube.side_m/2.+self.fixed_jaw_gap_m), 0., contact_z])
                         solve_started = time.perf_counter()
                         try:
                             seed = self.model.ik(*target_tip, pitch=pitch, roll=float(roll), gripper=opening)
@@ -236,9 +237,12 @@ class TunedExtractionPlanner(ExtractionPlanner):
                         joints, x = fit(seed, self.fixed_jaw_gap_m)
                         if joints is None:
                             continue
-                        # How much closer the command pose brings the fixed jaw than the goal pose does.
+                        # Size the stand-off against the register goal and the
+                        # predicted factory STOP response, when available.
                         cmd = self._command_pose(joints)
-                        gap = self.fixed_jaw_gap_m + max(0., self._fixed_jaw_clearance(joints, cube) - self._fixed_jaw_clearance(cmd, cube)) + .001
+                        probe = (cmd,stopped_pose(joints)) if stopped_pose is not None else (cmd,)
+                        gap = self.fixed_jaw_gap_m + max(0., self._fixed_jaw_clearance(joints, cube)
+                            - min(self._fixed_jaw_clearance(q,cube) for q in probe)) + .001
                         if gap > self.max_standoff_m:
                             continue
                         if gap > self.fixed_jaw_gap_m + .0005:
@@ -253,7 +257,8 @@ class TunedExtractionPlanner(ExtractionPlanner):
                             continue
                         joints = dict(joints, gripper=open_angle)
                         signature = tuple(np.round(self.vector(joints), 1))
-                        if signature not in seen:
+                        stop_clear = stopped_pose is None or self._fixed_jaw_clearance(stopped_pose(joints),cube)>=.0015
+                        if stop_clear and signature not in seen:
                             seen.add(signature)
                             self.last_clamp_deg = clamp
                             yield joints, angle_for(cube.side_m+gap)
@@ -283,7 +288,7 @@ class TunedExtractionPlanner(ExtractionPlanner):
                 rejections.append(str(exc))
         raise ValueError('no collision-free measured grasp and placement: ' + ('; '.join(rejections[-3:]) or 'IK/jaw geometry rejected all face pairs'))
 
-    def _candidate(self, scene, current, target_id, cube, grasp, closed, world):
+    def _candidate(self, scene, current, target_id, cube, grasp, closed, world, *, check_entry=None):
         policy = {'target': target_id, 'jaw_contact': True}
         frame = self.model.frames(grasp)['gripper_frame_link']
         local = (cube.vertices_m-frame[:3, 3]) @ frame[:3, :3]
@@ -292,6 +297,8 @@ class TunedExtractionPlanner(ExtractionPlanner):
         # The cube only has to clear the rim: its lowest point, not its corner radius, sets the lift.
         rise = max(.025, rim+scene.box.clearance_m+self.rim_margin_m+cube.side_m/2-cube.center_m[2])
         entry_up = self.vertical_center(grasp, rise, local.mean(0), world, **policy)
+        if check_entry is not None:
+            check_entry(tuple(entry_up[::-1]))
         failure = self._tracking_robust(entry_up, world, **policy)
         if failure:
             raise ValueError('enter is not robust to arm tracking error: '+failure)

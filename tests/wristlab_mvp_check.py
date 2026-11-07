@@ -692,7 +692,7 @@ class GeometryPolicy(unittest.TestCase):
 
     def test_intermediate_compensated_command_cannot_cross_obstacle(self):
         motion = Motion.__new__(Motion)
-        motion.robot = NS(native_edge_samples=Robot.native_edge_samples)
+        motion.robot = NS(native_edge_samples=Robot.native_edge_samples,quantized_command=dict)
         motion.check_cancel = lambda:None
         motion.report = lambda *args:None
         motion.planner = NS(command_sag=3.7,_command_pose=lambda q:dict(q,shoulder_pan=q['shoulder_pan']+10))

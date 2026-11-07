@@ -745,6 +745,30 @@ class Motion:
                     return kind+': '+reason
         return None
 
+    def stop_settled_pose(self, q):
+        command = self.robot.quantized_command(self.planner._command_pose(q))
+        frozen = self.robot.quantized_command(q)
+        return {j:frozen[j]+q[j]-command[j] for j in q}
+
+    def check_stop_settling(self, phase, plan, world):
+        # Factory STOP removes gravity bias. Test the predicted position
+        # before doing the more expensive interpolation on a rejected phase.
+        if not phase.name.startswith('RECOVERY_'):
+            for q in phase.joints:
+                self.check_cancel()
+                settled = self.stop_settled_pose(q)
+                reason = self.state_is_valid(settled,phase,plan,world)
+                intended = reason in {'gripper_link: cube '+plan.target_id,'moving_jaw_so101_v1_link: cube '+plan.target_id}
+                if intended and phase.name=='grasp' and phase.jaw_contact:
+                    reason = world.grasp_contact_reason(settled,plan.target_id)
+                if reason:
+                    raise ValueError(phase.name+': native STOP settling: '+reason)
+
+    def check_pick_entry(self, path, target, world):
+        phase = Phase('enter',path,jaw_contact=True)
+        plan = ExtractionPlan(world.scene.revision,target,(phase,),None,None,())
+        self.check_path(plan,world)
+
     def check_path(self, plan, world):
         for phase in plan.phases:
             self.report('checking',phase.name)
@@ -752,26 +776,12 @@ class Motion:
                 raise ValueError(phase.name+': empty trajectory')
             world.release_origin = phase.joints[0] if phase.name=='retract' and phase.placed_cube is not None else None
             try:
+                self.check_stop_settling(phase,plan,world)
                 edges = zip(phase.joints,phase.joints[1:]) if len(phase.joints)>1 else [(phase.joints[0],phase.joints[0])]
                 for start,goal in edges:
                     reason = self.edge_is_valid(start,goal,phase,plan,world)
                     if reason:
                         raise ValueError(f'{phase.name}: {reason}')
-                if not phase.name.startswith('RECOVERY_'):
-                    for q in phase.joints:
-                        self.check_cancel()
-                        command = self.robot.quantized_command(self.planner._command_pose(q))
-                        frozen = self.robot.quantized_command(q)
-                        # The factory STOP removes the position bias supporting
-                        # gravity. Check that transition before committing to
-                        # a grasp/release, rather than discovering it in a box.
-                        settled = {j:frozen[j]+q[j]-command[j] for j in q}
-                        reason = self.state_is_valid(settled,phase,plan,world)
-                        intended = reason in {'gripper_link: cube '+plan.target_id,'moving_jaw_so101_v1_link: cube '+plan.target_id}
-                        if intended and phase.name=='grasp' and phase.jaw_contact:
-                            reason = world.grasp_contact_reason(settled,plan.target_id)
-                        if reason:
-                            raise ValueError(phase.name+': native STOP settling: '+reason)
                 if phase.name in ('retract','safe_park','RECOVERY_PARK'):
                     for lag in self.planner._lagging_poses(phase.joints):
                         self.check_cancel()

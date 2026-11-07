@@ -92,7 +92,9 @@ class Actions:
                         obj = self.observe_object(object_id)
                         native_scene = self.scene.native_scene(object_id,choice)
                         world = self.motion.make_world(native_scene)
-                        candidate,plan,world = choose_grasp(obj,native_scene,self.robot,self.motion.planner,start,rt.check_cancel,world)
+                        candidate,plan,world = choose_grasp(obj,native_scene,self.robot,self.motion.planner,start,rt.check_cancel,world,
+                            check_entry=lambda path:self.motion.check_pick_entry(path,obj.id,world),
+                            stopped_pose=lambda q:self.motion.stop_settled_pose(q))
                         self.motion.check_entry_transition(plan,world,start)
                         park = self.motion.preflight_cycle(plan,world)
                         placement = choice
@@ -169,7 +171,9 @@ class Actions:
                         current = self.robot.read_state()['positions']
                         world = self.motion.make_world(native_scene)
                         stage = 'grasp_planning'
-                        candidate,plan,world = choose_grasp(obj,native_scene,self.robot,self.motion.planner,current,rt.check_cancel,world)
+                        candidate,plan,world = choose_grasp(obj,native_scene,self.robot,self.motion.planner,current,rt.check_cancel,world,
+                            check_entry=lambda path:self.motion.check_pick_entry(path,obj.id,world),
+                            stopped_pose=lambda q:self.motion.stop_settled_pose(q))
                         stage = 'path_check'
                         self.motion.preflight_cycle(plan,world)
                         self.motion.check_entry_transition(plan,world,current)

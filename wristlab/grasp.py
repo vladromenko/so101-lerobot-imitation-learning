@@ -6,32 +6,41 @@ from so101_pick_place.experiments.box_extraction.planner import Phase
 from .types import GraspCandidate
 
 
-def generate_grasps(object_state, native_scene, robot, planner, current, world):
+def generate_grasps(object_state, native_scene, robot, planner, current, world, *, stopped_pose=None):
     cube = native_scene.cubes[object_state.id]
-    for grasp,closed in planner.grasp_candidates(native_scene,cube,current):
-        reason = world.reason(grasp,target=object_state.id,jaw_contact=True)
-        if reason is None:
-            pose = robot.backend.model.frames(grasp)['gripper_frame_link']
-            pregrasp = pose.copy()
-            pregrasp[2,3] += max(.025,native_scene.box.obstacle_top_m-cube.center_m[2]+cube.side_m/2+.02)
-            q = robot.from_native(grasp)
-            cost = float(np.linalg.norm(q-robot.from_native(current)))
-            # Native closure is retained, instead of inventing a percent-to-metre scale.
-            yield GraspCandidate(pose,float(cube.side_m+.008),pregrasp,np.array([0.,0.,1.]),q,
-                float(planner.fixed_jaw_gap_m),(cost,),native=(grasp,closed))
+    centers = [cube.center_m]
+    if stopped_pose is not None:
+        up = cube.rotation[:,np.argmax(np.abs(cube.rotation[2,:]))]
+        top = cube.center_m+up*np.sign(up[2])*cube.side_m/2
+        # The upper half of the measured side offers a second contact band
+        # when the nominal mid-face approach has no floor clearance at STOP.
+        centers.append((top+cube.center_m)/2)
+    for center in centers:
+        options = {} if stopped_pose is None else {'contact_center':center,'stopped_pose':stopped_pose}
+        for grasp,closed in planner.grasp_candidates(native_scene,cube,current,**options):
+            reason = world.reason(grasp,target=object_state.id,jaw_contact=True)
+            if reason is None:
+                pose = robot.backend.model.frames(grasp)['gripper_frame_link']
+                pregrasp = pose.copy()
+                pregrasp[2,3] += max(.025,native_scene.box.obstacle_top_m-cube.center_m[2]+cube.side_m/2+.02)
+                q = robot.from_native(grasp)
+                cost = float(np.linalg.norm(q-robot.from_native(current)))
+                # Native closure is retained, instead of inventing a percent-to-metre scale.
+                yield GraspCandidate(pose,float(cube.side_m+.008),pregrasp,np.array([0.,0.,1.]),q,
+                    float(planner.fixed_jaw_gap_m),(cost,),native=(grasp,closed))
 
 
 def rank_grasps(candidates):
     return sorted(candidates,key=lambda c:c.score)
 
 
-def choose_grasp(obj, scene, robot, planner, current, check_cancel, world):
+def choose_grasp(obj, scene, robot, planner, current, check_cancel, world, *, check_entry=None, stopped_pose=None):
     from box_extract.planning import flush_local
     failures = []
     metrics = getattr(planner,'timings',{})
     started = time.perf_counter()
     try:
-        for candidate in generate_grasps(obj,scene,robot,planner,current,world):
+        for candidate in generate_grasps(obj,scene,robot,planner,current,world,stopped_pose=stopped_pose):
             check_cancel()
             grasp,closed = candidate.native
             begin = time.perf_counter()
@@ -50,14 +59,14 @@ def choose_grasp(obj, scene, robot, planner, current, check_cancel, world):
                     reason = world.reason(pose,target=obj.id,jaw_contact=True,payload_local=local,support_contact=True)
                     if reason:
                         raise ValueError('placement pose: '+reason)
-                plan = planner._candidate(scene,current,obj.id,scene.cubes[obj.id],grasp,closed,world)
+                plan = planner._candidate(scene,current,obj.id,scene.cubes[obj.id],grasp,closed,world,check_entry=check_entry)
                 return candidate,plan,world
             except ValueError as exc:
                 failures.append(str(exc))
                 metrics['candidate_failures'] = failures[-12:]
             finally:
                 metrics['motion_planning_s'] = (metrics.get('motion_planning_s',0.) or 0.)+time.perf_counter()-begin
-        raise ValueError('no full-arm grasp/approach/lift/placement path: '+('; '.join(failures[-3:]) or 'no admissible opposing-face grasp'))
+        raise ValueError('no full-arm grasp/approach/lift/placement path: '+('; '.join(dict.fromkeys(failures)) or 'no admissible opposing-face grasp'))
     finally:
         metrics['grasp_planning_s'] = (metrics.get('grasp_planning_s',0.) or 0.)+time.perf_counter()-started
 
