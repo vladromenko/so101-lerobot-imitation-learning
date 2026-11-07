@@ -138,7 +138,7 @@ class TunedExtractionPlanner(ExtractionPlanner):
         """The contacts the driver itself allows during the jaw closure: the two fingers on the target cube."""
         return reason in {f'gripper_link: cube {target_id}', f'moving_jaw_so101_v1_link: cube {target_id}'}
 
-    def _lagging_poses(self, path):
+    def _lagging_poses(self, path, *, from_rest=False):
         """Poses the arm can be in while it trails its path: every joint behind its waypoint in proportion to its own
         speed (the fastest by `tracking_error_deg`), with different gains per joint, so the pose is off the path."""
         patterns = [(1.,)*5] + [tuple(1.6 if i == j else .6 for i in range(5)) for j in range(5)] \
@@ -146,11 +146,16 @@ class TunedExtractionPlanner(ExtractionPlanner):
         for k in range(1, len(path)-1, 2):
             velocity = np.array([(path[k+1][j]-path[k-1][j])/2. for j in ARM_JOINTS])
             peak = float(np.abs(velocity).max())
-            if peak < 1e-6:
-                continue
-            behind = velocity*(self.tracking_error_deg/peak)
-            for gains in patterns:
-                yield dict(path[k], **{j: path[k][j]-float(g*d) for j, g, d in zip(ARM_JOINTS, gains, behind)})
+            if peak >= 1e-6:
+                behind = velocity*(self.tracking_error_deg/peak)
+                history = np.array([[q[j] for j in ARM_JOINTS] for q in path[:k+1]]) if from_rest else None
+                for gains in patterns:
+                    lag = np.array([path[k][j]-float(g*d) for j, g, d in zip(ARM_JOINTS, gains, behind)])
+                    if history is not None:
+                        # Delay can select an earlier joint position, but cannot
+                        # invent motion before a stationary phase boundary.
+                        lag = np.clip(lag,history.min(0),history.max(0))
+                    yield dict(path[k], **dict(zip(ARM_JOINTS,map(float,lag))))
 
     def _tracking_robust(self, path, world, *, closing=False, **policy):
         """The jaws stay clear of the cube and the walls while the arm trails its path."""

@@ -473,12 +473,13 @@ class Motion:
                     if reason:
                         raise ValueError(f'{phase.name}: {reason}')
                 if phase.name in ('retract','safe_park'):
-                    for lag in self.planner._lagging_poses(phase.joints):
+                    for lag in self.planner._lagging_poses(phase.joints,from_rest=True):
                         self.check_cancel()
-                        for pose in (lag,self.planner._command_pose(lag)):
-                            reason = self.state_is_valid(pose,phase,plan,world)
-                            if reason:
-                                raise ValueError(phase.name+': tracking envelope: '+reason)
+                        # Keep the same measured-pose, command-pose and native
+                        # separation contact rules as every ordinary waypoint.
+                        reason = self.edge_is_valid(lag,lag,phase,plan,world)
+                        if reason:
+                            raise ValueError(phase.name+': tracking envelope: '+reason)
             finally:
                 world.release_origin = None
         return True

@@ -588,6 +588,22 @@ class GeometryPolicy(unittest.TestCase):
 
 
 class CompleteGraspSelection(unittest.TestCase):
+    def test_stationary_boundary_lag_uses_visited_positions_only(self):
+        from box_extract.planning import TunedExtractionPlanner,ARM_JOINTS
+        planner=TunedExtractionPlanner.__new__(TunedExtractionPlanner)
+        path=[dict.fromkeys(ARM_JOINTS,float(i)/10.)|{'gripper':45.} for i in range(6)]
+        original=list(planner._lagging_poses(path))
+        bounded=list(planner._lagging_poses(path,from_rest=True))
+        self.assertTrue(any(q['elbow_flex']<0. for q in original))
+        for index,q in enumerate(bounded):
+            waypoint=1+2*(index//11)
+            for joint in ARM_JOINTS:
+                self.assertGreaterEqual(q[joint],path[0][joint])
+                self.assertLessEqual(q[joint],path[waypoint][joint])
+        long=[dict.fromkeys(ARM_JOINTS,float(i))|{'gripper':45.} for i in range(12)]
+        self.assertEqual(list(planner._lagging_poses(long))[-11:],
+                         list(planner._lagging_poses(long,from_rest=True))[-11:])
+
     def test_planning_reacquires_native_snapshot_instead_of_using_stale_cache(self):
         from wristlab.cameras import Cameras
         cameras = Cameras('http://unused')
