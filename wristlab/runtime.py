@@ -64,6 +64,7 @@ class Runtime:
         self.encoder_hold_tick = None
         self.phase,self.detail = 'initializing','Загрузка калибровки и детекторов'
         self.mode = None
+        self.dry = None
         self.metrics = {key:None for key in ('first_command_s','vision_s','grasp_planning_s','ik_s',
             'collision_checking_s','motion_planning_s','actual_motion_s','verification_s')}
         self.results = []
@@ -1263,13 +1264,18 @@ class Runtime:
                 raise ValueError('STOP is latched; reset while idle before a new check')
             if not self.initialized:
                 raise ValueError('runtime is initializing')
-            reasons = self.blockers() if not dry else []
+            # HTTP only queues work. The bus owner obtains fresh encoders and
+            # rechecks every blocker before planning or issuing any command.
+            # A cached idle sample expiring must not prevent that read.
+            reasons = [item['reason'] for item in self.blocking_conditions()
+                       if item['code'] not in ('FEEDBACK_MISSING','FEEDBACK_STALE')] if not dry else []
             if reasons:
                 raise ValueError('; '.join(reasons))
             self.robot.first_command_at = None
             self.started = time.monotonic()
             self.finished = None
             self.mode = mode
+            self.dry = dry
             self.scene.remember_reset_layout()
             self.running = True
             self.metrics = {key:None for key in ('first_command_s','vision_s','grasp_planning_s','ik_s',
@@ -1410,9 +1416,14 @@ class Runtime:
     def execute(self, payload):
         try:
             self.check_cancel()
-            if self.robot.arm is None:
-                self.robot.read_state()
             self.refresh()
+            state = self.robot.read_state()
+            self.cameras.record_state(state['timestamp'],state['q'],state['gripper'])
+            self.monitor_motors()
+            self.check_cancel()
+            reasons = self.blockers()
+            if reasons:
+                raise ValueError('; '.join(reasons))
             selected = payload.get('object_id') or self.selected
             destination = payload.get('destination') or self.destination
             if payload.get('auto_select') and payload['mode']=='relocate':
@@ -1431,19 +1442,18 @@ class Runtime:
                 self.results = execute(payload['mode'],self.scene,self.actions,self.refresh,self.check_cancel,**{k:v for k,v in payload.items() if k not in ('mode','dry')})
             elif payload['dry']:
                 self.report('checking','contact-free preflight; actuator commands prohibited')
-                reasons = self.blockers()
-                if reasons:
-                    raise ValueError('; '.join(reasons))
+                self.metrics['dry_scope'] = 'individual transfers from the observed scene; occupancy is not simulated'
                 if payload['mode'] in self.EXTRA_MODES:
                     from .experiments import prepare,next_step
                     options = {k:v for k,v in payload.items() if k not in ('mode','dry')}
                     if payload['mode']=='run_sequence':
                         raise ValueError('use task-plan for sequence; each physical stage requires its freshly observed scene')
                     item = next_step(self.scene,payload['mode'],prepare(self.scene,payload['mode'],options))
+                    if item is not None:
+                        self.results = [self.actions.relocate(*item,dry=True)]
                 else:
-                    item = tasks.next_transfer(payload['mode'],self.scene,selected,destination)
-                if item is not None:
-                    self.results = [self.actions.relocate(*item,dry=True)]
+                    self.results = tasks.run_task(payload['mode'],self.scene,self.actions,self.refresh,
+                                                  self.check_cancel,selected,destination,dry=True)
             else:
                 self.results = tasks.run_task(payload['mode'],self.scene,self.actions,self.refresh,self.check_cancel,selected,destination)
             ok = all(result.success for result in self.results)
@@ -1453,7 +1463,8 @@ class Runtime:
                 except ValueError as exc:
                     self.park_error = str(exc)
             self.report(('checked' if payload['dry'] else 'completed') if ok else 'blocked' if self.stop_event.is_set() else 'recovering' if self.scene.held is not None else 'failed',
-                ('Геометрия проверена; команд приводам не было' if payload['dry'] else 'Все запрошенные переносы подтверждены') if ok else self.results[-1].reason)
+                ('Переносы проверены по текущей сцене; команд приводам не было' if payload['dry'] else 'Все запрошенные переносы подтверждены') if ok else
+                '; '.join(f'{r.object_id}: {r.reason}' for r in self.results if not r.success))
         except Exception as exc:
             self.report('blocked' if self.stop_event.is_set() or self.blockers() else 'failed',f'{type(exc).__name__}: {exc}')
             self.results = [{'success':False,'reason':str(exc),'physical_verified':False}]
@@ -1531,7 +1542,7 @@ class Runtime:
                 'recheck':'Свежие энкодеры и штатная проверка всего пути; сброс STOP сам по себе движение не разрешает.'}
             if self.recovery_proposal:
                 physical_blocker['required_action'] = self.recovery_proposal.get('reason',physical_blocker['required_action'])
-        return {'running':self.running,'mode':self.mode,'dry':None,'started':self.started,'finished':self.finished,
+        return {'running':self.running,'mode':self.mode,'dry':getattr(self,'dry',None),'started':self.started,'finished':self.finished,
             'phase':self.phase,'state':state,'blocking_conditions':conditions,
             'project_detail':self.detail,'project_state':state,'detail':self.detail,
             'ready':self.initialized and not self.running and not reasons,'blockers':reasons,'paused':self.pause_event.is_set(),
@@ -1548,7 +1559,7 @@ class Runtime:
             'grasp_mode':self.motion.grasp_mode,'wrist_refinement_enabled':self.motion.grasp_mode=='wrist_refinement',
             'supervision_required':self.motion.grasp_mode=='overhead_grasp',
             'physical_relocate_verified':any(not isinstance(r,dict) and r.success and r.evidence.get('physical_verified') for r in self.results),'experiments':{m:'blocked_pending_relocate_qualification' for m in self.MODES},
-            'results':[r if isinstance(r,dict) else {'success':r.success,'reason':r.reason,'evidence':r.evidence} for r in self.results]}
+            'results':[r if isinstance(r,dict) else {'success':r.success,'object_id':r.object_id,'reason':r.reason,'evidence':r.evidence} for r in self.results]}
 
     def scene_public(self):
         with self.scene_lock:

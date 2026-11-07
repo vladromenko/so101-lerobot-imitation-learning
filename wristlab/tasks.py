@@ -1,5 +1,6 @@
 """Task selection delegates every physical transfer to actions.relocate."""
 import numpy as np
+import time
 from .types import ActionResult, Placement
 
 
@@ -67,8 +68,12 @@ def next_transfer(mode, scene, selected=None, destination=None, excluded=()):
         pose[:3,3] = [*np.mean(support['patch'].polygon_xy_m,axis=0),support['height_m']+obj.dimensions[2]/2]
         return obj.id,Placement(pose,support['id'])
     if mode == 'sort_colors':
+        if not scene.state.objects:
+            raise ValueError('sorting cannot confirm completion without observed cubes')
         wrong = [o for o in objects if o.id not in scene.state.boxes[box_for_color(o.color,scene.state.boxes)].occupied_slots]
         if not wrong:
+            if any(not o.evidence.get('metric_qualified') or time.time()-o.timestamp>.5 for o in objects):
+                raise ValueError('sorting completion requires fresh measured cube positions')
             return None
         graph = scene.build_support_graph()
         available = [obj for obj in wrong if not graph[obj.id] and obj.status!='held']
@@ -82,14 +87,15 @@ def next_transfer(mode, scene, selected=None, destination=None, excluded=()):
     raise ValueError('experiment has not reached implementation/qualification stage')
 
 
-def run_task(mode, scene, actions, refresh, check_cancel, selected=None, destination=None):
+def run_task(mode, scene, actions, refresh, check_cancel, selected=None, destination=None, *, dry=False):
+    options = {'dry':True} if dry else {}
     if mode == 'relocate':
         check_cancel()
         refresh()
-        return [actions.relocate(*next_transfer(mode,scene,selected,destination))]
+        return [actions.relocate(*next_transfer(mode,scene,selected,destination),**options)]
     results, deferred = [], set()
     initial_count = len(scene.state.objects)
-    for _ in range(initial_count):
+    for _ in range(max(1,initial_count)):
         check_cancel()
         refresh()
         try:
@@ -103,9 +109,11 @@ def run_task(mode, scene, actions, refresh, check_cancel, selected=None, destina
         object_id,placement = item
         if object_id in deferred:
             return results
-        result = actions.relocate(object_id,placement)
+        result = actions.relocate(object_id,placement,**options)
         results.append(result)
-        if not result.success:
+        # A dry check does not change occupancy. Do not keep checking the
+        # first successful cube while silently skipping the other colors.
+        if dry or not result.success:
             deferred.add(object_id)
             if result.evidence.get('critical') or (result.evidence.get('motion_started') and not result.evidence.get('recovered')):
                 return results

@@ -753,13 +753,16 @@ class Motion:
         return None
 
     def stop_settled_pose(self, q):
+        """Static bias-removal estimate, not a measured stopping trajectory."""
         command = self.robot.quantized_command(self.planner._command_pose(q))
         frozen = self.robot.quantized_command(q)
         return {j:frozen[j]+q[j]-command[j] for j in q}
 
     def check_stop_settling(self, phase, plan, world):
-        # Factory STOP removes gravity bias. Test the predicted position
-        # before doing the more expensive interpolation on a rejected phase.
+        # Factory STOP removes gravity bias. This extrapolation identifies
+        # an unresolved stopping risk; it is not evidence of real penetration.
+        # The recorded wall STOP confirms settling, but does not calibrate
+        # its transient response for other poses, payloads or support contacts.
         if not phase.name.startswith('RECOVERY_'):
             for q in phase.joints:
                 getattr(self,'check_planning',self.check_cancel)()
@@ -777,7 +780,9 @@ class Motion:
                         self.metrics.setdefault('payload_stop_refusals',{})[plan.target_id] = {
                             'phase':phase.name,'pose_deg':dict(q),'settled_deg':settled,
                             'table_z_m':float(backend.model.table_z),'planned_bottom_m':bottom(q),
-                            'stopped_bottom_m':bottom(settled),'physical_measurement':False}
+                            'stopped_bottom_m':bottom(settled),'physical_measurement':False,
+                            'estimate_model':'static gravity-bias subtraction',
+                            'qualified_transient_model':False,'support_contact':phase.support_contact}
                     raise ValueError(phase.name+': native STOP settling: '+reason)
 
     def check_pick_phase(self, phase, payload, target, world):

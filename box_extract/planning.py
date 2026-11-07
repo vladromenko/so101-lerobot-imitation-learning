@@ -321,7 +321,7 @@ class TunedExtractionPlanner(ExtractionPlanner):
         closure = [*closure, held]
         flush = flush_local(local)
         if check_pick is not None:
-            check_pick(Phase('extract_vertical',(held,),True,True),flush)
+            check_pick(Phase('extract_vertical',(held,),True,True,True),flush)
         return frame,local,closure,held,flush
 
     def _candidate(self, scene, current, target_id, cube, grasp, closed, world, *, check_pick=None, source=None):
@@ -338,8 +338,10 @@ class TunedExtractionPlanner(ExtractionPlanner):
         failure = self._tracking_robust(entry_up, world, **policy)
         if failure:
             raise ValueError('enter is not robust to arm tracking error: '+failure)
-        lift = self.vertical_center(held, rise, flush.mean(0), world, payload_local=flush, **policy)
-        extract = Phase('extract_vertical',lift,True,True)
+        # The cube starts on its source support. Use the same native contact
+        # policy as the measured post-grasp replan, including its 1 mm limit.
+        lift = self.vertical_center(held, rise, flush.mean(0), world, payload_local=flush, support_contact=True, **policy)
+        extract = Phase('extract_vertical',lift,True,True,True)
         if check_pick is not None:
             check_pick(extract,flush)
         opened = dict(current, gripper=grasp['gripper'])
@@ -368,7 +370,7 @@ class TunedExtractionPlanner(ExtractionPlanner):
         placed = released_cube(placed)
         retract = self._retract_path(release_goal, flush.mean(0), world, placed_cube=placed, **policy)
         if self.command_sag:
-            for name, path, extra in (('enter', entry_up, {}), ('closure', closure[:-1], {}), ('lift', lift, {'payload_local': flush}),
+            for name, path, extra in (('enter', entry_up, {}), ('closure', closure[:-1], {}), ('lift', lift, {'payload_local': flush, 'support_contact': True}),
                                       ('placement', placement_up, {'payload_local': flush, 'support_contact': True}),
                                       ('retract', retract, {'placed_cube': placed})):
                 for q in (path[self.separation_waypoints:] if name == 'retract' else path):
