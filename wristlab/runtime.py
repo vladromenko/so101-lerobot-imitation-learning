@@ -185,7 +185,7 @@ class Runtime:
         self.scene_lock.acquire()
         stage = 'frames'
         try:
-            frames = self.cameras.latest_pair()
+            frames = self.cameras.check()
             t = time.monotonic()
             from .vision import frame_quality
             qualities = {name:frame_quality(frame,40. if name=='overview' else 15.) for name,frame in frames.items()}

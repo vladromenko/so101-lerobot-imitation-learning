@@ -45,6 +45,10 @@ class Actions:
         self.runtime.refresh()
         obj = self.scene.state.objects[object_id]
         if time.time()-obj.timestamp > .5:
+            self.runtime.cameras.wait_for_frame('overview',time.time(),self.runtime.check_cancel)
+            self.runtime.refresh()
+            obj = self.scene.state.objects[object_id]
+        if time.time()-obj.timestamp > .5:
             raise ValueError('fresh target observation is required')
         return obj
 

@@ -92,6 +92,20 @@ def proposed_grasp(plan):
 
 
 class RelocateContract(unittest.TestCase):
+    def test_planning_reacquires_native_snapshot_instead_of_using_stale_cache(self):
+        from wristlab.cameras import Cameras
+        cameras = Cameras('http://unused')
+        fresh = {'overview':object(),'wrist':object()}
+        cameras.latest_pair = Mock(side_effect=[RuntimeError('overview: stale frame'),fresh])
+        cameras.refresh = Mock()
+        self.assertIs(cameras.check(),fresh)
+        cameras.refresh.assert_called_once()
+        cameras.latest_pair.assert_called_with()
+        cameras.error = 'overview: native camera unavailable'
+        with self.assertRaisesRegex(RuntimeError,'native camera unavailable'):
+            cameras.check()
+        cameras.refresh.assert_called_once()
+
     def test_full_cycle_refusal_tries_another_grasp_at_the_same_destination(self):
         from dataclasses import replace
         from wristlab.grasp import choose_grasp

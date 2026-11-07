@@ -70,7 +70,7 @@ class Cameras:
         if self.error:
             raise RuntimeError(self.error)
         try:
-            self.latest_pair()
+            return self.latest_pair()
         except RuntimeError as exc:
             if ': stale frame' not in str(exc):
                 raise
@@ -79,9 +79,10 @@ class Cameras:
             # Hold the command callback until actual fresh native snapshots
             # arrive. Neither the age bound nor a real camera failure is waived.
             self.refresh()
-            self.latest_pair()
+            pair = self.latest_pair()
             self.cache_refreshes.append({'at':began,'old_age_s':old,'fetch_s':time.time()-began,
                 'native_age_s':{name:value['age_s'] for name,value in self.last_health.items()}})
+            return pair
 
     def close(self):
         self.stop_event.set()
