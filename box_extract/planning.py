@@ -133,12 +133,23 @@ class TunedExtractionPlanner(ExtractionPlanner):
                      for link in ('gripper_link','moving_jaw_so101_v1_link'))
         rise = np.array([0.,0.,max(.03,float(policy['placed_cube'].vertices_m[:,2].max())+self.model.gap-bottom)])
         failures = []
-        for direction in (separation,rise,separation+rise):
+        modes = ('separate','rise','rise_then_separate') if getattr(self,'check_retreat',None) is not None else ('separate',)
+        for mode in modes:
             try:
-                away = self.translated(release_goal, direction)
-                first = self.edge(release_goal, away, world, **policy)
-                remaining = max(0.,rise[2]-direction[2])
-                up = self.vertical_center(away,remaining,center_local,world,**policy) if remaining>1e-9 else (away,)
+                if mode=='separate':
+                    away = self.translated(release_goal,separation)
+                    first = self.edge(release_goal,away,world,**policy)
+                    up = self.vertical_center(away,rise[2],center_local,world,**policy)
+                else:
+                    # The native centre-following IK permits the empty wrist
+                    # to rotate. A fixed orientation would overconstrain SO-101.
+                    first = self.vertical_center(release_goal,rise[2],center_local,world,**policy)
+                    away = first[-1]
+                    up = (away,)
+                    if mode=='rise_then_separate':
+                        axis = self.model.frames(away)['gripper_frame_link'][:3,0]
+                        goal = self.translated(away,axis*self.release_separation_m)
+                        up = self.edge(away,goal,world,**policy)
                 path = tuple(first)+tuple(up)[1:]
                 if getattr(self,'check_retreat',None) is not None:
                     self.check_retreat(Phase('retract',path,jaw_contact=True,placed_cube=policy['placed_cube']),world,policy['target'])

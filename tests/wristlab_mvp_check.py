@@ -596,7 +596,7 @@ class CompleteGraspSelection(unittest.TestCase):
         planner.backend=NS(meshes={k:np.zeros((2,3)) for k in frames},_transform_points=lambda t,v:v)
         planner.translated=lambda q,delta:dict(q,shift=tuple(delta))
         planner.edge=lambda a,b,*args,**kw:(a,b)
-        planner.vertical_center=lambda q,*args,**kw:(q,)
+        planner.vertical_center=lambda q,height,*args,**kw:(q,dict(q,shift=(0.,0.,height)))
         planner.check_retreat=Mock(side_effect=[ValueError('finger presses released cube'),True])
         cube=NS(vertices_m=np.array([[0.,0.,0.],[.03,.03,.03]]))
         path=planner._retract_path({'gripper':45.},np.zeros(3),NS(),target='cube',placed_cube=cube)
