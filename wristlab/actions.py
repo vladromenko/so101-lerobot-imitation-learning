@@ -19,8 +19,9 @@ class Actions:
         ranking = []
         rejected = {key:reason for (key,reason) in self.runtime.recovery.failures
                     if 'enter is not robust' in reason and 'wrist_camera' in reason}
-        for obj in self.scene.state.objects.values():
+        for object_id in tuple(self.scene.state.objects):
             self.runtime.check_cancel()
+            obj = self.observe_object(object_id)
             row = {'object_id':obj.id,'color':obj.color,'admissible':False}
             if obj.id in rejected or obj.color in excluded_colors:
                 row['reason'] = 'previously rejected camera/box entry; not retried'
@@ -82,7 +83,8 @@ class Actions:
             if placement.support_surface in self.scene.state.boxes and not resume_held:
                 for patch in self.scene.find_free_box_slots(placement.support_surface,obj.dimensions):
                     center = np.r_[np.mean(patch.polygon_xy_m,axis=0),patch.height_m+obj.dimensions[2]/2]
-                    if np.linalg.norm(center-placement.object_pose[:3,3])>.015:
+                    duplicate = any(np.allclose(center,choice.object_pose[:3,3],rtol=0.,atol=1e-9) for choice in choices)
+                    if np.linalg.norm(center-placement.object_pose[:3,3])>.015 and not duplicate:
                         pose = placement.object_pose.copy();pose[:3,3] = center
                         choices.append(replace(placement,object_pose=pose))
             failures = []
