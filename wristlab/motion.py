@@ -73,6 +73,7 @@ RecoveryCollisionWorld.reason = _native_recovery_reason()
 class Motion:
     def __init__(self, robot, check_cancel, report, qualification_file):
         self.robot, self.check_cancel, self.report = robot, check_cancel, report
+        self.check_planning = check_cancel
         self.planner = TunedExtractionPlanner(robot.backend,check_cancel=check_cancel)
         self.metrics = {}
         self.planner.timings = self.metrics
@@ -443,7 +444,7 @@ class Motion:
         if self.planner.command_sag is None:
             raise ValueError('native gravity-compensation setting has not been read')
         for q in self.robot.native_edge_samples(start,goal):
-            self.check_cancel()
+            getattr(self,'check_planning',self.check_cancel)()
             command = self.robot.synchronized_command(q,self.recovery_mapping) if phase.name=='RECOVERY_FROM_INVALID_START' else self.planner._command_pose(q)
             for kind,pose in (('pose',q),('native command',command)):
                 reason = self.state_is_valid(pose,phase,plan,world)

@@ -55,6 +55,8 @@ class Runtime:
         if previous.get('stop_latched'):
             self.stop_event.set()
         self.motion = Motion(self.robot,self.check_cancel,self.report,self.root/self.config['qualification_file'])
+        self.motion.planner.check_cancel = self.check_planning
+        self.motion.check_planning = self.check_planning
         self.recovery = Recovery(self.config['max_recovery_attempts'])
         self.actions = Actions(self)
         self.running,self.initialized = False,False
@@ -812,6 +814,16 @@ class Runtime:
             raise RuntimeError('STOP')
         if self.robot.arm is not None and not self.robot.owns_lease():
             raise RuntimeError('exclusive hardware lease lost')
+
+    def check_planning(self):
+        """Poll feedback on the same worker that plans and owns the bus."""
+        self.check_cancel()
+        last = self.robot.last_state
+        if self.robot.arm is not None and (last is None or time.time()-last['timestamp']>=self.config['poll_interval_s']):
+            state = self.robot.read_state()
+            self.cameras.record_state(state['timestamp'],state['q'],state['gripper'])
+            self.monitor_motors()
+            self.check_cancel()
 
     def wait_pause(self):
         while self.pause_event.is_set():
