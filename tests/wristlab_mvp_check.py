@@ -482,6 +482,32 @@ class GeometryPolicy(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,'classified'):
             tasks.box_for_color('unknown',{})
 
+    def test_sort_keeps_confirmed_left_placement_when_right_box_is_unavailable(self):
+        scene = Scene(NS())
+        green,red = object_at('g','green',.26,0.),object_at('r','red',.34,.1)
+        scene.state.objects = {obj.id:obj for obj in (red,green)}
+        left = NS(id='left',occupied_slots=[],evidence={'polygon':[[0.,0.],[2.,2.]]})
+        right = NS(id='right',occupied_slots=[],evidence={'polygon':[[4.,0.],[6.,2.]]})
+        scene.state.boxes = {'left':left,'right':right}
+        placement = Placement(np.eye(4),'left')
+
+        def find_slot(_scene, object_id, box_id):
+            if box_id=='right':
+                raise ValueError('unmeasured opening')
+            return placement
+
+        def relocate(object_id, destination):
+            left.occupied_slots.append(object_id)
+            return ActionResult(True,'observed in box',object_id,scene.state,{'physical_verified':True})
+
+        actions = NS(relocate=Mock(side_effect=relocate))
+        with patch('wristlab.tasks.placement_in_box',side_effect=find_slot):
+            results = tasks.run_task('sort_colors',scene,actions,Mock(),Mock())
+        actions.relocate.assert_called_once_with(green.id,placement)
+        self.assertEqual([(r.object_id,r.success) for r in results],[(green.id,True),(red.id,False)])
+        self.assertTrue(results[0].evidence['physical_verified'])
+        self.assertEqual(results[1].reason,'unmeasured opening')
+
     def test_resumed_native_reference_preserves_all_powered_hardware_goals(self):
         recorded=json.loads((ROOT/'runtime/retreat-park-before-restart.json').read_text())
         robot=Robot('/home/jetsonnx/Projects/so101_autonomous_pick_place',ROOT/'runtime/unit')

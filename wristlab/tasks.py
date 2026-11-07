@@ -1,9 +1,16 @@
 """Task selection delegates every physical transfer to actions.relocate."""
 import numpy as np
-from .types import Placement
+from .types import ActionResult, Placement
 
 
 MODES = ('relocate','stow','extract','collect_to_box','empty_box','sort_colors')
+
+
+class SortingBlocked(ValueError):
+    def __init__(self, reasons):
+        self.reasons = reasons
+        super().__init__('sorting has no accessible destination: '+ '; '.join(
+            f'{object_id}: {reason}' for object_id,reason in reasons.items()))
 
 
 def box_for_color(color, boxes):
@@ -65,13 +72,13 @@ def next_transfer(mode, scene, selected=None, destination=None, excluded=()):
             return None
         graph = scene.build_support_graph()
         available = [obj for obj in wrong if not graph[obj.id] and obj.status!='held']
-        failures = []
+        failures = {obj.id:'support graph blocks access' for obj in wrong if graph[obj.id] or obj.status=='held'}
         for obj in sorted(available,key=lambda obj:-obj.pose[2,3]):
             try:
                 return obj.id,placement_in_box(scene,obj.id,box_for_color(obj.color,scene.state.boxes))
             except ValueError as exc:
-                failures.append(obj.id+': '+str(exc))
-        raise ValueError('sorting has no accessible destination: '+('; '.join(failures) or 'support graph blocks the remaining objects'))
+                failures[obj.id] = str(exc)
+        raise SortingBlocked(failures)
     raise ValueError('experiment has not reached implementation/qualification stage')
 
 
@@ -85,7 +92,12 @@ def run_task(mode, scene, actions, refresh, check_cancel, selected=None, destina
     for _ in range(initial_count):
         check_cancel()
         refresh()
-        item = next_transfer(mode,scene,selected,destination,deferred)
+        try:
+            item = next_transfer(mode,scene,selected,destination,deferred)
+        except SortingBlocked as exc:
+            return results+[ActionResult(False,reason,object_id,scene.state,
+                {'motion_started':False,'physical_verified':False,'failure_kind':'PLANNING_OR_OBSERVATION'})
+                for object_id,reason in exc.reasons.items()]
         if item is None:
             return results
         object_id,placement = item
