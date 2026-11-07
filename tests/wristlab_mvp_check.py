@@ -10,7 +10,6 @@ import sys
 import time
 import threading
 import tempfile
-import queue
 from collections import deque
 from types import SimpleNamespace as NS
 import unittest
@@ -32,7 +31,7 @@ from wristlab.types import ObjectState,Placement,SceneState,ActionResult,Frame
 from so101_pick_place.geometry.cuboid_vision import cube_vertices
 from so101_pick_place.geometry.spatial_cube import SpatialCube
 from so101_pick_place.experiments.box_extraction.planner import Phase,ExtractionPlan
-from so101_pick_place.experiments.box_extraction.scene import SupportPatch,ExtractionScene,ExtractionCollisionWorld
+from so101_pick_place.experiments.box_extraction.scene import SupportPatch,ExtractionScene
 
 
 Q = json.loads((ROOT/'runtime/robot-audit.json').read_text())['joints_native']
@@ -51,26 +50,21 @@ def action_contract():
     cube = SpatialCube(obj.pose[:3,3],SIDE,np.eye(3),vertices,dict(obj.evidence))
     scene = Scene(NS());scene.state = SceneState({obj.id:obj})
     scene.native_scene = Mock(return_value=ExtractionScene('recorded',time.time(),NS(),{obj.id:cube},NS(),(),True))
-    offset = np.array([.001,0.,0.])
-    observed_cube = SpatialCube(cube.center_m+offset,SIDE,np.eye(3),vertices+offset,dict(obj.evidence))
-    scene.native_object = Mock(return_value=observed_cube)
-    state = {'positions':dict(Q),'gripper':Q['gripper'],'timestamp':time.time()}
+    scene.native_object = Mock(return_value=cube)
+    state = {'positions':dict(Q),'gripper':Q['gripper']}
     robot = NS(read_state=Mock(return_value=state),arm=NS(read=Mock(return_value=(dict(Q),{},{}))),
         backend=NS(model=NS(frames=lambda q:{'gripper_frame_link':np.eye(4)})))
     local = vertices-vertices.mean(0)
     def phase(name):
-        return Phase(name,(dict(Q),dict(Q)),name in ('extract_vertical','release'),
-                     placed_cube=cube if name=='retract' else None)
-    remainder = ('extract_vertical','transfer','lower_to_support','release','retract')
-    plan = ExtractionPlan('recorded',obj.id,tuple(phase(s) for s in ('open','approach','enter','grasp')+remainder),
+        return Phase(name,(dict(Q),dict(Q)),name in ('extract_vertical','release'))
+    plan = ExtractionPlan('recorded',obj.id,tuple(phase(s) for s in ('open','approach','enter','grasp')),
                           local,np.array([.3,0.,SIDE/2]),())
-    rest = ExtractionPlan('recorded',obj.id,tuple(phase(s) for s in remainder),
+    rest = ExtractionPlan('recorded',obj.id,tuple(phase(s) for s in ('extract_vertical','transfer','release','retract')),
                           local,np.array([.3,0.,SIDE/2]),())
     driver = NS(confirm_grasp=Mock(return_value=local),release_confirmed=Mock(),confirm_retention=Mock(),retention=NS(armed=True))
     motion = NS(qualification_reasons=Mock(return_value=[]),make_world=Mock(return_value=NS()),
-        check_path=Mock(),check_entry_transition=Mock(),contact_free_passed=True,driver=driver,planner=NS(),execute_trajectory=Mock(),
-        replan_held=Mock(return_value=(rest,NS())),preflight_cycle=Mock(return_value=phase('safe_park')),
-        state_is_valid=Mock(return_value=None))
+        check_path=Mock(),contact_free_passed=True,driver=driver,planner=NS(),execute_trajectory=Mock(),
+        replan_held=Mock(return_value=(rest,NS())),preflight_cycle=Mock(),state_is_valid=Mock(return_value=None))
     rt = NS(scene=scene,robot=robot,motion=motion,metrics={},report=Mock(),refresh=Mock(),
         check_cancel=Mock(),wait_pause=Mock(),ensure_driver=Mock(),stop=Mock(),recovery=Recovery(),
         mode='relocate',physical_relocate_count=0,cameras=NS(check=Mock()),stop_event=threading.Event(),
@@ -78,173 +72,17 @@ def action_contract():
     action = Actions(rt)
     action.capture_grip_view = Mock(return_value={'frame_id':'anchor'})
     action.verify_pick = Mock(return_value=True)
-    observed_pose = obj.pose.copy();observed_pose[:3,3] += offset
-    action.verify_placement = Mock(return_value=(True,observed_pose))
+    action.verify_placement = Mock(return_value=(True,obj.pose.copy()))
     placement = Placement(obj.pose.copy(),'box-1')
     alignment = {'observed_top_m':(obj.pose[:3,3]+[0.,0.,SIDE/2]).tolist()}
     return obj,rt,action,placement,plan,alignment
 
 
-def proposed_grasp(plan):
-    def choose(*args, verify_plan, **kwargs):
-        world = NS()
-        return None,plan,world,verify_plan(plan,world)
-    return choose
-
-
 class RelocateContract(unittest.TestCase):
-    def test_initial_pick_uses_native_support_contact_without_widening_its_limit(self):
-        from box_extract.planning import TunedExtractionPlanner
-        obj = object_at('source','green',0.,0.)
-        vertices = cube_vertices(obj.pose[:2,3],SIDE,0.,0.)
-        cube = SpatialCube(obj.pose[:3,3],SIDE,np.eye(3),vertices,dict(obj.evidence))
-        planner = TunedExtractionPlanner.__new__(TunedExtractionPlanner)
-        planner.model = NS(frames=lambda q:{'gripper_frame_link':np.eye(4)})
-        planner.last_clamp_deg = 29.
-        planner.edge = lambda start,end,world,**policy:[start,end]
-        closure = NS(reason=lambda q,**policy:'moving_jaw_so101_v1_link: cube source' if q['gripper']<30. else None)
-        checked=[]
-        planner.pick_endpoints('source',cube,{'gripper':35.},30.,closure,
-                               lambda phase,payload:checked.append(phase))
-        lift = checked[-1]
-        self.assertEqual(lift.name,'extract_vertical')
-        self.assertTrue(lift.carrying and lift.support_contact)
-
-        def frame(q):
-            pose=np.eye(4);pose[2,3]=q['z']
-            return {'gripper_frame_link':pose}
-        world = ExtractionCollisionWorld.__new__(ExtractionCollisionWorld)
-        world.backend = NS(model=NS(pose=lambda q:q,problems=lambda q:[],collides=lambda q:None,frames=frame),
-                           meshes={},_transform_points=lambda pose,points:points@pose[:3,:3].T+pose[:3,3])
-        world.scene = NS(cubes={'source':cube},placement=NS(height_m=0.,uncertainty_m=0.),
-                         box=NS(base_from_box=np.eye(4),solid_parts=lambda:(),floor_interval_m=(0.,0.)))
-        policy={'target':'source','payload_local':vertices,'jaw_contact':True}
-        self.assertIsNotNone(world.reason({'z':-.0005},**policy))
-        self.assertIsNone(world.reason({'z':-.0005},support_contact=lift.support_contact,**policy))
-        self.assertEqual(world.reason({'z':-.0011},support_contact=lift.support_contact,**policy),
-                         'payload intersects measured table support')
-
-    def test_grasp_height_uses_source_support_not_destination_floor(self):
-        from box_extract.planning import TunedExtractionPlanner
-        obj = object_at('table-cube','red',.26,0.)
-        vertices = cube_vertices(obj.pose[:2,3],SIDE,0.,0.)
-        cube = SpatialCube(obj.pose[:3,3],SIDE,np.eye(3),vertices,dict(obj.evidence))
-        aperture = Mock(side_effect=ValueError('captured source aperture probe'))
-        model = NS(pose=Mock(),table_z=0.,gap=.006)
-        planner = TunedExtractionPlanner.__new__(TunedExtractionPlanner)
-        planner.model = model
-        planner.backend = NS(fixed_jaw_distal_z_m=.03,expected_block_gripper=aperture)
-        for height in (.002,.05):
-            box = NS(base_from_box=np.eye(4),floor_interval_m=(height,height))
-            with self.assertRaisesRegex(ValueError,'captured source aperture probe'):
-                next(planner.grasp_candidates(NS(box=box),cube,Q))
-        self.assertEqual(aperture.call_args_list[0].args,aperture.call_args_list[1].args)
-        self.assertAlmostEqual(aperture.call_args.args[-1],.03+.006+.003-SIDE/2)
-
-    def test_unsafe_source_is_rejected_before_placement_ik(self):
-        from wristlab.grasp import choose_grasp, SourceRejected
-        obj,rt,_,placement,_,_ = action_contract()
-        scene = rt.scene.native_scene(obj.id,placement)
-        planner = NS(timings={},placement_pose=Mock(),
-                     pick_endpoints=Mock(side_effect=ValueError('extract_vertical: pose: camera intersects wall')))
-        candidate = NS(native=(dict(Q),15.))
-        with patch('wristlab.grasp.generate_grasps',return_value=iter([candidate])):
-            with self.assertRaisesRegex(SourceRejected,'pose: camera intersects wall'):
-                choose_grasp(obj,scene,rt.robot,planner,Q,rt.check_cancel,NS(),check_pick=Mock())
-        planner.placement_pose.assert_not_called()
-
-    def test_park_falls_back_to_a_checked_lower_load_pose(self):
-        motion=Motion.__new__(Motion)
-        motion.check_cancel=Mock()
-        motion.check_path=Mock()
-        motion.planner=NS(_command_pose=dict)
-        model=NS(ranges=[(-100.,100.)]*5,margin=5.,
-                 pose=lambda q:NS(torque=[0.,q['shoulder_lift']/100.,q['elbow_flex']/100.]))
-        motion.robot=NS(backend=NS(model=model),from_native=Robot.from_native,
-                        native_edge_samples=Robot.native_edge_samples)
-        start=dict(Q,shoulder_lift=0.,elbow_flex=10.)
-        world=NS(reason=lambda q,**policy:'wall' if q['elbow_flex']<5. else None)
-        previous=ExtractionPlan('current','',(),None,None,())
-        with tempfile.TemporaryDirectory() as directory:
-            motion.qualification_file=Path(directory)/'qualification.json'
-            phase=motion.plan_park(start,previous,world)
-        self.assertEqual(phase.joints[0],start)
-        self.assertGreaterEqual(phase.joints[-1]['elbow_flex'],5.)
-        self.assertLess(phase.joints[-1]['elbow_flex'],10.)
-        motion.check_path.assert_called_once()
-
-    def test_stationary_planning_refreshes_motor_telemetry(self):
-        rt=Runtime.__new__(Runtime)
-        rt.config={'poll_interval_s':.35}
-        old={'timestamp':time.time()-1.}
-        state={'timestamp':time.time(),'q':np.zeros(5),'gripper':22.}
-        rt.robot=NS(arm=object(),last_state=old,read_state=Mock(return_value=state))
-        rt.cameras=NS(record_state=Mock())
-        rt.check_cancel=Mock()
-        rt.monitor_motors=Mock()
-        rt.check_planning()
-        rt.robot.read_state.assert_called_once()
-        rt.cameras.record_state.assert_called_once_with(state['timestamp'],state['q'],state['gripper'])
-        rt.monitor_motors.assert_called_once()
-        self.assertEqual(rt.check_cancel.call_count,2)
-        rt.robot.last_state=state
-        rt.check_planning()
-        rt.robot.read_state.assert_called_once()
-
-    def test_box_tracking_does_not_accumulate_previous_frame_errors(self):
-        from wristlab.types import BoxState
-        scene = Scene(None)
-        image = np.random.default_rng(1).integers(0,256,(96,96,3),dtype=np.uint8)
-        polygon = np.array([[20,20],[75,20],[75,75],[20,75]])
-        box = BoxState('box',np.eye(4),np.ones(3),.1,evidence={'polygon':polygon.tolist()})
-        scene.state.boxes[box.id] = box
-        scene.frames['overview'] = Frame('overview','anchor',image,1.,1.,(1.,1.))
-        moved = cv2.warpAffine(image,np.float32([[1,0,2],[0,1,0]]),(96,96))
-        first = scene.track_box_edges(Frame('overview','moved',moved,2.,2.,(2.,2.)))
-        self.assertIsNotNone(first)
-        box.evidence['polygon'] = first[0]['polygon']
-        scene.frames['overview'] = Frame('overview','obscured',np.zeros_like(image),3.,3.,(3.,3.))
-        second = scene.track_box_edges(Frame('overview','clear',image,4.,4.,(4.,4.)))
-        self.assertIsNotNone(second)
-        np.testing.assert_allclose(second[0]['polygon'],polygon,atol=.1)
-
-    def test_planning_reacquires_native_snapshot_instead_of_using_stale_cache(self):
-        from wristlab.cameras import Cameras
-        cameras = Cameras('http://unused')
-        fresh = {'overview':object(),'wrist':object()}
-        cameras.latest_pair = Mock(side_effect=[RuntimeError('overview: stale frame'),fresh])
-        cameras.refresh = Mock()
-        self.assertIs(cameras.check(),fresh)
-        cameras.refresh.assert_called_once()
-        cameras.latest_pair.assert_called_with()
-        cameras.error = 'overview: native camera unavailable'
-        with self.assertRaisesRegex(RuntimeError,'native camera unavailable'):
-            cameras.check()
-        cameras.refresh.assert_called_once()
-
-    def test_full_cycle_refusal_tries_another_grasp_at_the_same_destination(self):
-        from dataclasses import replace
-        from wristlab.grasp import choose_grasp
-        obj,rt,_,placement,plan,_ = action_contract()
-        scene = replace(rt.scene.native_scene(obj.id,placement),placement=NS(
-            polygon_xy_m=np.array([[.2,0.],[.3,0.],[.3,.1],[.2,.1]]),height_m=0.,uncertainty_m=0.))
-        second = replace(plan,scene_revision='second')
-        planner = NS(timings={},last_clamp_deg=15.,placement_pose=Mock(return_value=Q),
-                     _command_pose=dict,_candidate=Mock(side_effect=[plan,second]))
-        world = NS(reason=Mock(return_value=None))
-        park = object()
-        verify = Mock(side_effect=[ValueError('retreat: wall clearance'),park])
-        grasps = [NS(native=(dict(Q),15.)),NS(native=(dict(Q,shoulder_pan=Q['shoulder_pan']+1.),15.))]
-        with patch('wristlab.grasp.generate_grasps',return_value=iter(grasps)):
-            selected = choose_grasp(obj,scene,rt.robot,planner,Q,rt.check_cancel,world,verify_plan=verify)
-        self.assertIs(selected[1],second)
-        self.assertIs(selected[3],park)
-        self.assertEqual(planner._candidate.call_count,2)
-
     def test_active_perception_is_bounded_and_replans_approach(self):
         setup=action_contract();obj,rt,action,placement,plan,alignment=setup
         rt.refine_object=Mock(return_value=obj)
-        with patch('wristlab.actions.choose_grasp',side_effect=proposed_grasp(plan)) as choose,patch(
+        with patch('wristlab.actions.choose_grasp',return_value=(None,plan,NS())) as choose,patch(
             'wristlab.actions.visual_alignment',side_effect=[ValueError('view occluded'),alignment]):
             result=action.relocate(obj.id,placement)
         self.assertTrue(result.success,result.reason)
@@ -255,7 +93,7 @@ class RelocateContract(unittest.TestCase):
     def test_active_perception_does_not_repeat_same_failed_alignment(self):
         setup=action_contract();obj,rt,action,placement,plan,_=setup
         rt.refine_object=Mock(return_value=obj)
-        with patch('wristlab.actions.choose_grasp',side_effect=proposed_grasp(plan)),patch(
+        with patch('wristlab.actions.choose_grasp',return_value=(None,plan,NS())),patch(
             'wristlab.actions.visual_alignment',side_effect=ValueError('target still occluded')):
             result=action.relocate(obj.id,placement)
         self.assertFalse(result.success)
@@ -264,7 +102,7 @@ class RelocateContract(unittest.TestCase):
         rt.stop.assert_not_called()
     def invoke(self, setup, **options):
         obj,rt,action,placement,plan,alignment = setup
-        with patch('wristlab.actions.choose_grasp',side_effect=proposed_grasp(plan)),patch('wristlab.actions.visual_alignment',return_value=alignment):
+        with patch('wristlab.actions.choose_grasp',return_value=(None,plan,NS())),patch('wristlab.actions.visual_alignment',return_value=alignment):
             result = action.relocate(obj.id,placement,**options)
         return result
 
@@ -280,8 +118,6 @@ class RelocateContract(unittest.TestCase):
         self.assertGreaterEqual(rt.motion.preflight_cycle.call_count,2)
         rt.park_arm.assert_called_once()
         self.assertIs(rt.motion.make_world.call_args.args[0].cubes[obj.id],rt.scene.native_object.return_value)
-        park_plan = rt.park_arm.call_args.args[0]
-        self.assertIs(next(p.placed_cube for p in park_plan.phases if p.name=='retract'),rt.scene.native_object.return_value)
         self.assertTrue(result.evidence['retreat_completed'])
         self.assertTrue(result.evidence['parked'])
         self.assertEqual(rt.physical_relocate_count,1)
@@ -321,37 +157,13 @@ class RelocateContract(unittest.TestCase):
         result = self.invoke(setup,dry=True)
         self.assertTrue(result.success)
         self.assertFalse(result.evidence['physical_verified'])
-        self.assertEqual([p['name'] for p in result.evidence['checked_phases']][-2:],['retract','safe_park'])
-        self.assertEqual(result.evidence['checked_phases'][-1]['goal_deg'],Q)
         rt.ensure_driver.assert_not_called()
         rt.motion.execute_trajectory.assert_not_called()
         rt.motion.driver.confirm_grasp.assert_not_called()
 
-    def test_powered_goal_transition_rejects_outward_elbow_step_before_motion(self):
-        setup = action_contract();_,rt,_,_,plan,_ = setup
-        state = rt.robot.read_state()
-        state['timestamp'] = time.time()
-        actual = state['positions']
-        rt.robot.read_motor_health = Mock(return_value={
-            name:{'goal':value-(1.32 if name=='elbow_flex' else 0.),'torque_enabled':True,'status_raw':0,'moving':False}
-            for name,value in actual.items()})
-        rt.robot.quantized_command = dict
-        rt.robot.native_edge_samples = Robot.native_edge_samples
-        rt.motion.robot = rt.robot
-        rt.motion.planner._command_pose = dict
-        rt.motion.check_cancel = rt.check_cancel
-        rt.motion.state_is_valid.side_effect = lambda q,*_: (
-            'elbow_flex outside its range' if q['elbow_flex']>actual['elbow_flex']+.2 else None)
-        rt.motion.check_entry_transition.side_effect = lambda *args: Motion.check_entry_transition(rt.motion,*args)
-        result = self.invoke(setup)
-        self.assertFalse(result.success)
-        self.assertIn('native holding transition: elbow_flex outside its range',result.reason)
-        rt.motion.preflight_cycle.assert_not_called()
-        rt.motion.execute_trajectory.assert_not_called()
-
     def test_missing_visual_target_after_approach_does_not_latch_hardware_fault(self):
         setup = action_contract();obj,rt,action,placement,plan,_ = setup
-        with patch('wristlab.actions.choose_grasp',side_effect=proposed_grasp(plan)),patch('wristlab.actions.visual_alignment',side_effect=ValueError('wrist target is missing')):
+        with patch('wristlab.actions.choose_grasp',return_value=(None,plan,NS())),patch('wristlab.actions.visual_alignment',side_effect=ValueError('wrist target is missing')):
             result = action.relocate(obj.id,placement)
         self.assertFalse(result.success)
         self.assertEqual(result.evidence['failure_kind'],'PLANNING_OR_OBSERVATION')
@@ -383,81 +195,6 @@ class RelocateContract(unittest.TestCase):
 
 
 class GeometryPolicy(unittest.TestCase):
-    def test_dry_preflight_failure_never_moves_to_a_qualified_park(self):
-        rt=Runtime.__new__(Runtime)
-        rt.stop_event=threading.Event();rt.scene=NS(held=None)
-        rt.robot=NS(arm=object(),first_command_at=None);rt.park_qualified_file=NS(exists=lambda:True)
-        rt.motion=NS(plan=object(),world=object());rt.park_arm=Mock();rt.persist=Mock()
-        rt.report=Mock();rt.check_cancel=Mock();rt.blockers=Mock(return_value=[])
-        rt.refresh=Mock(side_effect=ValueError('scene changed before dry preflight'))
-        rt.last_plan=None;rt.started=time.monotonic();rt.metrics={}
-        rt.execute({'mode':'relocate','dry':True})
-        self.assertFalse(rt.results[0]['success'])
-        rt.park_arm.assert_not_called()
-
-    def test_overview_measurement_rejects_repeated_frame_during_monitored_hold(self):
-        rt = Runtime.__new__(Runtime)
-        rt.stop_event = threading.Event()
-        rt.check_cancel = Mock()
-        rt.monitor_motors = Mock()
-        rt.config = {'poll_interval_s':.01}
-        state = {'positions':Q,'timestamp':time.time(),'q':np.zeros(5),'gripper':Q['gripper']}
-        rt.robot = NS(encoder_steps=lambda:{j:.1 for j in Q},read_state=Mock(return_value=state))
-        rt.cameras = NS(max_age=.5,check=Mock(),record_state=Mock(),json=Mock(side_effect=lambda *a,**kw:
-            {'frame':{'sequence':1,'captured_at_unix_s':time.time()}}))
-        with self.assertRaisesRegex(ValueError,'three fresh distinct frames'):
-            rt.measure_overview(Q)
-        rt.monitor_motors.assert_called()
-        self.assertEqual(rt.cameras.json.call_count,3)
-
-    def test_release_checkpoint_cannot_cross_a_reboot(self):
-        import pickle
-        with tempfile.TemporaryDirectory() as directory:
-            rt=Runtime.__new__(Runtime);rt.output=Path(directory);rt.boot_id='current'
-            path=rt.output/'released-placement.pkl'
-            path.write_bytes(pickle.dumps({'boot_id':'previous'}))
-            with self.assertRaisesRegex(ValueError,'not from this boot'):
-                rt.read_release_checkpoint()
-            path.write_bytes(pickle.dumps({'boot_id':'current','release_actual':Q}))
-            self.assertEqual(rt.read_release_checkpoint()['release_actual'],Q)
-
-    def test_camera_initialization_can_retry_after_native_api_starts(self):
-        with tempfile.TemporaryDirectory() as directory:
-            rt=Runtime.__new__(Runtime);rt.output=Path(directory);rt.metrics={}
-            rt.scene=NS(boxes_semantically_seeded=True);rt.refresh=Mock()
-            rt.cameras_initialized=False;rt.camera_retry_at=0.
-            rt.cameras=NS(apply_controls=Mock(side_effect=[OSError('connection refused'),{}]),start_capture=Mock())
-            rt.initialize_cameras()
-            self.assertFalse(rt.cameras_initialized)
-            self.assertGreater(rt.camera_retry_at,time.monotonic())
-            rt.initialize_cameras()
-            self.assertTrue(rt.cameras_initialized)
-            rt.cameras.start_capture.assert_called_once()
-
-    def test_overview_view_requires_attended_approval_for_that_proposal(self):
-        rt=Runtime.__new__(Runtime);rt.stop_generation=2
-        rt.overview_preview={'checked_at':1.,'stop_generation':2}
-        rt.refresh=Mock()
-        with self.assertRaisesRegex(ValueError,'explicit attended approval'):
-            rt.prepare_overview_clearance({'operator_at_stop':True,'proposal_checked_at':3.})
-        rt.refresh.assert_not_called()
-
-    def test_encoder_drift_invalidates_an_overview_proposal_before_actuation(self):
-        rt=Runtime.__new__(Runtime);rt.stop_generation=2;rt.overview_preview={'checked_at':1.}
-        rt.config={'poll_interval_s':1.};rt.report=Mock();rt.refresh=Mock();rt.monitor_motors=Mock()
-        rt.scene=NS(state=NS(boxes={'observed':object()}));rt.geometry=NS()
-        rt.cameras=NS(check=Mock(),record_state=Mock())
-        health={j:{'goal':q,'status_raw':0,'torque_enabled':True} for j,q in Q.items()}
-        state={'positions':Q,'motor_health':health,'timestamp':time.time(),'q':np.zeros(5),'gripper':Q['gripper']}
-        changed=state|{'positions':Q|{'gripper':Q['gripper']+100./1511.}}
-        rt.robot=NS(owns_lease=lambda:True,read_state=Mock(side_effect=[state,changed]),
-                    read_motor_health=Mock(return_value=health),arm=NS(follow=Mock()))
-        rt.motion=NS(overview_clear_path=Mock(return_value=((Q,Q),NS(),{'hardware_goals':Q})))
-        with self.assertRaisesRegex(ValueError,'changed during overview calculation'):
-            rt.prepare_overview_clearance({'dry':True})
-        self.assertIsNone(rt.overview_preview)
-        rt.robot.arm.follow.assert_not_called()
-
     def test_placement_cannot_be_proved_by_retained_or_old_metric_coordinates(self):
         scene=Scene(NS(wrist=None))
         obj=object_at('target','green',.25,0.)
@@ -513,110 +250,6 @@ class GeometryPolicy(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,'classified'):
             tasks.box_for_color('unknown',{})
 
-    def test_sort_keeps_confirmed_left_placement_when_right_box_is_unavailable(self):
-        scene = Scene(NS())
-        green,red = object_at('g','green',.26,0.),object_at('r','red',.34,.1)
-        scene.state.objects = {obj.id:obj for obj in (red,green)}
-        left = NS(id='left',occupied_slots=[],evidence={'polygon':[[0.,0.],[2.,2.]]})
-        right = NS(id='right',occupied_slots=[],evidence={'polygon':[[4.,0.],[6.,2.]]})
-        scene.state.boxes = {'left':left,'right':right}
-        placement = Placement(np.eye(4),'left')
-
-        def find_slot(_scene, object_id, box_id):
-            if box_id=='right':
-                raise ValueError('unmeasured opening')
-            return placement
-
-        def relocate(object_id, destination):
-            left.occupied_slots.append(object_id)
-            return ActionResult(True,'observed in box',object_id,scene.state,{'physical_verified':True})
-
-        actions = NS(relocate=Mock(side_effect=relocate))
-        with patch('wristlab.tasks.placement_in_box',side_effect=find_slot):
-            results = tasks.run_task('sort_colors',scene,actions,Mock(),Mock())
-        actions.relocate.assert_called_once_with(green.id,placement)
-        self.assertEqual([(r.object_id,r.success) for r in results],[(green.id,True),(red.id,False)])
-        self.assertTrue(results[0].evidence['physical_verified'])
-        self.assertEqual(results[1].reason,'unmeasured opening')
-
-    def test_dry_sort_checks_every_color_without_changing_occupancy(self):
-        scene = Scene(NS())
-        objects = [object_at(str(i),color,.24+i*.04,0.)
-                   for i,color in enumerate(('green','blue','yellow','red'))]
-        scene.state.objects = {obj.id:obj for obj in objects}
-        scene.state.boxes = {name:NS(id=name,occupied_slots=[],evidence={'polygon':[[x,0.],[x+1.,1.]]})
-                             for name,x in (('left',0.),('right',3.))}
-        actions = NS(relocate=Mock(side_effect=lambda key,placement,*,dry:ActionResult(
-            True,'checked',key,scene.state,{'motion_started':False,'physical_verified':False})))
-        with patch('wristlab.tasks.placement_in_box',side_effect=lambda scene,key,box:Placement(np.eye(4),box)):
-            results = tasks.run_task('sort_colors',scene,actions,Mock(),Mock(),dry=True)
-        self.assertEqual({r.object_id for r in results},{obj.id for obj in objects})
-        self.assertEqual(actions.relocate.call_count,4)
-        self.assertTrue(all(c.kwargs=={'dry':True} for c in actions.relocate.call_args_list))
-        self.assertTrue(all(not box.occupied_slots for box in scene.state.boxes.values()))
-
-    def test_sort_does_not_claim_success_on_an_empty_or_stale_scene(self):
-        scene = Scene(NS())
-        actions = NS(relocate=Mock())
-        with self.assertRaisesRegex(ValueError,'observed cubes'):
-            tasks.run_task('sort_colors',scene,actions,Mock(),Mock())
-        obj = object_at('g','green',.24,0.)
-        obj.timestamp = time.time()-1.
-        scene.state.objects = {obj.id:obj}
-        scene.state.boxes = {name:NS(id=name,occupied_slots=['g'] if name=='left' else [],
-                                    evidence={'polygon':[[x,0.],[x+1.,1.]]})
-                             for name,x in (('left',0.),('right',3.))}
-        with self.assertRaisesRegex(ValueError,'fresh measured'):
-            tasks.run_task('sort_colors',scene,actions,Mock(),Mock())
-        actions.relocate.assert_not_called()
-
-    def test_start_queues_a_fresh_bus_read_but_never_skips_other_blockers(self):
-        rt = Runtime.__new__(Runtime)
-        rt.running=False;rt.initialized=True;rt.submit_lock=threading.Lock()
-        rt.commands=queue.Queue(maxsize=1);rt.stop_event=threading.Event()
-        rt.robot=NS(first_command_at=None);rt.scene=NS(remember_reset_layout=Mock())
-        rt.motion=NS(planner=NS());rt.report=Mock()
-        rt.blocking_conditions=Mock(return_value=[{'code':'FEEDBACK_STALE','reason':'old idle cache'}])
-        rt.start({'mode':'sort_colors'})
-        self.assertEqual(rt.commands.get_nowait()['mode'],'sort_colors')
-        self.assertIsNone(rt.robot.first_command_at)
-        rt.running=False
-        rt.blocking_conditions.return_value.append({'code':'MODEL_CONTACT','reason':'camera contact'})
-        with self.assertRaisesRegex(ValueError,'camera contact'):
-            rt.start({'mode':'sort_colors'})
-        self.assertTrue(rt.commands.empty())
-        rt.stop_event.set()
-        with self.assertRaisesRegex(ValueError,'STOP'):
-            rt.start({'mode':'sort_colors'})
-
-    def test_worker_rereads_encoders_before_validation_and_refuses_read_failure(self):
-        for read_failure in (False,True):
-            rt = Runtime.__new__(Runtime)
-            events=[]
-            rt.check_cancel=Mock();rt.refresh=Mock(side_effect=lambda:events.append('scene'))
-            state={'timestamp':time.time(),'q':np.zeros(5),'gripper':20.}
-            def read():
-                events.append('encoders')
-                if read_failure:
-                    raise RuntimeError('encoder read failed')
-                return state
-            rt.robot=NS(arm=NS(),read_state=Mock(side_effect=read),first_command_at=None)
-            rt.cameras=NS(record_state=Mock());rt.monitor_motors=Mock()
-            rt.blockers=Mock(side_effect=lambda:events.append('validate') or [])
-            rt.selected=rt.destination=None;rt.actions=NS();rt.scene=NS(held=None)
-            rt.results=[];rt.stop_event=threading.Event();rt.parked=False
-            rt.park_qualified_file=NS(exists=lambda:False);rt.report=Mock()
-            rt.last_plan=None;rt.metrics={};rt.started=time.monotonic();rt.persist=Mock()
-            with patch('wristlab.runtime.tasks.run_task',return_value=[]) as run:
-                rt.execute({'mode':'sort_colors','dry':True})
-            self.assertEqual(events[:3],['scene','encoders','validate'])
-            if read_failure:
-                run.assert_not_called()
-                self.assertIn('encoder read failed',rt.results[0]['reason'])
-            else:
-                self.assertTrue(run.call_args.kwargs['dry'])
-                rt.cameras.record_state.assert_called_once_with(state['timestamp'],state['q'],state['gripper'])
-
     def test_resumed_native_reference_preserves_all_powered_hardware_goals(self):
         recorded=json.loads((ROOT/'runtime/retreat-park-before-restart.json').read_text())
         robot=Robot('/home/jetsonnx/Projects/so101_autonomous_pick_place',ROOT/'runtime/unit')
@@ -656,73 +289,6 @@ class GeometryPolicy(unittest.TestCase):
                 robot.arm.follow([recorded['pos'],recorded['pos']],lead=False)
         native_follow.assert_not_called()
 
-    def test_supported_stop_scope_is_removed_after_a_native_fault(self):
-        recorded=json.loads((ROOT/'runtime/retreat-park-before-restart.json').read_text())
-        robot=Robot('/home/jetsonnx/Projects/so101_autonomous_pick_place',ROOT/'runtime/unit')
-        state={'positions':recorded['pos'],'motor_health':recorded['motor_health']}
-        synchronization=robot.synchronize_reference(state,3.7)
-        synchronization['supported_stop_packet_checked']=True
-        support=Mock();follow=Mock(side_effect=RuntimeError('native stopped'))
-        robot.arm=NS(raw=NS(sag=3.7,supported_stop=support),follow=follow,move_joints=Mock())
-        robot.read_motor_health=Mock(return_value=recorded['motor_health'])
-        with self.assertRaisesRegex(RuntimeError,'native stopped'):
-            with robot.synchronized_follow(synchronization):
-                robot.arm.follow([recorded['pos'],recorded['pos']],lead=False)
-        self.assertEqual(support.call_args_list[0].args,(synchronization['offset'],))
-        self.assertEqual(support.call_args_list[-1].args,(None,))
-        self.assertIs(robot.arm.follow,follow)
-        self.assertEqual(robot.arm.raw.sag,3.7)
-
-    def test_recovery_execution_cannot_clear_or_bypass_stop(self):
-        rt=Runtime.__new__(Runtime);rt.stop_event=threading.Event();rt.stop_event.set()
-        rt.cameras=NS(check=Mock());rt.robot=NS(arm=None,enable=Mock())
-        with self.assertRaisesRegex(RuntimeError,'STOP'):
-            rt.execute_invalid_start({'operator_at_stop':True})
-        rt.cameras.check.assert_not_called();rt.robot.enable.assert_not_called()
-        self.assertTrue(rt.stop_event.is_set())
-
-    def test_recovery_execution_requires_approval_for_the_checked_proposal(self):
-        rt=Runtime.__new__(Runtime);rt.stop_event=threading.Event()
-        rt.cameras=NS(check=Mock());rt.robot=NS(arm=None,enable=Mock(),read_state=Mock())
-        rt.recovery_proposal={'status':'READY_FOR_ATTENDED_CONFIRMATION','checked_at':1.}
-        with self.assertRaisesRegex(ValueError,'explicit attended approval'):
-            rt.execute_invalid_start({'operator_at_stop':True,'proposal_checked_at':2.})
-        rt.robot.read_state.assert_not_called();rt.robot.enable.assert_not_called()
-
-    def test_measured_clearance_monitor_rejects_a_confirmed_decrease(self):
-        motion=Motion.__new__(Motion)
-        motion.robot=NS(health_interval_s=0.,encoder_steps=lambda:{'q':.1},backend=NS(model=NS(gap=.008)))
-        motion.recovery_feedback_at=0.;motion.recovery_observed_lower=None
-        motion.recovery_report={'initial_gaps_with_execution_error_m':{'native: pair':.003}}
-        motion.recovery_gaps=lambda world,q:{'native: pair':.004+q['q']*.001}
-        world=NS(scene=NS(box=NS(clearance_m=.006)),recovery_numeric_resolution=1e-7)
-        motion.check_recovery_feedback({'q':0.},world)
-        motion.check_recovery_feedback({'q':0.},world)
-        motion.recovery_gaps=lambda world,q:{'native: pair':.003+q['q']*.001}
-        with self.assertRaisesRegex(RuntimeError,'measured clearance decreases'):
-            motion.check_recovery_feedback({'q':0.},world)
-
-    def test_path_checks_actual_commands_without_a_hypothetical_bias_removal(self):
-        recorded=json.loads((ROOT/'runtime/retreat-park-before-restart.json').read_text())
-        robot=Robot('/home/jetsonnx/Projects/so101_autonomous_pick_place',ROOT/'runtime/unit')
-        motion=Motion(robot,lambda:None,lambda *args:None,ROOT/'runtime/qualification.json')
-        motion.planner.command_sag=3.7;q=recorded['pos']
-        phase=Phase('release',(q,),jaw_contact=True)
-        plan=NS(target_id='released',payload_local=None,phases=(phase,))
-        world=NS(reason=Mock(side_effect=lambda pose,**policy:'camera: wall' if pose['shoulder_lift']>q['shoulder_lift']+.5 else None))
-        self.assertTrue(motion.check_path(plan,world))
-        checked=[call.args[0] for call in world.reason.call_args_list]
-        self.assertIn(q,checked)
-        self.assertIn(motion.planner._command_pose(q),checked)
-        world.reason.side_effect=lambda pose,**policy:'camera: wall' if pose==q else None
-        with self.assertRaisesRegex(ValueError,'release: pose: camera: wall'):
-            motion.check_path(plan,world)
-        command=motion.planner._command_pose(q)
-        world.reason.side_effect=lambda pose,**policy:'camera: wall' if pose==command else None
-        with self.assertRaisesRegex(ValueError,'release: native command: camera: wall'):
-            motion.check_path(plan,world)
-        self.assertIsNone(robot.arm)
-
     def test_recorded_stop_settling_is_rejected_before_path_search_or_motion(self):
         import pickle
         from wristlab.geometry import AttachmentGeometry
@@ -744,7 +310,7 @@ class GeometryPolicy(unittest.TestCase):
     def test_incomplete_exit_blocks_before_any_actuator_call(self):
         setup=action_contract();obj,rt,action,placement,plan,_=setup
         rt.motion.preflight_cycle.side_effect=ValueError('retreat: no safe Park route')
-        with patch('wristlab.actions.choose_grasp',side_effect=proposed_grasp(plan)):
+        with patch('wristlab.actions.choose_grasp',return_value=(None,plan,NS())):
             result=action.relocate(obj.id,placement)
         self.assertFalse(result.success)
         rt.motion.execute_trajectory.assert_not_called()
@@ -961,7 +527,7 @@ class GeometryPolicy(unittest.TestCase):
 
     def test_intermediate_compensated_command_cannot_cross_obstacle(self):
         motion = Motion.__new__(Motion)
-        motion.robot = NS(native_edge_samples=Robot.native_edge_samples,quantized_command=dict)
+        motion.robot = NS(native_edge_samples=Robot.native_edge_samples)
         motion.check_cancel = lambda:None
         motion.report = lambda *args:None
         motion.planner = NS(command_sag=3.7,_command_pose=lambda q:dict(q,shoulder_pan=q['shoulder_pan']+10))
@@ -1002,32 +568,6 @@ class GeometryPolicy(unittest.TestCase):
             experiments.run_sequence(['empty_box'],scene,NS(),refresh,lambda:None)
         self.assertEqual([c.kwargs['destination'] for c in run.call_args_list],['left','right'])
         self.assertGreaterEqual(refresh.call_count,3)
-
-    def test_sequence_rejects_late_invalid_stage_before_moving(self):
-        refresh = Mock()
-        with patch('wristlab.tasks.run_task') as run:
-            with self.assertRaisesRegex(ValueError,'stage 2: unsupported mode'):
-                experiments.run_sequence(['sort_colors','unknown'],NS(),NS(),refresh,lambda:None)
-        run.assert_not_called()
-        refresh.assert_not_called()
-
-    def test_sequence_preserves_explicit_relocate_selection(self):
-        with patch('wristlab.tasks.run_task',return_value=[]) as run:
-            experiments.run_sequence([{'mode':'relocate','object_id':'green','destination':'white'}],
-                                     NS(),NS(),lambda:None,lambda:None)
-        self.assertEqual(run.call_args.kwargs,{'selected':'green','destination':'white'})
-
-    def test_first_command_time_survives_guard_failure(self):
-        runtime = Runtime.__new__(Runtime)
-        runtime.robot = NS(first_command_at=None)
-        runtime.started = time.monotonic()
-        runtime.metrics = {}
-        runtime.check_cancel = Mock(side_effect=RuntimeError('STOP'))
-        for _ in range(2):
-            with self.assertRaisesRegex(RuntimeError,'STOP'):
-                runtime.tick({})
-        self.assertGreaterEqual(runtime.metrics['first_command_s'],0.)
-        self.assertEqual(runtime.metrics['first_command_s'],runtime.robot.first_command_at-runtime.started)
 
 
 if __name__=='__main__':

@@ -41,18 +41,15 @@ class RecoveryCollisionWorld(ExtractionCollisionWorld):
         points = self.backend._transform_points(frame,vertices)
         inverse = np.linalg.inv(self.scene.box.base_from_box)
         local = points@inverse[:3,:3].T+inverse[:3,3]
-        bounds_lo,bounds_hi = local.min(0),local.max(0)
         for lower,upper,label in self.scene.box.solid_parts():
-            if np.all(bounds_hi>=lower) and np.all(bounds_lo<=upper):
+            if mesh_box_overlap(parts,frame,self.scene.box.base_from_box,lower,upper):
                 minimum = self.minimums.get((name,label))
-                gap = None
-                if minimum is not None:
-                    lo,hi = self.physical[label]
-                    gap = float(np.max(np.maximum(lo-bounds_hi,bounds_lo-hi)))
-                # A separating full-mesh bound proves every triangle clear.
-                # Otherwise retain the exact native triangle/box intersection.
-                if (minimum is None or gap<minimum) and mesh_box_overlap(parts,frame,self.scene.box.base_from_box,lower,upper):
-                    return label if minimum is None else 'recovery decreases '+label
+                if minimum is None:
+                    return label
+                lo,hi = self.physical[label]
+                gap = float(np.max(np.maximum(lo-local.max(0),local.min(0)-hi)))
+                if gap<minimum:
+                    return 'recovery decreases '+label
         return None
 
 
@@ -76,7 +73,6 @@ RecoveryCollisionWorld.reason = _native_recovery_reason()
 class Motion:
     def __init__(self, robot, check_cancel, report, qualification_file):
         self.robot, self.check_cancel, self.report = robot, check_cancel, report
-        self.check_planning = check_cancel
         self.planner = TunedExtractionPlanner(robot.backend,check_cancel=check_cancel)
         self.metrics = {}
         self.planner.timings = self.metrics
@@ -95,7 +91,7 @@ class Motion:
         self.recovery_mapping = None
         self.executing_recovery = False
 
-    def prepare_ready(self, scene, geometry, attendance, dry=False, planning_check=None):
+    def prepare_ready(self, scene, geometry, attendance, dry=False):
         """Leave the folded soft-margin violation through an attended opening corridor.
 
         This does not qualify an unknown cable or enable manipulation. The human
@@ -103,9 +99,8 @@ class Motion:
         before and during the motion. Ordinary task margins remain unchanged.
         """
         from box_extract.mounted_arm import validated_segments
-        check = planning_check if dry and planning_check is not None else self.check_cancel
-        check()
-        if not dry and attendance.get('cable_and_hidden_surfaces_clear') is not True:
+        self.check_cancel()
+        if attendance.get('cable_and_hidden_surfaces_clear') is not True:
             raise ValueError('attended startup requires the operator observation')
         state = self.robot.read_state()
         if not self.robot.audit_state(state)['hard_valid']:
@@ -126,7 +121,7 @@ class Motion:
         # its corners, rather than extrapolating past the stationary start.
         import itertools
         for q in path:
-            check()
+            self.check_cancel()
             lag_deg = self.planner.tracking_error_deg
             for lift,elbow in itertools.product((max(start['shoulder_lift'],q['shoulder_lift']-lag_deg),q['shoulder_lift']),
                                                (min(start['elbow_flex'],q['elbow_flex']+lag_deg),q['elbow_flex'])):
@@ -142,9 +137,9 @@ class Motion:
                     'ordinary_margin_deg':model.margin,'ordinary_gap_m':model.gap,
                     'initial_sample_gap_m':world.initial_gap,'physical_completed':False}
         output = self.qualification_file.parent/'startup-trial.json'
+        output.write_text(json.dumps(evidence,indent=2,ensure_ascii=False))
         if dry:
             return evidence
-        output.write_text(json.dumps(evidence,indent=2,ensure_ascii=False))
         self.startup_world = world
         self.report('moving','attended_prepare_ready: coordinated shoulder/elbow opening; wrist held')
         try:
@@ -171,138 +166,6 @@ class Motion:
     def qualification_reasons(self, geometry):
         return [item['reason'] for item in self.qualification_blockers(geometry)]
 
-    def stationary_world(self, scene):
-        """Current collision world with all measured objects stationary."""
-        from types import SimpleNamespace
-        from .scene import BoxUnion
-        from so101_pick_place.experiments.box_extraction.scene import ExtractionScene
-        with scene.lock:
-            state = scene.state
-            if not state.evidence.get('coverage_verified') or state.obstacles:
-                raise ValueError('stationary scene coverage is not confirmed')
-            boxes = [box.evidence['native_box'] for box in state.boxes.values()
-                     if box.evidence.get('metric_qualified') or box.evidence.get('collision_qualified')]
-            if not boxes or len(boxes)!=len(state.boxes):
-                raise ValueError('stationary world requires collision geometry for every visible box')
-            cubes = {key:scene.native_object(key) for key in state.objects}
-            table = SimpleNamespace(height_m=float(self.robot.backend.model.table_z),uncertainty_m=0.)
-            native = ExtractionScene(str(state.version),state.timestamp,BoxUnion(boxes[0],boxes),cubes,table,(),True)
-        return self.make_world(native)
-
-    def overview_clear_path(self, scene, geometry, check):
-        """Select the shortest checked base rotation that exposes an occluded cube."""
-        from box_extract.scene_builder import robot_mask
-        state = self.robot.read_state()
-        start = state['positions']
-        if not self.robot.audit_state(state)['planning_valid'] or not self.robot.arm.torque:
-            raise ValueError('a powered ordinary working pose is required for a new view')
-        if state['loads']['gripper'] or state['currents']['gripper']:
-            raise ValueError('view change requires an empty gripper')
-        mapping = self.robot.synchronize_reference(state,self.robot.arm.raw.sag)
-        if not mapping['supported_stop_packet_checked']:
-            raise ValueError('preservation of the last checked holding goals was not confirmed')
-        model = self.robot.backend.model
-        frame = scene.frames['overview']
-        world = StartupWorld(self.robot,scene,geometry,start,start,self.attachment_path,strict=True)
-        if not world.partial_cubes:
-            check()
-            self.robot.read_state()
-            blockers = self.qualification_reasons(geometry)
-            if blockers:
-                raise ValueError('powered entry: '+'; '.join(blockers))
-            world.metric_world = self.stationary_world(scene)
-            return self.powered_entry_path(world,mapping,check)
-        visible = np.zeros(frame.image.shape[:2],np.uint8)
-        for _,_,_,rectangle in world.partial_cubes:
-            cv2.fillConvexPoly(visible,rectangle,255)
-        limits = model.ranges[0][0]+model.margin,model.ranges[0][1]-model.margin
-        pan = 'shoulder_pan'
-        candidates = sorted((q for limit in limits for q in self.robot.native_edge_samples(start,dict(start,**{pan:limit}))
-                             if q[pan]!=start[pan]),key=lambda q:abs(q[pan]-start[pan]))
-        first_refusal = None
-        rejected = set()
-        for goal in candidates:
-            check()
-            # Require the whole visible fragment, not just its centre, to be
-            # clear in the prospective image. The new frame must then localize it.
-            side = np.sign(goal[pan]-start[pan])
-            occlusion = robot_mask(self.robot.backend,goal,geometry.calibration,visible.shape) if side not in rejected else visible
-            if not np.any((occlusion>0)&(visible>0)):
-                world.goal = goal
-                world.cache.clear()
-                world.partial_clearance = {}
-                path = tuple(self.robot.native_edge_samples(start,goal))
-                self.recovery_mapping = mapping
-                holding = mapping['hardware_goals']
-                world.command_bounds = holding,self.robot.synchronized_command(goal,mapping)
-                reason = None
-                for q in path:
-                    check()
-                    for sample in self.recovery_envelope(start,q,holding):
-                        reason = world.reason(sample)
-                        if reason:
-                            break
-                    command = self.robot.synchronized_command(q,mapping)
-                    if not reason:
-                        reason = world.reason(command,command=True)
-                    if reason:
-                        break
-                if not reason:
-                    return path,world,mapping
-                first_refusal = first_refusal or reason
-                # A farther rotation on this side contains the same failed edge.
-                rejected.add(side)
-                if len(rejected)==2:
-                    break
-        raise ValueError('no checked overview change: '+str(first_refusal or 'cube remains occluded'))
-
-    def powered_entry_path(self, world, mapping, check):
-        """Move an empty tool away from a limit before taking up native compensation."""
-        start,hold = world.start,mapping['hardware_goals']
-        model = self.robot.backend.model
-        steps = self.robot.encoder_steps()
-        sag = mapping['sag']
-        native = lambda q:self.robot.quantized_command(self.robot.backend.driver_command_goal(q,sag))
-        nominal = native(start)
-        stopped = self.robot.quantized_command(start)
-        goal = dict(start)
-        from so101_pick_place.kinematics.so101_backend import ARM_JOINTS
-        for name,(low,high) in zip(ARM_JOINTS,model.ranges):
-            # A move is required only when the actual hold, ordinary goal,
-            # or factory STOP would consume the existing working margin.
-            excursions = [0.,nominal[name]-hold[name],stopped[name]-hold[name],stopped[name]-nominal[name]]
-            reserve = self.planner.tracking_error_deg+steps[name]
-            lower = low+model.margin-min(excursions)+reserve
-            upper = high-model.margin-max(excursions)-reserve
-            if lower>upper:
-                raise ValueError(name+': insufficient range for the measured holding transition')
-            goal[name] = float(np.clip(start[name],lower,upper))
-        if goal==start:
-            raise ValueError('all cubes visible and no powered entry adjustment is required')
-        world.goal = goal
-        self.recovery_mapping = mapping
-        command = self.robot.quantized_command(self.robot.synchronized_command(goal,mapping))
-        world.command_bounds = hold,command
-        path = tuple(self.robot.native_edge_samples(start,goal))
-        for q in path:
-            check()
-            for sample in self.recovery_envelope(start,q,hold):
-                reason = world.reason(sample)
-                if reason:
-                    raise ValueError('powered entry tracking envelope: '+reason)
-            reason = world.reason(self.robot.synchronized_command(q,mapping),command=True)
-            if reason:
-                raise ValueError('powered entry command: '+reason)
-        for q in self.recovery_envelope(start,goal,hold,settled=True):
-            normal = native(q)
-            frozen = self.robot.quantized_command(q)
-            for goals,reference in ((normal,command),(frozen,command),(frozen,normal)):
-                response = {j:q[j]+goals[j]-reference[j] for j in q}
-                reason = world.reason(response)
-                if reason:
-                    raise ValueError('powered entry endpoint transition: '+reason)
-        return path,world,mapping
-
     def qualification_blockers(self, geometry):
         blockers = []
         def add(code,category,reason,condition):
@@ -321,8 +184,7 @@ class Motion:
             if audit['zero_gap_sample_contact']:
                 add('MODEL_CONTACT','GEOMETRY',audit['zero_gap_sample_contact'],'подтверждено отсутствие контакта всей руки; нулевой порог не обходить')
             if audit['hard_valid'] and not audit['planning_valid']:
-                released = (any(m['torque_enabled'] for m in state.get('motor_health',{}).values()) and
-                            (self.qualification_file.parent/'released-placement.pkl').exists())
+                released = (self.qualification_file.parent/'released-placement.pkl').exists()
                 add('RETREAT_CLEARANCE' if released else 'STARTUP_PREPARATION','GEOMETRY' if released else 'STARTUP',
                     'после release фактическая поза не проходит рабочий запас; требуется проверенный выход пустого захвата' if released else
                     'штатная стартовая поза требует prepare_ready до применения рабочих запасов 5°/8 мм; это не отказ калибровки суставов',
@@ -414,16 +276,8 @@ class Motion:
         world.recovery_walls = walls
         world.recovery_link_walls = link_walls
         world.physical_walls = physical
-        # Native BVH coordinates are float32 even though FK frames are double.
-        # Bound two homogeneous dot products and their subtraction (gamma_n),
-        # rather than comparing their results with an exact equality.
-        scale = max(float(np.max(np.abs(frame[:3,:3])@np.abs(self.robot.backend.meshes[name]).T+
-                                  np.abs(frame[:3,3,None])))
-                    for name,frame in frames.items() if name in self.robot.backend.meshes)
-        operations = 2*(2*next(iter(frames.values())).shape[0]-1)+1
-        unit = np.finfo(np.float32).eps/2
-        world.recovery_numeric_resolution = float(operations*unit/(1-operations*unit)*scale)
-        world.empty_recovery = True
+        scale = max(float(np.abs(frame[:3,3]).max()) for frame in frames.values())
+        world.recovery_numeric_resolution = float(abs(np.spacing(np.float32(scale))))
         return world
 
     def recovery_gaps(self, world, joints):
@@ -441,17 +295,6 @@ class Motion:
             points = self.robot.backend._transform_points(frames[part[1]],part[4])@inverse[:3,:3].T+inverse[:3,3]
             result[name+': '+label] = float(np.max(np.maximum(bound['lower']-points.max(0),points.min(0)-bound['upper'])))
         return result
-
-    def install_recovery_bounds(self, world, lower):
-        comparison = {key:max(0.,value-world.recovery_numeric_resolution) for key,value in lower.items()}
-        for key in world.recovery_native_minimums:
-            world.recovery_native_minimums[key] = comparison['native: '+key]
-        for key in world.recovery_link_walls:
-            world.recovery_link_walls[key] = comparison[key[0]+': '+key[1]]
-        for key,bound in world.recovery_walls.items():
-            bound['minimum'] = comparison[key[0]+': '+key[1]]
-        world.native_checks.backend.model.minimums = world.recovery_native_minimums
-        world.cache.clear()
 
     def recovery_envelope(self, start, joints, holding_goals, settled=False):
         import itertools,inspect,re
@@ -493,20 +336,6 @@ class Motion:
             previous = capped
         return minima
 
-    def recovery_candidate_is_valid(self, world, start, joints, holding, policy):
-        # Reject the established failure cheaply before native mesh search:
-        # a stopped compensated target may not cross the fixed finger plane.
-        placed = policy['placed_cube']
-        for sample in self.recovery_envelope(start,joints,holding):
-            for q in (sample,):
-                if self.planner._fixed_jaw_clearance(q,placed)<0.:
-                    frame = self.robot.backend.model.frames(q)['gripper_link']
-                    points = self.robot.backend._transform_points(frame,self.robot.backend.meshes['gripper_link'])
-                    if np.all(points.max(0)>=placed.vertices_m.min(0)) and np.all(points.min(0)<=placed.vertices_m.max(0)):
-                        return False
-        return world.reason(joints,**policy) is None and world.reason(
-            self.robot.synchronized_command(joints,self.recovery_mapping),**policy) is None
-
     def plan_invalid_start(self, native_scene, state, placed, planning_cancel):
         """Calculate a finite native recovery; no actuation and no STOP reset."""
         import inspect,re
@@ -541,14 +370,7 @@ class Motion:
         self.recovery_report.update(native_stop_raw_goals=stop_goals,
             measured_hold_deflection=settling,stop_settling_scenario=stop_pose,stop_settling_gaps_m=stop_gaps)
         contact = next((key for key,value in stop_gaps.items() if value<=0.),None)
-        supported = self.recovery_mapping.get('supported_stop_packet_checked') is True
-        if supported:
-            self.recovery_report.update(stop_policy='last_checked_hardware_goals',
-                default_freeze_rejected=contact is not None,
-                supported_stop_goals=self.recovery_mapping['supported_stop_goals'],
-                stop_response_model='trajectory aborted; last checked targets retained; settling enclosed by native tracking and command-response envelope',
-                physical_supported_stop_tested=False)
-        if contact and not supported:
+        if contact:
             self.recovery_report.update(status='BLOCKED',code='STOP_SETTLING_CLEARANCE',pair=contact,
                 reason='native STOP rewrites goals to encoders; observed hold deflection reaches '+contact)
             raise ValueError('RECOVERY_FROM_INVALID_START: '+self.recovery_report['reason'])
@@ -559,10 +381,15 @@ class Motion:
             lower = {key:min(lower[key],values[key]) for key in lower}
         if any(value<=0. for value in lower.values()):
             raise ValueError('initial execution uncertainty reaches physical contact: '+str(lower))
-        # Keep the physical bounds; account for native float32 arithmetic only.
-        self.install_recovery_bounds(world,lower)
+        for key in world.recovery_native_minimums:
+            world.recovery_native_minimums[key] = lower['native: '+key]
+        for key in world.recovery_link_walls:
+            world.recovery_link_walls[key] = lower[key[0]+': '+key[1]]
+        for key,bound in world.recovery_walls.items():
+            bound['minimum'] = lower[key[0]+': '+key[1]]
+        world.native_checks.backend.model.minimums = world.recovery_native_minimums
+        world.cache.clear()
         self.recovery_report['initial_gaps_with_execution_error_m'] = lower
-        self.recovery_report['floating_point_resolution_m'] = world.recovery_numeric_resolution
         for sample in initial_states:
             planning_cancel()
             refusal = world.reason(sample,**policy)
@@ -575,70 +402,30 @@ class Motion:
                 raise ValueError('RECOVERY_FROM_INVALID_START: initial native command response: '+refusal)
         source = inspect.getsource(ExistingArmDriver._move)
         arrival = float(re.search(r'follow\(poses,.*?within=([\d.]+)',source,re.S).group(1))
-        previous_cancel = self.planner.check_cancel
-        previous_check = self.check_cancel
-        previous_command = self.planner._command_pose
-        self.planner.check_cancel = planning_cancel
-        self.check_cancel = planning_cancel
-        failures = []
-        selected = None
+        # Reuse native vertical IK, with the lift computed from the measured
+        # rim and the lowest finger mesh vertex. There is no recovery planner.
+        frames = self.robot.backend.model.frames(start)
+        frame = frames['gripper_frame_link']
+        vertices = np.concatenate([part.triangles.reshape(-1,3)
+                                   for part in world.collision_meshes['gripper_link']])
+        points = self.robot.backend._transform_points(frames['gripper_link'],vertices)
+        lowest = points[np.argmin(points[:,2])]
+        center_local = (lowest-frame[:3,3])@frame[:3,:3]
+        rim = float((native_scene.box.base_from_box@np.r_[0.,0.,native_scene.box.obstacle_top_m,1.])[2])
+        rise = max(0.,rim+self.robot.backend.model.gap-lowest[2])
         try:
-            for label,goal,indices,limits in self.recovery_goals(start,world,normal,policy):
-                if selected is None:
-                    self.report('checking','recovery '+label)
-                    try:
-                        from so101_pick_place.experiments.box_extraction.search import rrt_connect
-                        names = tuple(start)
-                        def expand(values):
-                            q = dict(start)
-                            q.update({names[index]:float(value) for index,value in zip(indices,values)})
-                            return q
-                        route = rrt_connect([start[names[i]] for i in indices],
-                            [goal[names[i]] for i in indices],limits,
-                            lambda values:self.recovery_candidate_is_valid(world,start,expand(values),holding,policy),
-                            check_cancel=planning_cancel)
-                        points = tuple(expand(values) for values in route.points)
-                        minima = self.validate_recovery_envelope(world,start,points,holding,policy,planning_cancel)
-                        for sample in self.recovery_envelope(start,points[-1],holding,settled=True):
-                            refusal = normal.reason(sample,**policy)
-                            if refusal:
-                                raise ValueError('ordinary endpoint envelope: '+refusal)
-                        for q in points:
-                            reference = self.robot.control_reference(q,self.recovery_mapping)
-                            command = self.robot.synchronized_command(q,self.recovery_mapping)
-                            if self.robot.quantized_command(reference)==self.robot.quantized_command(command):
-                                raise ValueError('normal packet is not distinguishable from an uncompensated stop')
-                            refusal = world.reason(command,**policy)
-                            if refusal:
-                                raise ValueError('native compensated command: '+refusal)
-                        selected = points,minima
-                        self.recovery_report.update(route_family=label,rrt_iterations=route.trace['iterations'])
-                    except ValueError as exc:
-                        failures.append(label+': '+str(exc))
-                        self.recovery_report['candidate_failures'] = list(failures)
-                        self.report('rejected',failures[-1])
-                if selected is not None:
-                    break
-            if selected is None:
-                raise ValueError('; '.join(failures) or 'no goal outside the measured box is reachable')
-            points,minima = selected
-            self.planner._command_pose = lambda q:self.robot.synchronized_command(q,self.recovery_mapping)
-            previous = ExtractionPlan(native_scene.revision,target,(Phase('retract',points,placed_cube=placed),),
-                                      np.empty((0,3)),placed.center_m,())
-            self.report('checking','recovery Park from the calculated retreat endpoint')
-            park = self.plan_park(points[-1],previous,normal,recovery=True)
-            park_minima = self.validate_recovery_envelope(world,start,park.joints,holding,policy,planning_cancel)
-            minima = {key:min(minima[key],park_minima[key]) for key in minima}
+            points = tuple(self.planner.vertical_center(start,rise,center_local,world,**policy))
+            minima = self.validate_recovery_envelope(world,start,points,holding,policy,planning_cancel)
+            for sample in self.recovery_envelope(start,points[-1],holding,settled=True):
+                planning_cancel()
+                refusal = normal.reason(sample,**policy)
+                if refusal:
+                    raise ValueError('ordinary endpoint envelope: '+refusal)
         except ValueError as exc:
             self.recovery_report.update(status='BLOCKED',reason=str(exc))
             raise ValueError('RECOVERY_FROM_INVALID_START: '+str(exc)) from exc
-        finally:
-            self.planner.check_cancel = previous_cancel
-            self.check_cancel = previous_check
-            self.planner._command_pose = previous_command
         phase = Phase('RECOVERY_FROM_INVALID_START',points,jaw_contact=True,placed_cube=placed)
         report = self.recovery_report|{'goal':points[-1],'minimum_gaps_with_execution_error_m':minima,
-            'joint_path':points,'park_path':park.joints,'park_goal':park.joints[-1],
             'ordinary_native_gap_m':self.robot.backend.model.gap,
             'ordinary_wall_gap_m':native_scene.box.clearance_m,'encoder_steps':self.robot.encoder_steps(),
             'tracking_error_deg':self.planner.tracking_error_deg,'native_arrival_tolerance_deg':arrival,
@@ -647,96 +434,17 @@ class Motion:
         self.recovery_report = report
         return phase,world,normal,report
 
-    def recovery_goals(self, start, world, normal, policy):
-        """Derive lift goals from FK; use the existing native joint-space search."""
-        model = self.robot.backend.model
-        names = tuple(start)
-        steps = self.robot.encoder_steps()
-        rim = float((world.scene.box.base_from_box@np.r_[0.,0.,world.scene.box.obstacle_top_m,1.])[2])
-        def lowest(q):
-            frames = model.frames(q)
-            heights = [self.robot.backend._transform_points(frames[link],self.robot.backend.meshes[link])[:,2].min()
-                       for link in ('gripper_link','moving_jaw_so101_v1_link')]
-            heights.extend(self.robot.backend._transform_points(frames[parent],vertices)[:,2].min()
-                           for name,parent,lo,hi,vertices in world.attachment.parts)
-            return float(min(heights))
-        initial_height = lowest(start)
-        gradient = {}
-        for index in (1,2,3):
-            name = names[index]
-            gradient[index] = (lowest(dict(start,**{name:start[name]+steps[name]}))-initial_height)/steps[name]
-        cube = policy['placed_cube']
-        pan = names[0]
-        probe = dict(start,**{pan:start[pan]+steps[pan]})
-        outward = np.sign(self.planner._fixed_jaw_clearance(probe,cube)-self.planner._fixed_jaw_clearance(start,cube))
-        pan_range = (start[pan],model.ranges[0][1]-model.margin) if outward>=0 else (model.ranges[0][0]+model.margin,start[pan])
-        for label,axes in (('coordinated shoulder/elbow',(1,2)),('shoulder lift',(1,)),('elbow lift',(2,)),('wrist-assisted lift',(1,2,3))):
-            direction = {index:gradient[index] for index in axes}
-            peak = max(abs(value) for value in direction.values())
-            if peak>np.finfo(float).eps:
-                direction = {index:value/peak for index,value in direction.items()}
-                spans = [(model.ranges[index][1]-model.margin-start[names[index]])/value if value>0 else
-                         (model.ranges[index][0]+model.margin-start[names[index]])/value
-                         for index,value in direction.items() if value!=0.]
-                limit = min(spans)
-                far = dict(start,**{names[index]:start[names[index]]+value*limit for index,value in direction.items()})
-                goal = None
-                for q in self.robot.native_edge_samples(start,far):
-                    self.planner.check_cancel()
-                    if lowest(q)>=rim+model.gap and normal.reason(q,**policy) is None:
-                        reserve = self.planner.tracking_error_deg+max(steps[names[index]] for index in axes)
-                        candidate = dict(q,**{names[index]:q[names[index]]+value*reserve for index,value in direction.items()})
-                        if normal.reason(candidate,**policy) is None:
-                            goal = candidate
-                        break
-                if goal is not None:
-                    indices = (0,*axes)
-                    bounds = [pan_range]+[(min(start[names[index]],goal[names[index]]),max(start[names[index]],goal[names[index]])) for index in axes]
-                    if 3 in axes:
-                        bounds = [pan_range]+[(model.ranges[index][0]+model.margin,model.ranges[index][1]-model.margin) for index in axes]
-                    if all(lo<hi for lo,hi in bounds):
-                        yield label,goal,indices,np.asarray(bounds)
-
     def state_is_valid(self, q, phase, plan, world):
         return world.reason(q,target=plan.target_id,jaw_contact=phase.jaw_contact,
             payload_local=plan.payload_local if phase.carrying else None,support_contact=phase.support_contact,
             placed_cube=phase.placed_cube)
 
-    def check_entry_transition(self, plan, world, planned_start):
-        """Check the response to taking over the actual powered motor goals."""
-        self.check_cancel()
-        state = self.robot.read_state()
-        health = self.robot.read_motor_health(force=True)
-        actual = state['positions']
-        if actual!=planned_start:
-            raise ValueError('encoders changed during planning; replan from fresh feedback')
-        if (time.time()-state['timestamp']>.5 or health.keys()!=actual.keys() or
-            any(not m['torque_enabled'] or m['status_raw'] or m['moving'] for m in health.values())):
-            raise ValueError('first command requires fresh, stationary, fault-free powered feedback')
-        phase = plan.phases[0]
-        if not phase.joints or phase.joints[0]!=planned_start or phase.carrying or phase.jaw_contact:
-            raise ValueError('first phase does not start with the empty tool at the measured pose')
-        opening = phase.joints if phase.name=='open' else phase.joints[:1]
-        if phase.name=='open' and any(q[j]!=actual[j] for q in opening for j in actual if j!='gripper'):
-            raise ValueError('jaw opening must start with a stationary arm')
-        previous = actual
-        for q in opening:
-            command = self.robot.quantized_command(self.planner._command_pose(q))
-            response = {j:actual[j]+command[j]-health[j]['goal'] for j in actual}
-            for sample in self.robot.native_edge_samples(previous,response):
-                self.check_cancel()
-                reason = self.state_is_valid(sample,phase,plan,world)
-                if reason:
-                    change = ', '.join(f'{j} {response[j]-actual[j]:+.2f}°' for j in actual if j!='gripper' and response[j]!=actual[j])
-                    raise ValueError(f'{phase.name}: native holding transition: {reason}; predicted joint changes: {change}')
-            previous = response
-
     def edge_is_valid(self, start, goal, phase, plan, world):
         if self.planner.command_sag is None:
             raise ValueError('native gravity-compensation setting has not been read')
         for q in self.robot.native_edge_samples(start,goal):
-            getattr(self,'check_planning',self.check_cancel)()
-            command = self.robot.synchronized_command(q,self.recovery_mapping) if phase.name.startswith('RECOVERY_') else self.planner._command_pose(q)
+            self.check_cancel()
+            command = self.robot.synchronized_command(q,self.recovery_mapping) if phase.name=='RECOVERY_FROM_INVALID_START' else self.planner._command_pose(q)
             for kind,pose in (('pose',q),('native command',command)):
                 reason = self.state_is_valid(pose,phase,plan,world)
                 intended = reason in {'gripper_link: cube '+plan.target_id,'moving_jaw_so101_v1_link: cube '+plan.target_id}
@@ -752,10 +460,6 @@ class Motion:
                     return kind+': '+reason
         return None
 
-    def check_pick_phase(self, phase, payload, target, world):
-        plan = ExtractionPlan(world.scene.revision,target,(phase,),payload,None,())
-        self.check_path(plan,world)
-
     def check_path(self, plan, world):
         for phase in plan.phases:
             self.report('checking',phase.name)
@@ -768,7 +472,7 @@ class Motion:
                     reason = self.edge_is_valid(start,goal,phase,plan,world)
                     if reason:
                         raise ValueError(f'{phase.name}: {reason}')
-                if phase.name in ('retract','safe_park','RECOVERY_PARK'):
+                if phase.name in ('retract','safe_park'):
                     for lag in self.planner._lagging_poses(phase.joints):
                         self.check_cancel()
                         for pose in (lag,self.planner._command_pose(lag)):
@@ -796,7 +500,7 @@ class Motion:
     def plan_direct_transfer(self, start, goal, world, **policy):
         return self.planner.transport(start,goal,world,**policy)
 
-    def plan_park(self, start, previous, world, recovery=False):
+    def plan_park(self, start, previous, world):
         """Select a low-load recorded working pose; verify its current transition."""
         placed = next((p.placed_cube for p in reversed(previous.phases) if p.placed_cube is not None),None)
         policy = {'target':previous.target_id,'placed_cube':placed}
@@ -814,9 +518,9 @@ class Motion:
         def cost(q):
             torque = np.asarray(self.robot.backend.model.pose(q).torque)[1:3]
             return float(torque@torque),float(np.linalg.norm(self.robot.from_native(q)-self.robot.from_native(start)))
-        if not candidates and recovery:
+        if not candidates:
             raise ValueError('Park: no physically checked waiting configuration is recorded')
-        if candidates and cost(start)[0]<=min(cost(q)[0] for q in candidates):
+        if cost(start)[0]<=min(cost(q)[0] for q in candidates):
             candidates.append(start)
         failures = []
         for goal in sorted(candidates,key=cost):
@@ -826,41 +530,11 @@ class Motion:
             else:
                 try:
                     path,_ = self.planner.transport(start,goal,world,**policy)
-                    phase = Phase('RECOVERY_PARK' if recovery else 'safe_park',path,placed_cube=placed)
+                    phase = Phase('safe_park',path,placed_cube=placed)
                     self.check_path(replace(previous,phases=(phase,)),world)
                     return phase
                 except ValueError as exc:
                     failures.append(str(exc))
-        if not recovery:
-            model = self.robot.backend.model
-            from scipy.optimize import minimize
-            paths = []
-            for axes in ((1,2),(1,),(2,)):
-                names = tuple(('shoulder_lift','elbow_flex')[axis-1] for axis in axes)
-                def pose(values):
-                    return dict(start,**dict(zip(names,map(float,values))))
-                bounds = [(model.ranges[i][0]+model.margin,model.ranges[i][1]-model.margin) for i in axes]
-                fit = minimize(lambda values:cost(pose(values))[0],[start[j] for j in names],bounds=bounds)
-                if fit.success and cost(pose(fit.x))[0]<cost(start)[0]:
-                    path = []
-                    for q in self.robot.native_edge_samples(start,pose(fit.x)):
-                        getattr(self,'check_planning',self.check_cancel)()
-                        reason = next((r for p in (q,self.planner._command_pose(q))
-                                       if (r:=world.reason(p,**policy)) is not None),None)
-                        if reason:
-                            break
-                        path.append(q)
-                    if len(path)>1 and cost(path[-1])[0]<cost(start)[0]:
-                        paths.append(path)
-            for path in sorted(paths,key=lambda p:cost(p[-1])):
-                while len(path)>1 and cost(path[-1])[0]<cost(start)[0]:
-                    phase = Phase('safe_park',tuple(path),placed_cube=placed)
-                    try:
-                        self.check_path(replace(previous,phases=(phase,)),world)
-                        return phase
-                    except ValueError as exc:
-                        failures.append(str(exc))
-                        path = path[:len(path)//2]
         raise ValueError('no safe low-load Park transition: '+'; '.join(failures[-3:]))
 
     def park_arm(self, previous, world, phase=None):
@@ -945,17 +619,13 @@ class Motion:
         begin = time.perf_counter()
         try:
             world.release_origin = self.robot.arm.read()[0] if phase.name=='retract' and phase.placed_cube is not None else None
-            if phase.name.startswith('RECOVERY_'):
-                if self.recovery_mapping.get('supported_stop_packet_checked') is not True:
-                    raise RuntimeError('recovery requires a checked load-supported STOP packet')
+            if phase.name=='RECOVERY_FROM_INVALID_START':
                 import copy
                 original = self.driver.backend
                 backend = copy.copy(original)
                 backend.driver_command_goal = lambda q,sag:self.robot.synchronized_command(q,self.recovery_mapping)
                 self.driver.backend = backend
                 self.executing_recovery = True
-                self.recovery_feedback_at = 0.
-                self.recovery_observed_lower = None
                 try:
                     with self.robot.synchronized_follow(self.recovery_mapping):
                         self.driver.move_phase(phase,plan,world,self.check_cancel)
@@ -985,11 +655,9 @@ class Motion:
         if self.executing_recovery:
             record = dict(record,goal=self.robot.control_reference(record['goal'],self.recovery_mapping,inverse=True))
         if self.startup_world is not None:
-            command = (self.robot.synchronized_command(record['goal'],self.recovery_mapping) if self.executing_recovery else
-                       self.robot.backend.driver_command_goal(record['goal'],self.robot.arm.raw.sag))
             for kind,q in (('goal',record['goal']),('pos',record['pos']),
-                           ('command',command)):
-                reason = self.startup_world.reason(q,command=kind=='command')
+                           ('command',self.robot.backend.driver_command_goal(record['goal'],self.robot.arm.raw.sag))):
+                reason = self.startup_world.reason(q)
                 if reason:
                     raise RuntimeError('startup '+kind+': '+reason)
             return
@@ -1015,27 +683,6 @@ class Motion:
                 raise RuntimeError('release separation command: '+reason) from exc
             self.driver.previous['command'] = command
         self.release_phase,self.release_previous = phase,dict(record['goal'])
-        if self.executing_recovery and hasattr(self.driver.world,'recovery_native_minimums'):
-            self.check_recovery_feedback(record['pos'],self.driver.world)
-
-    def check_recovery_feedback(self, joints, world):
-        """Stop if measured, encoder-bounded deficient clearances worsen."""
-        import itertools
-        if time.monotonic()-self.recovery_feedback_at<self.robot.health_interval_s:
-            return
-        steps = self.robot.encoder_steps()
-        names = tuple(joints)
-        limits = [(joints[j]-steps[j]/2,joints[j]+steps[j]/2) for j in names]
-        samples = [self.recovery_gaps(world,dict(zip(names,values))) for values in itertools.product(*limits)]
-        low = {key:min(s[key] for s in samples) for key in samples[0]}
-        high = {key:max(s[key] for s in samples) for key in samples[0]}
-        previous = self.recovery_observed_lower or self.recovery_report['initial_gaps_with_execution_error_m']
-        for key,value in previous.items():
-            if high[key]<value-world.recovery_numeric_resolution:
-                raise RuntimeError('recovery measured clearance decreases: '+key)
-        self.recovery_observed_lower = {key:max(previous[key],min(value,
-            self.robot.backend.model.gap if key.startswith('native: ') else world.scene.box.clearance_m)) for key,value in low.items()}
-        self.recovery_feedback_at = time.monotonic()
 
     def separating_release(self,goal,previous,phase):
         if phase is None or phase.name!='retract' or phase.placed_cube is None or phase.carrying:
@@ -1056,7 +703,6 @@ class Motion:
         if not outward or any(p.carrying or p.jaw_contact for p in outward):
             raise ValueError('contact-free trial must contain only clear approach phases')
         self.check_path(replace(plan,phases=outward),world)
-        self.check_entry_transition(plan,world,start)
         world.cache_enabled = False
         world.cache.clear()
         self.driver.phase,self.driver.plan,self.driver.world = outward[0],plan,world
@@ -1172,12 +818,11 @@ class Motion:
 
 class StartupWorld:
     """Checked, pose-bounded exit; never used as a manipulation collision world."""
-    def __init__(self,robot,scene,geometry,start,goal,profile_path,strict=False):
+    def __init__(self,robot,scene,geometry,start,goal,profile_path):
         from scipy.spatial import ConvexHull
         from .diagnostics import minimum_clearance
         from so101_pick_place.experiments.box_extraction.mesh_collision import load_collision_meshes
         self.robot,self.geometry = robot,geometry
-        self.strict = strict
         self.initial_gap = minimum_clearance(robot.backend.model,start)
         self.start,self.goal = dict(start),dict(goal)
         self.meshes = load_collision_meshes(str(robot.root/'vendor/SO101/so101_new_calib.urdf'))
@@ -1193,74 +838,30 @@ class StartupWorld:
         for obj in scene.state.objects.values():
             self.mask[obj.mask>0] = 255
         self.mask = cv2.dilate(self.mask,np.ones((25,25),np.uint8))
-        self.partial_cubes = self.bound_partial_cubes(scene,geometry)
-        self.partial_clearance = {}
-        self.command_bounds = None
         self.cache = {}
-        self.metric_world = None
 
-    @staticmethod
-    def bound_partial_cubes(scene,geometry):
-        """Bound an occluded known-size tabletop cube without guessing its centre."""
-        from .vision import color_masks
-        from box_extract.scene_builder import SceneParameters
-        frame = scene.frames['overview']
-        masks = color_masks(frame.image)
-        bounds = []
-        side = float(geometry.known_cube['cube_size_m'])
-        table = geometry.table_z
-        limits = SceneParameters()
-        for color in sorted({o.get('color','unknown') for o in scene.state.obstacles}):
-            if color not in masks:
-                raise ValueError('unclassified obstacle in the observed workspace')
-            contours,_ = cv2.findContours(masks[color],cv2.RETR_EXTERNAL,cv2.CHAIN_APPROX_SIMPLE)
-            def in_workspace(contour):
-                center = np.mean(contour.reshape(-1,2),axis=0)
-                point = geometry.intersect_ray_with_plane(geometry.pixel_ray_in_base(center,frame),([0,0,1],-table))
-                return point[0]>=limits.workspace_min_x_m and np.linalg.norm(point[:2])<=limits.workspace_max_radius_m
-            contours = [c for c in contours if cv2.contourArea(c)>450. and in_workspace(c)]
-            if len(contours)!=1 or any(o.color==color for o in scene.state.objects.values()):
-                raise ValueError(color+': no unique overview fragment to bound the occluded cube')
-            pixels = cv2.convexHull(contours[0]).reshape(-1,2)
-            # Box-contained fragments cannot use the tabletop height. Boxes
-            # are already opaque keepouts, but do not silently infer a cube pose.
-            if any(cv2.pointPolygonTest(np.float32(b.evidence['polygon']),tuple(map(float,p)),False)>=0
-                   for b in scene.state.boxes.values() for p in pixels):
-                raise ValueError(color+': fragment may be supported by a box')
-            points = np.array([[geometry.intersect_ray_with_plane(geometry.pixel_ray_in_base(p,frame),([0,0,1],-z))
-                               for z in (table,table+side)] for p in pixels])
-            diameter = np.sqrt(2.)*side
-            lo = np.r_[points.min(1).max(0)[:2]-diameter,table]
-            hi = np.r_[points.max(1).min(0)[:2]+diameter,table+side]
-            x,y,w,h = cv2.boundingRect(contours[0])
-            bounds.append((color,lo,hi,np.int32([[x,y],[x+w,y],[x+w,y+h],[x,y+h]])))
-        return bounds
-
-    def reason(self,q,command=False,**policy):
-        key = (command,)+tuple(q[j] for j in self.start)
+    def reason(self,q,**policy):
+        key = tuple(q[j] for j in self.start)
         if key not in self.cache:
             if len(self.cache)>8192:
                 self.cache.clear()
-            self.cache[key] = self._reason(q,command)
+            self.cache[key] = self._reason(q)
         return self.cache[key]
 
-    def _reason(self,q,command):
+    def _reason(self,q):
         from so101_pick_place.experiments.box_extraction.mesh_collision import mesh_box_overlap
         robot,model = self.robot,self.robot.backend.model
-        start,goal = self.command_bounds if command and self.command_bounds is not None else (self.start,self.goal)
         for name,value in q.items():
-            low,high = sorted((start[name],goal[name]))
+            low,high = sorted((self.start[name],self.goal[name]))
             # Native sag can move the elbow inwards; no outward range override.
             allowance = 2. if name=='elbow_flex' else .8
             if not low-allowance<=value<=high+.8:
                 return name+': outside bounded startup corridor'
-        if self.metric_world is not None:
-            return self.metric_world.reason(q)
         pose = model.pose(q)
-        problems = model.problems(pose) if self.strict else model.problems(pose,margin=0.)
+        problems = model.problems(pose,margin=0.)
         if problems:
             return 'hard constraints: '+str(problems)
-        collision = model.collides(pose) if self.strict else model.collides(pose,gap=max(0.,self.initial_gap-.0002))
+        collision = model.collides(pose,gap=max(0.,self.initial_gap-.0002))
         if collision:
             return 'startup closes existing sampled separation: '+collision
         frames = model.frames(q)
@@ -1280,24 +881,13 @@ class StartupWorld:
             frames[part['name']] = parent
         for name,local in bodies.items():
             points = robot.backend._transform_points(frames[name],local)
-            lo,hi = points.min(0),points.max(0)
-            if name not in ('base_link','shoulder_link') and lo[2]<model.table_z+(model.gap if self.strict else .004):
+            if name not in ('base_link','shoulder_link') and points[:,2].min()<model.table_z+.004:
                 return name+': table clearance'
-            for color,lower,upper,_ in self.partial_cubes:
-                gap = float(np.maximum(lower-hi,lo-upper).max())
-                self.partial_clearance[color] = min(self.partial_clearance.get(color,float('inf')),gap)
-                if gap<model.gap:
-                    return name+': partially visible '+color+' cube clearance'
             hull = cv2.convexHull(np.float32(self.geometry.project(points))).astype(np.int32)
-            x,y,w,h = cv2.boundingRect(hull)
-            x0,y0 = max(0,x),max(0,y)
-            x1,y1 = min(self.mask.shape[1],x+w),min(self.mask.shape[0],y+h)
-            region = self.mask[y0:y1,x0:x1] if x1>x0 and y1>y0 else None
-            if region is not None and np.any(region):
-                mask = np.zeros_like(region)
-                cv2.fillConvexPoly(mask,hull-np.int32([x0,y0]),255)
-                if np.any(cv2.bitwise_and(mask,region)):
-                    return name+': projected cube/box keepout'
+            mask = np.zeros_like(self.mask)
+            cv2.fillConvexPoly(mask,hull,255)
+            if np.any((mask>0)&(self.mask>0)):
+                return name+': projected cube/box keepout'
         return None
 
 
@@ -1375,12 +965,6 @@ class AccessoryWorld(ExtractionCollisionWorld):
         native = self.native_checks.reason(joints,**policy)
         target = policy.get('target')
         placed = policy.get('placed_cube')
-        if native is None and getattr(self,'empty_recovery',False) and placed is not None:
-            from so101_pick_place.experiments.box_extraction.mesh_collision import mesh_cube_overlap
-            frames = self.robot.backend.model.frames(joints)
-            for link in ('gripper_link','moving_jaw_so101_v1_link'):
-                if mesh_cube_overlap(self.collision_meshes[link],frames[link],placed,0.):
-                    return link+': new contact with released cube '+str(target)
         if native=='gripper_link: cube '+str(target) and placed is not None and self.release_origin is not None and policy.get('jaw_contact') and policy.get('payload_local') is None:
             from box_extract.driver import BoxArmDriver
             origin = self.release_origin

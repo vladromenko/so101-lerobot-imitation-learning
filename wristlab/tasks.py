@@ -1,17 +1,6 @@
 """Task selection delegates every physical transfer to actions.relocate."""
 import numpy as np
-import time
-from .types import ActionResult, Placement
-
-
-MODES = ('relocate','stow','extract','collect_to_box','empty_box','sort_colors')
-
-
-class SortingBlocked(ValueError):
-    def __init__(self, reasons):
-        self.reasons = reasons
-        super().__init__('sorting has no accessible destination: '+ '; '.join(
-            f'{object_id}: {reason}' for object_id,reason in reasons.items()))
+from .types import Placement
 
 
 def box_for_color(color, boxes):
@@ -68,53 +57,39 @@ def next_transfer(mode, scene, selected=None, destination=None, excluded=()):
         pose[:3,3] = [*np.mean(support['patch'].polygon_xy_m,axis=0),support['height_m']+obj.dimensions[2]/2]
         return obj.id,Placement(pose,support['id'])
     if mode == 'sort_colors':
-        if not scene.state.objects:
-            raise ValueError('sorting cannot confirm completion without observed cubes')
         wrong = [o for o in objects if o.id not in scene.state.boxes[box_for_color(o.color,scene.state.boxes)].occupied_slots]
         if not wrong:
-            if any(not o.evidence.get('metric_qualified') or time.time()-o.timestamp>.5 for o in objects):
-                raise ValueError('sorting completion requires fresh measured cube positions')
             return None
         graph = scene.build_support_graph()
         available = [obj for obj in wrong if not graph[obj.id] and obj.status!='held']
-        failures = {obj.id:'support graph blocks access' for obj in wrong if graph[obj.id] or obj.status=='held'}
+        failures = []
         for obj in sorted(available,key=lambda obj:-obj.pose[2,3]):
             try:
                 return obj.id,placement_in_box(scene,obj.id,box_for_color(obj.color,scene.state.boxes))
             except ValueError as exc:
-                failures[obj.id] = str(exc)
-        raise SortingBlocked(failures)
+                failures.append(obj.id+': '+str(exc))
+        raise ValueError('sorting has no accessible destination: '+('; '.join(failures) or 'support graph blocks the remaining objects'))
     raise ValueError('experiment has not reached implementation/qualification stage')
 
 
-def run_task(mode, scene, actions, refresh, check_cancel, selected=None, destination=None, *, dry=False):
-    options = {'dry':True} if dry else {}
-    if mode == 'relocate':
-        check_cancel()
-        refresh()
-        return [actions.relocate(*next_transfer(mode,scene,selected,destination),**options)]
+def run_task(mode, scene, actions, refresh, check_cancel, selected=None, destination=None):
     results, deferred = [], set()
     initial_count = len(scene.state.objects)
-    for _ in range(max(1,initial_count)):
+    for _ in range(initial_count):
         check_cancel()
         refresh()
-        try:
-            item = next_transfer(mode,scene,selected,destination,deferred)
-        except SortingBlocked as exc:
-            return results+[ActionResult(False,reason,object_id,scene.state,
-                {'motion_started':False,'physical_verified':False,'failure_kind':'PLANNING_OR_OBSERVATION'})
-                for object_id,reason in exc.reasons.items()]
+        item = next_transfer(mode,scene,selected,destination,deferred)
         if item is None:
             return results
         object_id,placement = item
         if object_id in deferred:
             return results
-        result = actions.relocate(object_id,placement,**options)
+        result = actions.relocate(object_id,placement)
         results.append(result)
-        # A dry check does not change occupancy. Do not keep checking the
-        # first successful cube while silently skipping the other colors.
-        if dry or not result.success:
+        if not result.success:
             deferred.add(object_id)
             if result.evidence.get('critical') or (result.evidence.get('motion_started') and not result.evidence.get('recovered')):
                 return results
+        if mode == 'relocate':
+            return results
     return results

@@ -27,7 +27,6 @@ class Scene:
         self.metric_boxes = {}
         self.measured_surfaces = []
         self.boxes_semantically_seeded = False
-        self.box_edge_reference = None
         self.attachment_hypothesis = None
         self.passive_measurements = None
 
@@ -58,29 +57,19 @@ class Scene:
         self.state.evidence['boxes_at'] = captured
         self.frames['overview'] = Frame('overview','native:'+str(scan['frame']['sequence']),image,captured,time.time(),(captured,captured))
         self.boxes_semantically_seeded = True
-        self.box_edge_reference = None
 
     def track_box_edges(self, frame):
         previous = self.frames.get('overview')
         if previous is None or not self.state.boxes:
             return None
-        if self.box_edge_reference is None:
-            gray0 = cv2.cvtColor(previous.image,cv2.COLOR_BGR2GRAY)
-            edges = {}
-            for box_id,box in self.state.boxes.items():
-                polygon = np.asarray(box.evidence['polygon'],np.float32)
-                mask = np.zeros(gray0.shape,np.uint8)
-                cv2.polylines(mask,[np.int32(polygon)],True,255,18)
-                points = cv2.goodFeaturesToTrack(gray0,40,.01,6,mask=mask)
-                if points is None or len(points)<6:
-                    return None
-                edges[box_id] = polygon,points
-            self.box_edge_reference = gray0,edges
-        gray0,edges = self.box_edge_reference
+        gray0 = cv2.cvtColor(previous.image,cv2.COLOR_BGR2GRAY)
         gray1 = cv2.cvtColor(frame.image,cv2.COLOR_BGR2GRAY)
         proposed = []
-        for box_id,box in self.state.boxes.items():
-            polygon,points = edges.get(box_id,(None,None))
+        for box in self.state.boxes.values():
+            polygon = np.asarray(box.evidence['polygon'],np.float32)
+            mask = np.zeros(gray0.shape,np.uint8)
+            cv2.polylines(mask,[np.int32(polygon)],True,255,18)
+            points = cv2.goodFeaturesToTrack(gray0,40,.01,6,mask=mask)
             if points is None or len(points)<6:
                 return None
             tracked,status,error = cv2.calcOpticalFlowPyrLK(gray0,gray1,points,None,winSize=(21,21),maxLevel=2)
@@ -131,10 +120,6 @@ class Scene:
                 objects.append(obj)
             except ValueError as exc:
                 rejected.append({'color': detection['color'], 'reason': str(exc)})
-        seen_colors = {d['color'] for d in detected}
-        wrist_only = {d['color'] for d in wrist_detections}-seen_colors
-        for color in sorted(wrist_only):
-            rejected.append({'color':color,'reason':'wrist-visible cube has no current overview localization'})
         for obj in objects:
             matches = [] if obj.evidence.get('metric_qualified') else [(key,cube) for key,cube in self.metric_objects.items() if np.linalg.norm(cube.center_m[:2]-obj.pose[:2,3]) < .006]
             if len(matches)==1:
@@ -354,21 +339,6 @@ class Scene:
                     if np.all(candidate>=lo) and np.all(candidate<=hi):
                         xy = bound.base_from_box[:2,:2]@candidate+bound.base_from_box[:2,3]
                         resized.append(replace(patch,polygon_xy_m=xy+np.array([[-1,-1],[1,-1],[1,1],[-1,1]])*half))
-            if len(resized)==1:
-                # A narrow box may yield just its centre under the packing
-                # heuristic. Try the nearest full support patch as well;
-                # native jaw, wall, payload and retreat checks still apply.
-                patch = resized[0]
-                rotation = bound.base_from_box[:2,:2]
-                extent = half*np.abs(rotation).sum(axis=0)
-                lower,upper = bound.inner_min_xy+extent,bound.inner_max_xy-extent
-                if np.all(lower<=upper):
-                    local_base = (inverse@np.r_[0.,0.,patch.height_m,1.])[:2]
-                    xy = rotation@np.clip(local_base,lower,upper)+bound.base_from_box[:2,3]
-                    center = np.mean(patch.polygon_xy_m,axis=0)
-                    if not np.allclose(xy,center,rtol=0.,atol=1e-9):
-                        resized.append(replace(patch,polygon_xy_m=patch.polygon_xy_m+xy-center,
-                                               evidence=patch.evidence|{'near_base_support_candidate':True}))
         return resized
 
     def find_free_table_slots(self, object_shape):

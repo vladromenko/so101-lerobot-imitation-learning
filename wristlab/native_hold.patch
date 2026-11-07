@@ -2,89 +2,9 @@
 +++ b/python/so101ik/_arm.c
 @@ -9,0 +10 @@
 +#include "sts.h"
-@@ -29,0 +31,6 @@
-+    int supported_stop;
-+    int supported_grip;
-+    int supported_goals[SO101_NJ];
-+    so101_real stop_offset[SO101_NJ];
-+    int encoder_stop_requested, encoder_stop_pending, encoder_following;
-+    int encoder_hold_lower[SO101_NJ], encoder_hold_upper[SO101_NJ];
-@@ -35,0 +43,52 @@
-+/* Wristlab HAL adapter. The factory follower and freeze() are unchanged.
-+ * Only an explicitly armed, empty-tool recovery uses the measured hold reference. */
-+static int adapter_raw(const so101_servo_cal *cal,int joint,so101_real angle) {
-+    if (joint==SO101_GRIP) {
-+        angle=angle<0?0:angle>100?100:angle;
-+        return (int)(angle/100*(cal->range_max-cal->range_min)+cal->range_min);
-+    }
-+    so101_real value=angle*4095/360+(cal->range_min+cal->range_max)/2.0;
-+    return (int)(value<0?0:value>4095?4095:value);
-+}
-+static int supported_raw(ArmObject *o,const so101_real *actual,const so101_real *offset,int *raw) {
-+    so101_real reference[SO101_NJ];
-+    for (int j=0;j<SO101_NJ;j++) reference[j]=actual[j]+offset[j];
-+    so101_pose pose;so101_pose_eval(&o->arm.model,reference,&pose);
-+    for (int j=0;j<SO101_NJ;j++) {
-+        so101_real goal=reference[j];
-+        if (j>=SO101_LIFT && j<=SO101_ROLL) goal+=o->arm.sag*pose.torque[j];
-+        raw[j]=adapter_raw(&o->arm.cal[j],j,goal);
-+        if (raw[j]<o->arm.cal[j].range_min || raw[j]>o->arm.cal[j].range_max) return 0;
-+    }
-+    return 1;
-+}
-+static int supported_packet(ArmObject *o,const uint8_t *input,int n,uint8_t *output) {
-+    if (!o->supported_stop || (o->supported_stop==2 && !o->encoder_stop_pending) ||
-+        n!=8+3*SO101_NJ || input[0]!=255 || input[1]!=255 ||
-+        input[2]!=254 || input[4]!=0x83 || input[5]!=STS_GOAL_POSITION || input[6]!=2) return 0;
-+    if (o->supported_stop==2) o->encoder_stop_pending=0;
-+    /* Normal send_goals() packets contain compensation. freeze() writes the
-+     * freshly read encoder angles directly. Match every ID and raw target. */
-+    for (int j=0;j<SO101_NJ;j++) {
-+        if (input[7+3*j]!=o->arm.cal[j].id ||
-+            so101_sts_u16(input+8+3*j)!=adapter_raw(&o->arm.cal[j],j,o->arm.goal[j])) return 0;
-+    }
-+    int hold[SO101_NJ];
-+    const int *raw=o->supported_goals;
-+    if (o->supported_stop==2) {
-+        if (!supported_raw(o,o->arm.goal,o->stop_offset,hold)) return 0;
-+        hold[SO101_GRIP]=o->supported_grip;
-+        for (int j=0;j<SO101_NJ;j++)
-+            if (hold[j]<o->encoder_hold_lower[j] || hold[j]>o->encoder_hold_upper[j]) return 0;
-+        raw=hold;
-+    }
-+    memcpy(output,input,n);
-+    for (int j=0;j<SO101_NJ;j++) {
-+        output[8+3*j]=(uint8_t)(raw[j]&255);
-+        output[9+3*j]=(uint8_t)((raw[j]>>8)&255);
-+    }
-+    unsigned sum=0;for (int k=2;k<n-1;k++) sum+=output[k];
-+    output[n-1]=(uint8_t)~sum;
-+    return 1;
+@@ -271,0 +273,64 @@
 +}
 +
-@@ -36,0 +96,7 @@
-+static int record_supported_goals(ArmObject *o,const uint8_t *b,int n) {
-+    if (o->supported_stop!=1 || n!=8+3*SO101_NJ || b[0]!=255 || b[1]!=255 ||
-+        b[2]!=254 || b[4]!=0x83 || b[5]!=STS_GOAL_POSITION || b[6]!=2) return 0;
-+    for (int j=0;j<SO101_NJ;j++) if (b[7+3*j]!=o->arm.cal[j].id) return 0;
-+    for (int j=0;j<SO101_NJ;j++) o->supported_goals[j]=so101_sts_u16(b+8+3*j);
-+    return 1;
-+}
-@@ -39 +105,2 @@
--    int r;
-+    int r;uint8_t supported[260];
-+    if (supported_packet(o,b,n,supported)) b=supported;
-@@ -41 +108,3 @@
--    Py_END_ALLOW_THREADS return r;
-+    Py_END_ALLOW_THREADS
-+    if (r==n) record_supported_goals(o,b,n);
-+    return r;
-@@ -65,0 +135,2 @@
-+        o->encoder_stop_pending = o->supported_stop==2 && o->encoder_stop_requested;
-+        o->encoder_stop_requested = 0;
-@@ -127,0 +199 @@
-+    o->encoder_stop_requested = o->encoder_stop_pending = 0;
-@@ -273,0 +346,179 @@
 +/* Read-only reconnect: preserve hardware goals, torque and RAM settings. */
 +/* Same-owner register reads, including from its tick callback. No writes. */
 +static PyObject *arm_read_registers(ArmObject *self, PyObject *args) {
@@ -103,121 +23,6 @@
 +    PyObject *rows=PyTuple_New(SO101_NJ);
 +    for (int j=0;j<SO101_NJ;j++) PyTuple_SET_ITEM(rows,j,PyBytes_FromStringAndSize(PyBytes_AS_STRING(bytes)+j*n,n));
 +    Py_DECREF(bytes); return rows;
-+}
-+
-+/* Metadata/read-only configuration: no servo goal, torque or RAM writes. */
-+static PyObject *arm_supported_stop(ArmObject *self,PyObject *value) {
-+    OPEN(self);TAKE(self);
-+    if (value==Py_None) {
-+        self->supported_stop=self->encoder_stop_requested=self->encoder_stop_pending=0;
-+        GIVE(self);Py_RETURN_NONE;
-+    }
-+    so101_real offset[SO101_NJ];
-+    if (!read_deg(value,offset)) {GIVE(self);return NULL;}
-+    for (int j=0;j<SO101_NJ;j++) {
-+        so101_real scale=j==SO101_GRIP?self->arm.model.gripper_span_deg/100:1;
-+        if (!isfinite(offset[j]) || fabs(offset[j]*scale)>self->arm.start_max) {
-+            GIVE(self);PyErr_SetString(PyExc_ValueError,"hold reference exceeds native start bound");return NULL;
-+        }
-+    }
-+    int goals[SO101_NJ];
-+    for (int j=0;j<SO101_NJ;j++) {
-+        if (so101_sts_read2(&self->arm.hal,(uint8_t)self->arm.cal[j].id,STS_GOAL_POSITION,&goals[j])) {
-+            GIVE(self);PyErr_SetString(Fault,"cannot read existing powered holding goals");return NULL;
-+        }
-+    }
-+    memcpy(self->stop_offset,offset,sizeof offset);memcpy(self->supported_goals,goals,sizeof goals);
-+    self->supported_grip=goals[SO101_GRIP];self->supported_stop=1;
-+    GIVE(self);Py_RETURN_NONE;
-+}
-+static PyObject *arm_encoder_hold(ArmObject *self,PyObject *args) {
-+    PyObject *offset,*lower,*upper;
-+    so101_real lo[SO101_NJ],hi[SO101_NJ];
-+    int raw_lo[SO101_NJ],raw_hi[SO101_NJ];
-+    if (!PyArg_ParseTuple(args,"OOO",&offset,&lower,&upper) ||
-+        !read_deg(lower,lo) || !read_deg(upper,hi)) return NULL;
-+    OPEN(self);
-+    for (int j=0;j<SO101_NJ;j++) {
-+        if (!isfinite(lo[j]) || !isfinite(hi[j]) || lo[j]>hi[j]) {
-+            PyErr_SetString(PyExc_ValueError,"invalid checked encoder hold window");return NULL;
-+        }
-+        raw_lo[j]=adapter_raw(&self->arm.cal[j],j,lo[j]);
-+        raw_hi[j]=adapter_raw(&self->arm.cal[j],j,hi[j]);
-+        if (raw_lo[j]<self->arm.cal[j].range_min || raw_hi[j]>self->arm.cal[j].range_max) {
-+            PyErr_SetString(PyExc_ValueError,"encoder hold window exceeds calibrated limits");return NULL;
-+        }
-+    }
-+    PyObject *armed=arm_supported_stop(self,offset);
-+    if (!armed) return NULL;
-+    Py_DECREF(armed);
-+    for (int j=0;j<SO101_NJ;j++) {
-+        if (self->supported_goals[j]<raw_lo[j] || self->supported_goals[j]>raw_hi[j]) {
-+            self->supported_stop=0;
-+            PyErr_SetString(PyExc_ValueError,"powered goals are outside the checked encoder hold window");return NULL;
-+        }
-+    }
-+    memcpy(self->encoder_hold_lower,raw_lo,sizeof raw_lo);
-+    memcpy(self->encoder_hold_upper,raw_hi,sizeof raw_hi);
-+    self->encoder_stop_requested=self->encoder_stop_pending=0;
-+    self->supported_stop=2;
-+    Py_RETURN_NONE;
-+}
-+static void goal_packet(ArmObject *o,const int *raw,uint8_t *packet) {
-+    packet[0]=packet[1]=255;packet[2]=254;packet[3]=4+3*SO101_NJ;
-+    packet[4]=0x83;packet[5]=STS_GOAL_POSITION;packet[6]=2;
-+    for (int j=0;j<SO101_NJ;j++) {
-+        packet[7+3*j]=(uint8_t)o->arm.cal[j].id;
-+        packet[8+3*j]=(uint8_t)(raw[j]&255);packet[9+3*j]=(uint8_t)((raw[j]>>8)&255);
-+    }
-+    unsigned sum=0;for (int k=2;k<7+3*SO101_NJ;k++) sum+=packet[k];
-+    packet[7+3*SO101_NJ]=(uint8_t)~sum;
-+}
-+static PyObject *arm_preview_supported_stop(ArmObject *self,PyObject *args) {
-+    PyObject *position,*mapping;double grip;
-+    so101_real actual[SO101_NJ],offset[SO101_NJ];
-+    if (!PyArg_ParseTuple(args,"OOd",&position,&mapping,&grip) || !read_deg(position,actual) || !read_deg(mapping,offset)) return NULL;
-+    OPEN(self);TAKE(self);
-+    int raw[SO101_NJ],plain[SO101_NJ];
-+    if (!supported_raw(self,actual,offset,raw)) {GIVE(self);PyErr_SetString(PyExc_ValueError,"hold goal outside calibration limits");return NULL;}
-+    so101_real saved_goal[SO101_NJ],saved_offset[SO101_NJ];
-+    memcpy(saved_goal,self->arm.goal,sizeof saved_goal);memcpy(saved_offset,self->stop_offset,sizeof saved_offset);
-+    int saved_on=self->supported_stop,saved_grip=self->supported_grip,saved_raw[SO101_NJ];
-+    memcpy(saved_raw,self->supported_goals,sizeof saved_raw);
-+    self->supported_stop=1;memcpy(self->stop_offset,offset,sizeof offset);
-+    so101_servo_cal *gc=&self->arm.cal[SO101_GRIP];
-+    self->supported_grip=adapter_raw(gc,SO101_GRIP,grip+50.0/(gc->range_max-gc->range_min));
-+    raw[SO101_GRIP]=self->supported_grip;
-+    memcpy(self->supported_goals,raw,sizeof raw);
-+    for (int j=0;j<SO101_NJ;j++) {self->arm.goal[j]=actual[j];plain[j]=adapter_raw(&self->arm.cal[j],j,actual[j]);}
-+    uint8_t before[8+3*SO101_NJ],after[8+3*SO101_NJ],normal[8+3*SO101_NJ],ignored[260];
-+    goal_packet(self,plain,before);int transformed=supported_packet(self,before,sizeof before,after);
-+    goal_packet(self,raw,normal);
-+    for (int j=0;j<SO101_NJ;j++) self->arm.goal[j]=actual[j]+offset[j];
-+    int ordinary_changed=supported_packet(self,normal,sizeof normal,ignored);
-+    int changed[SO101_NJ];memcpy(changed,raw,sizeof changed);
-+    changed[0]+=changed[0]<self->arm.cal[0].range_max?1:-1;
-+    uint8_t updated[8+3*SO101_NJ],retained[8+3*SO101_NJ];
-+    goal_packet(self,changed,updated);
-+    int recorded=record_supported_goals(self,updated,sizeof updated);
-+    memcpy(self->arm.goal,actual,sizeof actual);
-+    int kept=recorded && supported_packet(self,before,sizeof before,retained) && !memcmp(retained,updated,sizeof updated);
-+    memcpy(self->arm.goal,saved_goal,sizeof saved_goal);memcpy(self->stop_offset,saved_offset,sizeof saved_offset);
-+    self->supported_stop=saved_on;self->supported_grip=saved_grip;
-+    memcpy(self->supported_goals,saved_raw,sizeof saved_raw);
-+    GIVE(self);
-+    if (!transformed) {PyErr_SetString(PyExc_RuntimeError,"native stop packet was not recognized");return NULL;}
-+    so101_real goals[SO101_NJ];
-+    for (int j=0;j<SO101_NJ;j++) {
-+        so101_servo_cal *cal=&self->arm.cal[j];
-+        goals[j]=j==SO101_GRIP?(raw[j]-cal->range_min)*100.0/(cal->range_max-cal->range_min):
-+            (raw[j]-(cal->range_min+cal->range_max)/2.0)*360/4095;
-+    }
-+    return Py_BuildValue("{s:N,s:N,s:N,s:O,s:O,s:s}","goals",by_joint(goals),
-+        "factory_packet",PyBytes_FromStringAndSize((char*)before,sizeof before),
-+        "supported_packet",PyBytes_FromStringAndSize((char*)after,sizeof after),
-+        "ordinary_packet_unchanged",ordinary_changed?Py_False:Py_True,
-+        "last_packet_retained",kept?Py_True:Py_False,
-+        "stop_policy","last_checked_hardware_goals");
 +}
 +
 +static PyObject *arm_adopt_hold(ArmObject *self, PyObject *noargs) {
@@ -262,29 +67,9 @@
 +    a->have_pose=0; a->have_target=0; a->folded=0; a->torque=1;
 +    h_log(self,"adopt_hold: stationary powered servos; all hardware goals preserved");
 +    GIVE(self); Py_RETURN_TRUE;
-+}
-+
-@@ -290,0 +542,8 @@
-+    self->encoder_stop_requested = 0;
-+    self->stop_req = 1;
-+    Py_RETURN_NONE;
-+}
-+
-+static PyObject *arm_stop_encoder_hold(ArmObject *self, PyObject *noargs) {
-+    OPEN(self);
-+    self->encoder_stop_requested = self->supported_stop==2 && self->encoder_following && !self->stop_req;
-@@ -438,0 +698 @@
-+    self->encoder_following = self->supported_stop==2 && !lead && !press;
-@@ -439,0 +700,2 @@
-+    self->encoder_following=self->encoder_stop_requested=self->encoder_stop_pending=0;
-+    if (self->supported_stop==2) self->supported_stop=0;
-@@ -676,0 +939,5 @@
-+    {"supported_stop",(PyCFunction)arm_supported_stop,METH_O,"scope a load-supported native STOP to the measured holding reference; None restores the default"},
-+    {"encoder_hold",(PyCFunction)arm_encoder_hold,METH_VARARGS,"arm a checked window for an explicit stop from fresh encoder feedback"},
-+    {"stop_encoder_hold",(PyCFunction)arm_stop_encoder_hold,METH_NOARGS,"request STOP and use the armed encoder hold if it remains inside the checked window"},
-+    {"preview_supported_stop",(PyCFunction)arm_preview_supported_stop,METH_VARARGS,"read-only native holding-goal prediction"},
+@@ -676,0 +742 @@
 +    {"read_registers", (PyCFunction)arm_read_registers, METH_VARARGS, "same-owner read-only servo register block"},
-@@ -679,0 +947 @@
+@@ -679,0 +746 @@
 +    {"adopt_hold", (PyCFunction)arm_adopt_hold, METH_NOARGS, "read-only adoption of stationary already-powered servos; False if all torque is off"},
 --- a/python/so101ik/_core.c
 +++ b/python/so101ik/_core.c

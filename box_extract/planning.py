@@ -169,7 +169,7 @@ class TunedExtractionPlanner(ExtractionPlanner):
         frame = self.model.frames(joints)['gripper_frame_link']
         return float(-((cube.vertices_m - frame[:3, 3]) @ frame[:3, :3])[:, 0].max())
 
-    def grasp_candidates(self, scene, cube, current, *, contact_center=None):
+    def grasp_candidates(self, scene, cube, current):
         """Solve opposing measured cube faces against the real jaw frame.
 
         The fixed jaw's stand-off is sized per candidate so that the gravity-compensated register command
@@ -177,13 +177,9 @@ class TunedExtractionPlanner(ExtractionPlanner):
         and the expected contact angle follow from that stand-off.
         """
         reference = self.model.pose(current)
-        center = cube.center_m if contact_center is None else np.asarray(contact_center)
         # Jaw contact height leaves the real distal mesh above the floor.
-        # The destination box can be at a different height from the source.
-        # Size the contact from the measured cube's bottom and the table,
-        # then check the actual support and walls in the collision world.
-        source_z = max(float(self.model.table_z),float(cube.vertices_m[:,2].min()))
-        contact_z = self.backend.fixed_jaw_distal_z_m + source_z+self.model.gap+.003-cube.center_m[2]
+        floor_world = scene.box.base_from_box @ np.r_[0., 0., scene.box.floor_interval_m[1], 1.]
+        contact_z = self.backend.fixed_jaw_distal_z_m + floor_world[2]+self.model.gap+.003-cube.center_m[2]
         for _ in range(3):
             opening, _ = self.backend.expected_block_gripper(reference, cube.side_m+self.opening_margin_m, contact_z)
             closed, _ = self.backend.expected_block_gripper(reference, cube.side_m, contact_z)
@@ -192,7 +188,7 @@ class TunedExtractionPlanner(ExtractionPlanner):
                 frames = self.model.frames(dict(current, gripper=float(gripper)))
                 moving = self.backend._transform_points(np.linalg.inv(frames['gripper_frame_link']) @ frames['moving_jaw_so101_v1_link'], self.backend.meshes['moving_jaw_so101_v1_link'])
                 distal = max(distal, float(moving[:, 2].max()))
-            contact_z = distal+source_z+max(self.model.gap, scene.box.clearance_m)+.003-cube.center_m[2]
+            contact_z = distal+floor_world[2]+max(self.model.gap, scene.box.clearance_m)+.003-cube.center_m[2]
         if not 4. <= closed < opening <= 45.:
             raise ValueError('measured cube does not fit the reliable jaw range')
         angle_for = self._jaw_angle_curve(reference, contact_z)
@@ -212,7 +208,7 @@ class TunedExtractionPlanner(ExtractionPlanner):
                         local = np.array([-(cube.side_m/2.+gap), 0., contact_z])
                         def residual(q):
                             frame = self.model.frames(self.joints(q, opening))['gripper_frame_link']
-                            return np.r_[(frame[:3, 3]+frame[:3, :3]@local-center)*1000., (frame[:3, 0]-frame_x)*30.]
+                            return np.r_[(frame[:3, 3]+frame[:3, :3]@local-cube.center_m)*1000., (frame[:3, 0]-frame_x)*30.]
                         solve_started = time.perf_counter()
                         try:
                             result = least_squares(residual, self.vector(seed_pose.deg), bounds=(self.limits[:, 0], self.limits[:, 1]), max_nfev=80)
@@ -226,8 +222,7 @@ class TunedExtractionPlanner(ExtractionPlanner):
                                 and np.linalg.norm(error[3:6])/30. <= np.sin(np.deg2rad(2.)) and actual[2, 2] < -self.min_tool_down)
                         return (joints if good else None), result.x
                     for pitch, roll in seeds:
-                        self.check_cancel()
-                        target_tip = center-desired@np.array([-(cube.side_m/2.+self.fixed_jaw_gap_m), 0., contact_z])
+                        target_tip = cube.center_m-desired@np.array([-(cube.side_m/2.+self.fixed_jaw_gap_m), 0., contact_z])
                         solve_started = time.perf_counter()
                         try:
                             seed = self.model.ik(*target_tip, pitch=pitch, roll=float(roll), gripper=opening)
@@ -241,10 +236,9 @@ class TunedExtractionPlanner(ExtractionPlanner):
                         joints, x = fit(seed, self.fixed_jaw_gap_m)
                         if joints is None:
                             continue
-                        # Size the stand-off against the actual register goal.
+                        # How much closer the command pose brings the fixed jaw than the goal pose does.
                         cmd = self._command_pose(joints)
-                        gap = self.fixed_jaw_gap_m + max(0., self._fixed_jaw_clearance(joints, cube)
-                            - self._fixed_jaw_clearance(cmd,cube)) + .001
+                        gap = self.fixed_jaw_gap_m + max(0., self._fixed_jaw_clearance(joints, cube) - self._fixed_jaw_clearance(cmd, cube)) + .001
                         if gap > self.max_standoff_m:
                             continue
                         if gap > self.fixed_jaw_gap_m + .0005:
@@ -289,12 +283,22 @@ class TunedExtractionPlanner(ExtractionPlanner):
                 rejections.append(str(exc))
         raise ValueError('no collision-free measured grasp and placement: ' + ('; '.join(rejections[-3:]) or 'IK/jaw geometry rejected all face pairs'))
 
-    def pick_endpoints(self, target_id, cube, grasp, closed, world, check_pick):
+    def _candidate(self, scene, current, target_id, cube, grasp, closed, world):
         policy = {'target': target_id, 'jaw_contact': True}
         frame = self.model.frames(grasp)['gripper_frame_link']
         local = (cube.vertices_m-frame[:3, 3]) @ frame[:3, :3]
-        if check_pick is not None:
-            check_pick(Phase('enter',(grasp,),jaw_contact=True),None)
+        rim = (scene.box.base_from_box @ np.r_[0., 0., scene.box.obstacle_top_m, 1.])[2]
+        radius = float(np.linalg.norm(cube.vertices_m-cube.center_m, axis=1).max())
+        # The cube only has to clear the rim: its lowest point, not its corner radius, sets the lift.
+        rise = max(.025, rim+scene.box.clearance_m+self.rim_margin_m+cube.side_m/2-cube.center_m[2])
+        entry_up = self.vertical_center(grasp, rise, local.mean(0), world, **policy)
+        failure = self._tracking_robust(entry_up, world, **policy)
+        if failure:
+            raise ValueError('enter is not robust to arm tracking error: '+failure)
+        approach = entry_up[-1]
+        opened = dict(current, gripper=grasp['gripper'])
+        open_path = self.edge(current, opened, world)
+        approach_path, search1 = self.transport(opened, approach, world)
         # The existing contact-band estimate initializes the aperture. Refine
         # first contact against the original, concave moving-jaw triangles;
         # never ask a geometric path to pass through the measured cube.
@@ -317,33 +321,7 @@ class TunedExtractionPlanner(ExtractionPlanner):
         held = dict(closure[-1], gripper=min(closure[-1]['gripper'], self.last_clamp_deg))
         closure = [*closure, held]
         flush = flush_local(local)
-        if check_pick is not None:
-            check_pick(Phase('extract_vertical',(held,),True,True,True),flush)
-        return frame,local,closure,held,flush
-
-    def _candidate(self, scene, current, target_id, cube, grasp, closed, world, *, check_pick=None, source=None):
-        policy = {'target': target_id, 'jaw_contact': True}
-        frame,local,closure,held,flush = (source if source is not None else
-            self.pick_endpoints(target_id,cube,grasp,closed,world,check_pick))
-        rim = (scene.box.base_from_box @ np.r_[0., 0., scene.box.obstacle_top_m, 1.])[2]
-        # The cube only has to clear the rim: its lowest point, not its corner radius, sets the lift.
-        rise = max(.025, rim+scene.box.clearance_m+self.rim_margin_m+cube.side_m/2-cube.center_m[2])
-        entry_up = self.vertical_center(grasp, rise, local.mean(0), world, **policy)
-        enter = Phase('enter',entry_up[::-1],jaw_contact=True)
-        if check_pick is not None:
-            check_pick(enter,None)
-        failure = self._tracking_robust(entry_up, world, **policy)
-        if failure:
-            raise ValueError('enter is not robust to arm tracking error: '+failure)
-        # The cube starts on its source support. Use the same native contact
-        # policy as the measured post-grasp replan, including its 1 mm limit.
-        lift = self.vertical_center(held, rise, flush.mean(0), world, payload_local=flush, support_contact=True, **policy)
-        extract = Phase('extract_vertical',lift,True,True,True)
-        if check_pick is not None:
-            check_pick(extract,flush)
-        opened = dict(current, gripper=grasp['gripper'])
-        open_path = self.edge(current, opened, world)
-        approach_path, search1 = self.transport(opened,entry_up[-1],world)
+        lift = self.vertical_center(held, rise, flush.mean(0), world, payload_local=flush, **policy)
         # Select a point from the measured support polygon, then verify the
         # complete cube footprint; no nominal table coordinates are used.
         patch = scene.placement
@@ -367,7 +345,7 @@ class TunedExtractionPlanner(ExtractionPlanner):
         placed = released_cube(placed)
         retract = self._retract_path(release_goal, flush.mean(0), world, placed_cube=placed, **policy)
         if self.command_sag:
-            for name, path, extra in (('enter', entry_up, {}), ('closure', closure[:-1], {}), ('lift', lift, {'payload_local': flush, 'support_contact': True}),
+            for name, path, extra in (('enter', entry_up, {}), ('closure', closure[:-1], {}), ('lift', lift, {'payload_local': flush}),
                                       ('placement', placement_up, {'payload_local': flush, 'support_contact': True}),
                                       ('retract', retract, {'placed_cube': placed})):
                 for q in (path[self.separation_waypoints:] if name == 'retract' else path):
@@ -378,8 +356,10 @@ class TunedExtractionPlanner(ExtractionPlanner):
             failure = self._tracking_robust(path, world, closing=closing, **policy)
             if failure:
                 raise ValueError(f'{name} is not robust to arm tracking error: {failure}')
-        phases = (Phase('open', open_path), Phase('approach', approach_path), enter,
-                  Phase('grasp', closure, jaw_contact=True),extract,
+        phases = (Phase('open', open_path), Phase('approach', approach_path),
+                  Phase('enter', entry_up[::-1], jaw_contact=True),
+                  Phase('grasp', closure, jaw_contact=True),
+                  Phase('extract_vertical', lift, True, True),
                   Phase('transfer', transfer, True, True),
                   Phase('lower_to_support', lowering, True, True, True),
                   Phase('release', release, True, True, True),

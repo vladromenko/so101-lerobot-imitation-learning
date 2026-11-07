@@ -109,8 +109,7 @@ class Robot:
             for name,row in zip(names,rows):
                 self.motor_limits[name] = {key:decode(row,0,key) for key in
                     ('Model_Number','Max_Temperature_Limit','Max_Voltage_Limit','Min_Voltage_Limit',
-                     'Protection_Current','Overload_Torque','Protection_Time','Over_Current_Protection_Time',
-                     'P_Coefficient','D_Coefficient','I_Coefficient','CW_Dead_Zone','CCW_Dead_Zone','Operating_Mode')}
+                     'Protection_Current','Overload_Torque','Protection_Time','Over_Current_Protection_Time')}
         rows = self.arm.raw.read_registers(40,31)
         calibration = json.loads(Path(self.config.robot['calibration']).read_text())
         result = {}
@@ -155,20 +154,9 @@ class Robot:
         first = self.quantized_command(self.backend.driver_command_goal(reference,sag))
         if not fit.success or any(abs(first[name]-goals[name])>steps[name]/2 for name in names):
             raise ValueError('native reference could not reproduce the existing hardware goal registers')
-        result = {'offset':{name:reference[name]-state['positions'][name] for name in names},
+        return {'offset':{name:reference[name]-state['positions'][name] for name in names},
                 'hardware_goals':goals,'start':dict(state['positions']),'sag':float(sag),
                 'first_command':first,'reference':reference}
-        preview = None if self.arm is None else getattr(self.arm.raw,'preview_supported_stop',None)
-        if callable(preview):
-            native = preview(state['positions'],result['offset'],goals['gripper'])
-            def valid_packet(packet):
-                return len(packet)==26 and packet[:3]==b'\xff\xff\xfe' and (sum(packet[2:])&255)==255
-            checked = (native.get('stop_policy')=='last_checked_hardware_goals' and native.get('last_packet_retained') is True and native['ordinary_packet_unchanged'] and valid_packet(native['factory_packet']) and
-                       valid_packet(native['supported_packet']) and all(abs(native['goals'][j]-goals[j])<steps[j]/2 for j in names))
-            result.update(supported_stop_packet_checked=bool(checked),supported_stop_goals=native['goals'],
-                supported_stop_policy=native.get('stop_policy'),
-                factory_stop_packet_hex=native['factory_packet'].hex(),supported_stop_packet_hex=native['supported_packet'].hex())
-        return result
 
     @staticmethod
     def control_reference(joints, synchronization, inverse=False):
@@ -197,19 +185,11 @@ class Robot:
             return follow(references,*args,**options)
         def refuse_move(*args,**options):
             raise ValueError('synchronized recovery must use the native checked trajectory')
-        support = getattr(self.arm.raw,'supported_stop',None)
-        supported = synchronization.get('supported_stop_packet_checked') is True
-        if supported:
-            if not callable(support):
-                raise RuntimeError('checked load-supported STOP adapter is unavailable')
-            support(synchronization['offset'])
         self.arm.follow,self.arm.move_joints = checked_follow,refuse_move
         try:
             yield
         finally:
             self.arm.follow,self.arm.move_joints = follow,move
-            if supported:
-                support(None)
 
     def audit_state(self, state):
         from .diagnostics import audit_pose

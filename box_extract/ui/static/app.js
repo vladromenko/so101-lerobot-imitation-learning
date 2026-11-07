@@ -1,5 +1,5 @@
 // The existing work panel now talks only to the persistent Wristlab runtime.
-let sceneData=null, statusData=null, lastRunning=false, selectedObject, selecting=false;
+let sceneData=null, statusData=null, lastRunning=false;
 const feeds = ['overview','wrist'];
 const imageIds={overview:'cam',wrist:'wrist-cam'}, canvasIds={overview:'overlay',wrist:'wrist-overlay'};
 const displayed={}, loading={};
@@ -16,16 +16,12 @@ function error(err){document.getElementById('scene-hint').textContent=String(err
 async function camera(name){
   if(loading[name]||!document.getElementById('work').classList.contains('active'))return;
   loading[name]=true;
-  let url;
   try{
     const response=await fetch('/snapshot/'+name+'.jpg?t='+Date.now());if(!response.ok)throw Error(name+': нет свежего кадра');
-    url=URL.createObjectURL(await response.blob());
-    const img=document.getElementById(imageIds[name]);
+    const blob=await response.blob(), url=URL.createObjectURL(blob), img=document.getElementById(imageIds[name]);
+    img.onload=()=>{if(displayed[name]?.url)URL.revokeObjectURL(displayed[name].url);displayed[name]={url,frameId:response.headers.get('X-Frame-Id')};drawOverlay();};
     img.src=url;
-    await img.decode();
-    if(displayed[name]?.url)URL.revokeObjectURL(displayed[name].url);
-    displayed[name]={url,frameId:response.headers.get('X-Frame-Id')};drawOverlay();
-  }catch(err){if(url&&displayed[name]?.url!==url)URL.revokeObjectURL(url);error(err);}finally{loading[name]=false;}
+  }catch(err){error(err);}finally{loading[name]=false;}
 }
 function drawOverlay(){
   feeds.forEach(name=>{
@@ -36,20 +32,16 @@ function drawOverlay(){
     const k=rect.width/(img.naturalWidth||1280);g.lineWidth=2;g.font='bold 13px sans-serif';
     function polygon(points,color){g.strokeStyle=color;g.beginPath();points.forEach((p,i)=>i?g.lineTo(p[0]*k,p[1]*k):g.moveTo(p[0]*k,p[1]*k));g.closePath();g.stroke();}
     if(name==='overview')sceneData.boxes.forEach(b=>{polygon(b.polygon,b.metric_qualified?'#22c55e':'#f59e0b');const p=b.polygon[0];g.fillStyle='#f59e0b';g.fillText(b.id+' · '+(b.metric_qualified?'измерена':'кандидат'),p[0]*k,p[1]*k-5);});
-    (name==='overview'?sceneData.cubes:sceneData.wrist_objects||[]).forEach(o=>{const selected=o.id===(selectedObject??statusData?.selected),color=selected?'#fff':'#38bdf8';g.setLineDash(o.status==='occluded'?[5,4]:[]);o.polygon.forEach(p=>polygon(p,color));g.fillStyle=color;g.fillText(o.id+' '+o.color+(o.status==='occluded'?' · скрыт':''),o.px[0]*k-35,o.px[1]*k-25);});
+    (name==='overview'?sceneData.cubes:sceneData.wrist_objects||[]).forEach(o=>{const selected=o.id===statusData?.selected,color=selected?'#fff':'#38bdf8';g.setLineDash(o.status==='occluded'?[5,4]:[]);o.polygon.forEach(p=>polygon(p,color));g.fillStyle=color;g.fillText(o.id+' '+o.color+(o.status==='occluded'?' · скрыт':''),o.px[0]*k-35,o.px[1]*k-25);});
     g.setLineDash([]);
   });
 }
 feeds.forEach(name=>document.getElementById(canvasIds[name]).addEventListener('click',async e=>{
-  if(selecting)return;
-  const img=document.getElementById(imageIds[name]),rect=e.currentTarget.getBoundingClientRect(),frame=displayed[name];
-  if(!frame?.frameId||img.src!==frame.url||!img.naturalWidth)return;
-  selecting=true;gate();
+  const img=document.getElementById(imageIds[name]),rect=e.currentTarget.getBoundingClientRect();
   try{
-    const selected=await api('/api/select',{camera_id:name,frame_id:frame.frameId,pixel_x:(e.clientX-rect.left)*img.naturalWidth/rect.width,pixel_y:(e.clientY-rect.top)*img.naturalHeight/rect.height});
-    selectedObject=selected.object_id;
-    document.getElementById('selected').textContent=selected.object_id+' · '+selected.color;drawOverlay();
-  }catch(err){error(err);}finally{selecting=false;gate();}
+    const selected=await api('/api/select',{camera_id:name,frame_id:displayed[name]?.frameId,pixel_x:(e.clientX-rect.left)*img.naturalWidth/rect.width,pixel_y:(e.clientY-rect.top)*img.naturalHeight/rect.height});
+    document.getElementById('selected').textContent=selected.object_id+' · '+selected.color;await poll();
+  }catch(err){error(err);}
 }));
 async function refreshScene(){
   sceneData=await api('/api/scene');
@@ -69,23 +61,9 @@ async function refreshScene(){
   hint.title='Обзор: '+sceneData.evidence.overview_frame_id+'; wrist: '+sceneData.evidence.wrist_frame_id+'; SceneState #'+sceneData.version;
   drawOverlay();
 }
-function taskBody(mode){
-  const body={mode,object_id:selectedObject??statusData?.selected,count:2,rows:2,columns:2};
-  if(mode!=='run_sequence')body.destination=document.getElementById('destination').value;
-  if(mode==='build_color_pattern')body.pattern=[['green','yellow'],['red','blue']];
-  return body;
-}
-async function showTaskPlan(body){
-  const plan=await api('/api/task-plan',body),out=document.getElementById('task-proposal');
-  out.hidden=false;out.textContent=JSON.stringify(plan,null,2);
-}
 async function start(mode){
-  if(selecting)return;
-  const dry=document.getElementById('dry').checked,body=taskBody(mode);
-  try{
-    if(dry&&mode==='run_sequence')await showTaskPlan(body);
-    else{await api('/api/run',{...body,dry});await poll();}
-  }catch(err){error(err);}
+  try{await api('/api/run',{mode,dry:document.getElementById('dry').checked,destination:document.getElementById('destination').value,object_id:statusData?.selected,count:2,rows:2,columns:2,pattern:mode==='build_color_pattern'?[['green','yellow'],['red','blue']]:undefined});}
+  catch(err){error(err);}await poll();
 }
 ['relocate','stow','extract'].forEach(id=>document.getElementById(id).addEventListener('click',()=>start(id)));
 document.getElementById('scene-btn').addEventListener('click',()=>refreshScene().catch(error));
@@ -100,13 +78,14 @@ document.getElementById('park-run').addEventListener('click',async()=>{
 });
 document.getElementById('experiment-start').addEventListener('click',()=>start(document.getElementById('experiment').value));
 document.getElementById('task-plan').addEventListener('click',async()=>{
-  if(selecting)return;
-  try{await showTaskPlan(taskBody(document.getElementById('experiment').value));}catch(err){error(err);}
+  const body={mode:document.getElementById('experiment').value,destination:document.getElementById('destination').value,object_id:statusData?.selected,count:2,rows:2,columns:2};
+  if(body.mode==='build_color_pattern')body.pattern=[['green','yellow'],['red','blue']];
+  try{const plan=await api('/api/task-plan',body);const out=document.getElementById('task-proposal');out.hidden=false;out.textContent=JSON.stringify(plan,null,2);}catch(err){error(err);}
 });
 document.getElementById('dry').addEventListener('change',gate);
 function gate(){
   const dry=document.getElementById('dry').checked;
-  ['relocate','stow','extract','experiment-start'].forEach(id=>document.getElementById(id).disabled=selecting||lastRunning||statusData?.stop_latched||(!dry&&!statusData?.ready));
+  ['relocate','stow','extract','experiment-start'].forEach(id=>document.getElementById(id).disabled=lastRunning||statusData?.stop_latched||(!dry&&!statusData?.ready));
   document.getElementById('park').disabled=lastRunning||statusData?.stop_latched;
   document.getElementById('park-run').disabled=lastRunning||statusData?.stop_latched||!statusData?.results?.some(r=>r.status==='PARK_CHECKED');
 }
