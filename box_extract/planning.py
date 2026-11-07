@@ -114,7 +114,12 @@ class TunedExtractionPlanner(ExtractionPlanner):
         for opening in [o for o in self.release_openings if o <= first + 1e-6] or [first]:
             goal = dict(start, gripper=opening)
             try:
-                return goal, self.edge(start, goal, world, **policy)
+                path = self.edge(start, goal, world, **policy)
+                for q in path:
+                    reason = world.reason(self._command_pose(q), **policy)
+                    if reason:
+                        raise ValueError('release under the gravity-compensated command: '+reason)
+                return goal, path
             except ValueError as exc:
                 reason = exc
         raise reason

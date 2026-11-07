@@ -588,6 +588,16 @@ class GeometryPolicy(unittest.TestCase):
 
 
 class CompleteGraspSelection(unittest.TestCase):
+    def test_release_tries_smaller_native_aperture_if_command_hits_wall(self):
+        from box_extract.planning import TunedExtractionPlanner
+        planner=TunedExtractionPlanner.__new__(TunedExtractionPlanner)
+        planner.edge=lambda a,b,*args,**kw:(a,b)
+        planner._command_pose=lambda q:q
+        world=NS(reason=lambda q,**kw:'moving jaw: wall' if q['gripper']>40. else None)
+        goal,path=planner._release({'gripper':15.},world)
+        self.assertEqual(goal['gripper'],38.)
+        self.assertEqual(path[-1],goal)
+
     def test_stationary_boundary_lag_uses_visited_positions_only(self):
         from box_extract.planning import TunedExtractionPlanner,ARM_JOINTS
         planner=TunedExtractionPlanner.__new__(TunedExtractionPlanner)
