@@ -195,6 +195,21 @@ class RelocateContract(unittest.TestCase):
 
 
 class GeometryPolicy(unittest.TestCase):
+    def test_overview_measurement_rejects_repeated_frame_during_monitored_hold(self):
+        rt = Runtime.__new__(Runtime)
+        rt.stop_event = threading.Event()
+        rt.check_cancel = Mock()
+        rt.monitor_motors = Mock()
+        rt.config = {'poll_interval_s':.01}
+        state = {'positions':Q,'timestamp':time.time(),'q':np.zeros(5),'gripper':Q['gripper']}
+        rt.robot = NS(encoder_steps=lambda:{j:.1 for j in Q},read_state=Mock(return_value=state))
+        rt.cameras = NS(max_age=.5,check=Mock(),record_state=Mock(),json=Mock(side_effect=lambda *a,**kw:
+            {'frame':{'sequence':1,'captured_at_unix_s':time.time()}}))
+        with self.assertRaisesRegex(ValueError,'three fresh distinct frames'):
+            rt.measure_overview(Q)
+        rt.monitor_motors.assert_called()
+        self.assertEqual(rt.cameras.json.call_count,3)
+
     def test_release_checkpoint_cannot_cross_a_reboot(self):
         import pickle
         with tempfile.TemporaryDirectory() as directory:

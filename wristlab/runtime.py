@@ -699,6 +699,51 @@ class Runtime:
             self.running = False
             self.persist()
 
+    def measure_overview(self, stationary):
+        """Take independent native measurements while the owner monitors the held pose."""
+        result = queue.Queue(maxsize=1)
+        cancelled = threading.Event()
+        started = time.time()
+
+        def capture():
+            try:
+                sources = []
+                for _ in range(3):
+                    if cancelled.is_set() or self.stop_event.is_set():
+                        raise RuntimeError('overview measurement cancelled')
+                    sources.append(self.cameras.json('/api/scan-hybrid',{},timeout=30.))
+                result.put(sources)
+            except Exception as exc:
+                result.put(exc)
+
+        threading.Thread(target=capture,name='wristlab-overview-measurement',daemon=True).start()
+        steps = self.robot.encoder_steps()
+        try:
+            while True:
+                self.check_cancel()
+                self.cameras.check()
+                state = self.robot.read_state()
+                if any(abs(state['positions'][j]-stationary[j])>steps[j] for j in stationary):
+                    raise ValueError('arm changed pose during overview measurement')
+                self.cameras.record_state(state['timestamp'],state['q'],state['gripper'])
+                self.monitor_motors()
+                self.check_cancel()
+                try:
+                    sources = result.get(timeout=self.config['poll_interval_s'])
+                    break
+                except queue.Empty:
+                    pass
+        finally:
+            cancelled.set()
+        if isinstance(sources,Exception):
+            raise sources
+        self.check_cancel()
+        frames = [source['frame'] for source in sources]
+        if (len({f['sequence'] for f in frames})!=3 or
+            min(f['captured_at_unix_s'] for f in frames)<started-self.cameras.max_age):
+            raise ValueError('overview measurements did not come from three fresh distinct frames')
+        return sources
+
     def prepare_overhead(self, attendance, recovery=False):
         """Restore the successful overview pipeline, without a wrist transform."""
         from box_extract.scene_builder import SceneParameters,measure_box,spatial_cube,merge_cubes
@@ -709,6 +754,8 @@ class Runtime:
         if not self.robot.audit_state(state)['planning_valid']:
             raise ValueError('overhead operation requires the measured working pose')
         self.refresh()
+        if self.scene.state.obstacles and not recovery:
+            raise ValueError('resolve visible unlocalized obstacles before measuring for Pick & Place')
         frame = self.scene.frames['overview']
         current_boxes = {key:np.asarray(box.evidence['polygon']) for key,box in self.scene.state.boxes.items()}
         if recovery:
@@ -734,9 +781,18 @@ class Runtime:
             control = dict(control,reused_after_self_occlusion=True,current_marker_measurement=False)
         else:
             control = validate_overview_control(frame.image,self.geometry.calibration,self.robot.backend.model,state['positions'])
-        sources = [json.loads((self.output/name).read_text()) for name in
-                   (('pre-approach-overview-reference.json','overview-confirm-0.json','overview-confirm-1.json') if recovery else
-                    ('box-observation.json','overview-confirm-0.json','overview-confirm-1.json'))]
+        source_names = ('pre-approach-overview-reference.json','overview-confirm-0.json','overview-confirm-1.json')
+        if recovery:
+            sources = [json.loads((self.output/name).read_text()) for name in source_names]
+        else:
+            self.report('observe','measuring the current overview geometry without motion')
+            sources = self.measure_overview(state['positions'])
+            self.refresh()
+            if self.scene.state.obstacles:
+                raise ValueError('scene coverage changed during overview measurement')
+            frame = self.scene.frames['overview']
+            current_boxes = {key:np.asarray(box.evidence['polygon']) for key,box in self.scene.state.boxes.items()}
+            control = validate_overview_control(frame.image,self.geometry.calibration,self.robot.backend.model,state['positions'])
         params = SceneParameters()
         measured = {}
         for box_id,box in self.scene.state.boxes.items():
@@ -804,6 +860,12 @@ class Runtime:
             raise ValueError('current silhouettes do not confirm overview geometry: '+str(invalid))
         self.scene.state.evidence['coverage_verified'] = not self.scene.state.obstacles
         self.ensure_driver()
+        if not recovery:
+            for name,scan in zip(source_names,sources):
+                path = self.output/name
+                temporary = path.with_suffix('.tmp')
+                temporary.write_text(json.dumps(scan))
+                temporary.replace(path)
         return {'grasp_mode':'overhead_grasp','wrist_refinement':False,'overview_control':control,
                 'sources':[s['artifacts'] for s in sources],'assumptions':params.__dict__,
                 'operator_observation':attendance,'physical_pick_place_completed':False}
