@@ -588,6 +588,19 @@ class GeometryPolicy(unittest.TestCase):
 
 
 class CompleteGraspSelection(unittest.TestCase):
+    def test_planning_reacquires_native_snapshot_instead_of_using_stale_cache(self):
+        from wristlab.cameras import Cameras
+        cameras = Cameras('http://unused')
+        fresh = {'overview':object(),'wrist':object()}
+        cameras.latest_pair = Mock(side_effect=[RuntimeError('overview: stale frame'),fresh])
+        cameras.refresh = Mock()
+        self.assertIs(cameras.check(),fresh)
+        cameras.refresh.assert_called_once()
+        cameras.error = 'overview: native camera unavailable'
+        with self.assertRaisesRegex(RuntimeError,'native camera unavailable'):
+            cameras.check()
+        cameras.refresh.assert_called_once()
+
     def test_failed_retreat_tries_next_grasp_in_same_slot(self):
         from wristlab.grasp import choose_grasp
         obj=NS(id='target')

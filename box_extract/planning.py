@@ -321,7 +321,9 @@ class TunedExtractionPlanner(ExtractionPlanner):
         held = dict(closure[-1], gripper=min(closure[-1]['gripper'], self.last_clamp_deg))
         closure = [*closure, held]
         flush = flush_local(local)
-        lift = self.vertical_center(held, rise, flush.mean(0), world, payload_local=flush, **policy)
+        # Initial contact with the source support uses the same native policy
+        # as the measured post-grasp plan; its penetration limit is unchanged.
+        lift = self.vertical_center(held, rise, flush.mean(0), world, payload_local=flush, support_contact=True, **policy)
         # Select a point from the measured support polygon, then verify the
         # complete cube footprint; no nominal table coordinates are used.
         patch = scene.placement
@@ -359,7 +361,7 @@ class TunedExtractionPlanner(ExtractionPlanner):
         phases = (Phase('open', open_path), Phase('approach', approach_path),
                   Phase('enter', entry_up[::-1], jaw_contact=True),
                   Phase('grasp', closure, jaw_contact=True),
-                  Phase('extract_vertical', lift, True, True),
+                  Phase('extract_vertical', lift, True, True, True),
                   Phase('transfer', transfer, True, True),
                   Phase('lower_to_support', lowering, True, True, True),
                   Phase('release', release, True, True, True),
