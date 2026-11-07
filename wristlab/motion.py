@@ -189,7 +189,12 @@ class Motion:
             from types import SimpleNamespace
             from .scene import BoxUnion
             from so101_pick_place.experiments.box_extraction.scene import ExtractionScene
-            if not scene.state.evidence.get('coverage_verified') or self.qualification_reasons(geometry):
+            check()
+            self.robot.read_state()
+            blockers = self.qualification_reasons(geometry)
+            if blockers:
+                raise ValueError('powered entry: '+'; '.join(blockers))
+            if not scene.state.evidence.get('coverage_verified'):
                 raise ValueError('powered entry requires fully measured current collision geometry')
             boxes = [box.evidence['native_box'] for box in scene.state.boxes.values()
                      if box.evidence.get('metric_qualified') or box.evidence.get('collision_qualified')]
