@@ -541,11 +541,13 @@ class Runtime:
         measured = {}
         for box_id,box in self.scene.state.boxes.items():
             observations = []
+            body_views = []
             tracker = OpeningTracker()
             for scan in sources:
                 image = cv2.imread(str(Path(scan['artifacts'])/'frame.jpg'))
                 bodies = [d for d in scan['detections'] if d['label']=='box']
                 body = min(bodies,key=lambda d:np.linalg.norm(np.asarray(d['center_px'])-box.evidence['center_px']))
+                body_views.append((image,dict(scan,detections=[body])))
                 outline = cv2.convexHull(np.float32(np.vstack(body['silhouette_polygons_px'])))
                 current_outline = cv2.convexHull(np.float32(current_boxes[box_id]))
                 intersection = cv2.intersectConvexConvex(outline,current_outline)[0]
@@ -562,6 +564,21 @@ class Runtime:
                     subset['detections'].append(opening)
                 observations.append(measure_box(subset,self.geometry.calibration,params,len(sources)))
             centers = np.array([b.base_from_box[:2,3] for b in observations])
+            if np.linalg.norm(np.ptp(centers,axis=0))>params.max_box_spread_m:
+                # SAM can label an unfolded lid as the opening in one view.
+                # Reuse the existing four-edge detector across all views;
+                # retain the same repeatability requirement and keepout fallback.
+                edges = []
+                tracker = OpeningTracker()
+                for image,subset in body_views:
+                    opening,_ = estimate_opening(image,subset,tracker=tracker)
+                    if opening is not None:
+                        subset['detections'].append(opening)
+                        edges.append(measure_box(subset,self.geometry.calibration,params,len(sources)))
+                if len(edges)==len(sources):
+                    edge_centers = np.array([b.base_from_box[:2,3] for b in edges])
+                    if np.linalg.norm(np.ptp(edge_centers,axis=0))<=params.max_box_spread_m:
+                        observations,centers = edges,edge_centers
             if np.linalg.norm(np.ptp(centers,axis=0))>params.max_box_spread_m:
                 from .scene import BoxKeepout
                 polygon = np.asarray(box.evidence['polygon'])
