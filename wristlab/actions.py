@@ -84,7 +84,8 @@ class Actions:
                 for patch in self.scene.find_free_box_slots(placement.support_surface,obj.dimensions):
                     center = np.r_[np.mean(patch.polygon_xy_m,axis=0),patch.height_m+obj.dimensions[2]/2]
                     duplicate = any(np.allclose(center,choice.object_pose[:3,3],rtol=0.,atol=1e-9) for choice in choices)
-                    if np.linalg.norm(center-placement.object_pose[:3,3])>.015 and not duplicate:
+                    if not duplicate and (np.linalg.norm(center-placement.object_pose[:3,3])>.015 or
+                                          patch.evidence.get('near_base_support_candidate')):
                         pose = placement.object_pose.copy();pose[:3,3] = center
                         choices.append(replace(placement,object_pose=pose))
             failures = []

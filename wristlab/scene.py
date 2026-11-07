@@ -354,6 +354,21 @@ class Scene:
                     if np.all(candidate>=lo) and np.all(candidate<=hi):
                         xy = bound.base_from_box[:2,:2]@candidate+bound.base_from_box[:2,3]
                         resized.append(replace(patch,polygon_xy_m=xy+np.array([[-1,-1],[1,-1],[1,1],[-1,1]])*half))
+            if len(resized)==1:
+                # A narrow box may yield just its centre under the packing
+                # heuristic. Try the nearest full support patch as well;
+                # native jaw, wall, payload and retreat checks still apply.
+                patch = resized[0]
+                rotation = bound.base_from_box[:2,:2]
+                extent = half*np.abs(rotation).sum(axis=0)
+                lower,upper = bound.inner_min_xy+extent,bound.inner_max_xy-extent
+                if np.all(lower<=upper):
+                    local_base = (inverse@np.r_[0.,0.,patch.height_m,1.])[:2]
+                    xy = rotation@np.clip(local_base,lower,upper)+bound.base_from_box[:2,3]
+                    center = np.mean(patch.polygon_xy_m,axis=0)
+                    if not np.allclose(xy,center,rtol=0.,atol=1e-9):
+                        resized.append(replace(patch,polygon_xy_m=patch.polygon_xy_m+xy-center,
+                                               evidence=patch.evidence|{'near_base_support_candidate':True}))
         return resized
 
     def find_free_table_slots(self, object_shape):
