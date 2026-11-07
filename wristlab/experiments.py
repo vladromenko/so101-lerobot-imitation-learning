@@ -6,6 +6,7 @@ from .types import Placement
 
 
 MODES = ('build_tower','unstack_tower','arrange_grid','build_color_pattern','pack_box','free_target','reset_scene','run_sequence')
+DEFAULT_SEQUENCE = ('sort_colors','empty_box','build_tower','unstack_tower','reset_scene')
 
 
 def on_table(scene, obj):
@@ -224,7 +225,7 @@ def next_step(scene, mode, context, excluded=()):
 
 def execute(mode, scene, actions, refresh, check_cancel, **options):
     if mode == 'run_sequence':
-        return run_sequence(options.get('sequence',['sort_colors','empty_box','build_tower','unstack_tower','reset_scene']),scene,actions,refresh,check_cancel,**{k:v for k,v in options.items() if k!='sequence'})
+        return run_sequence(options.get('sequence',DEFAULT_SEQUENCE),scene,actions,refresh,check_cancel,**{k:v for k,v in options.items() if k!='sequence'})
     refresh()
     context = prepare(scene,mode,options)
     results,deferred = [],set()
@@ -242,13 +243,32 @@ def execute(mode, scene, actions, refresh, check_cancel, **options):
     raise ValueError('task did not converge within bounded object transfers')
 
 
+def sequence_steps(sequence, options):
+    from .tasks import MODES as BASIC_MODES
+    if not isinstance(sequence,(list,tuple)) or not sequence:
+        raise ValueError('sequence must contain at least one task')
+    steps = []
+    for index,item in enumerate(sequence,1):
+        if not isinstance(item,(str,dict)):
+            raise ValueError(f'sequence stage {index}: expected a mode name or task settings')
+        stage = item if isinstance(item,str) else item.get('mode')
+        if not isinstance(stage,str) or stage=='run_sequence' or stage not in BASIC_MODES+MODES:
+            raise ValueError(f'sequence stage {index}: unsupported mode')
+        settings = dict(options) if isinstance(item,str) else options|{k:v for k,v in item.items() if k!='mode'}
+        if stage in ('relocate','free_target') and not settings.get('object_id'):
+            raise ValueError(f'sequence stage {index}: {stage} requires an object ID')
+        if stage in ('relocate','stow','collect_to_box','pack_box') and not settings.get('destination'):
+            raise ValueError(f'sequence stage {index}: {stage} requires a destination')
+        steps.append((stage,settings))
+    return steps
+
+
 def run_sequence(sequence, scene, actions, refresh, check_cancel, **options):
     from .tasks import run_task
+    steps = sequence_steps(sequence,options)
     results = []
-    for item in sequence:
+    for stage,settings in steps:
         check_cancel();refresh()
-        stage = item if isinstance(item,str) else item['mode']
-        settings = options if isinstance(item,str) else options|{k:v for k,v in item.items() if k!='mode'}
         if stage in ('extract','empty_box') and not settings.get('destination'):
             stage_results = []
             for box_id in tuple(scene.state.boxes):
@@ -260,7 +280,7 @@ def run_sequence(sequence, scene, actions, refresh, check_cancel, **options):
         elif stage in MODES and stage != 'run_sequence':
             stage_results = execute(stage,scene,actions,refresh,check_cancel,**settings)
         else:
-            stage_results = run_task(stage,scene,actions,refresh,check_cancel,destination=settings.get('destination'))
+            stage_results = run_task(stage,scene,actions,refresh,check_cancel,selected=settings.get('object_id'),destination=settings.get('destination'))
         results.extend(stage_results)
         if any(not r.success for r in stage_results):
             return results

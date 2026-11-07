@@ -842,6 +842,32 @@ class GeometryPolicy(unittest.TestCase):
         self.assertEqual([c.kwargs['destination'] for c in run.call_args_list],['left','right'])
         self.assertGreaterEqual(refresh.call_count,3)
 
+    def test_sequence_rejects_late_invalid_stage_before_moving(self):
+        refresh = Mock()
+        with patch('wristlab.tasks.run_task') as run:
+            with self.assertRaisesRegex(ValueError,'stage 2: unsupported mode'):
+                experiments.run_sequence(['sort_colors','unknown'],NS(),NS(),refresh,lambda:None)
+        run.assert_not_called()
+        refresh.assert_not_called()
+
+    def test_sequence_preserves_explicit_relocate_selection(self):
+        with patch('wristlab.tasks.run_task',return_value=[]) as run:
+            experiments.run_sequence([{'mode':'relocate','object_id':'green','destination':'white'}],
+                                     NS(),NS(),lambda:None,lambda:None)
+        self.assertEqual(run.call_args.kwargs,{'selected':'green','destination':'white'})
+
+    def test_first_command_time_survives_guard_failure(self):
+        runtime = Runtime.__new__(Runtime)
+        runtime.robot = NS(first_command_at=None)
+        runtime.started = time.monotonic()
+        runtime.metrics = {}
+        runtime.check_cancel = Mock(side_effect=RuntimeError('STOP'))
+        for _ in range(2):
+            with self.assertRaisesRegex(RuntimeError,'STOP'):
+                runtime.tick({})
+        self.assertGreaterEqual(runtime.metrics['first_command_s'],0.)
+        self.assertEqual(runtime.metrics['first_command_s'],runtime.robot.first_command_at-runtime.started)
+
 
 if __name__=='__main__':
     unittest.main(verbosity=2)

@@ -3,6 +3,9 @@ import numpy as np
 from .types import Placement
 
 
+MODES = ('relocate','stow','extract','collect_to_box','empty_box','sort_colors')
+
+
 def box_for_color(color, boxes):
     if color not in ('green','yellow','red','blue'):
         raise ValueError('sorting requires a confidently classified supported cube color')
@@ -73,6 +76,10 @@ def next_transfer(mode, scene, selected=None, destination=None, excluded=()):
 
 
 def run_task(mode, scene, actions, refresh, check_cancel, selected=None, destination=None):
+    if mode == 'relocate':
+        check_cancel()
+        refresh()
+        return [actions.relocate(*next_transfer(mode,scene,selected,destination))]
     results, deferred = [], set()
     initial_count = len(scene.state.objects)
     for _ in range(initial_count):
@@ -90,6 +97,4 @@ def run_task(mode, scene, actions, refresh, check_cancel, selected=None, destina
             deferred.add(object_id)
             if result.evidence.get('critical') or (result.evidence.get('motion_started') and not result.evidence.get('recovered')):
                 return results
-        if mode == 'relocate':
-            return results
     return results

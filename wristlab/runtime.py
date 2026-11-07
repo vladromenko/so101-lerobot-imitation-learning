@@ -20,7 +20,7 @@ from . import tasks
 
 class Runtime:
     from .experiments import MODES as EXTRA_MODES
-    MODES = ('relocate','stow','extract','collect_to_box','empty_box','sort_colors')+EXTRA_MODES
+    MODES = tasks.MODES+EXTRA_MODES
 
     def __init__(self, root):
         self.root = Path(root)
@@ -274,6 +274,8 @@ class Runtime:
         # fails the camera/geometry guard. Preserve that physical fact on error.
         if self.robot.first_command_at is None:
             self.robot.first_command_at = time.monotonic()
+            if self.started is not None:
+                self.metrics['first_command_s'] = self.robot.first_command_at-self.started
         self.check_cancel()
         self.cameras.check()
         self.robot.read_motor_health()
@@ -1159,6 +1161,11 @@ class Runtime:
         if mode not in self.MODES:
             raise ValueError('unsupported experiment')
         dry = bool(payload.get('dry',False))
+        if mode=='run_sequence':
+            from .experiments import DEFAULT_SEQUENCE, sequence_steps
+            sequence_steps(payload.get('sequence',DEFAULT_SEQUENCE),{k:v for k,v in payload.items() if k not in ('mode','sequence','dry')})
+            if dry:
+                raise ValueError('use task-plan to preview the sequence; later stages require fresh observations')
         with self.submit_lock:
             if self.running or not self.commands.empty():
                 raise ValueError('another task is already running')
@@ -1388,7 +1395,8 @@ class Runtime:
         mode = payload.get('mode','build_tower')
         options = {key:value for key,value in payload.items() if key!='mode'}
         if mode=='run_sequence':
-            return {'mode':mode,'sequence':options.get('sequence',['sort_colors','empty_box','build_tower','unstack_tower','reset_scene']),
+            sequence = experiments.sequence_steps(options.pop('sequence',experiments.DEFAULT_SEQUENCE),options)
+            return {'mode':mode,'sequence':[{'mode':stage,**settings} for stage,settings in sequence],
                     'physical_authorized':False,'scene_version':snapshot.state.version,'reobserve_between_stages':True}
         if mode in self.EXTRA_MODES:
             context = experiments.prepare(snapshot,mode,options)
