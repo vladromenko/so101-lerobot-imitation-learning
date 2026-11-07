@@ -88,9 +88,10 @@ class Actions:
                 motion_started = True
             for choice in choices:
                 if plan is None:
-                    native_scene = self.scene.native_scene(object_id,choice)
-                    world = self.motion.make_world(native_scene)
                     try:
+                        obj = self.observe_object(object_id)
+                        native_scene = self.scene.native_scene(object_id,choice)
+                        world = self.motion.make_world(native_scene)
                         candidate,plan,world = choose_grasp(obj,native_scene,self.robot,self.motion.planner,start,rt.check_cancel,world)
                         self.motion.check_entry_transition(plan,world,start)
                         park = self.motion.preflight_cycle(plan,world)
