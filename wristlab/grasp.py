@@ -34,7 +34,8 @@ def rank_grasps(candidates):
     return sorted(candidates,key=lambda c:c.score)
 
 
-def choose_grasp(obj, scene, robot, planner, current, check_cancel, world, *, check_entry=None, stopped_pose=None):
+def choose_grasp(obj, scene, robot, planner, current, check_cancel, world, *, check_pick=None,
+                 stopped_pose=None, verify_plan=None):
     from box_extract.planning import flush_local
     failures = []
     metrics = getattr(planner,'timings',{})
@@ -59,8 +60,9 @@ def choose_grasp(obj, scene, robot, planner, current, check_cancel, world, *, ch
                     reason = world.reason(pose,target=obj.id,jaw_contact=True,payload_local=local,support_contact=True)
                     if reason:
                         raise ValueError('placement pose: '+reason)
-                plan = planner._candidate(scene,current,obj.id,scene.cubes[obj.id],grasp,closed,world,check_entry=check_entry)
-                return candidate,plan,world
+                plan = planner._candidate(scene,current,obj.id,scene.cubes[obj.id],grasp,closed,world,check_pick=check_pick)
+                park = verify_plan(plan,world) if verify_plan is not None else None
+                return candidate,plan,world,park
             except ValueError as exc:
                 failures.append(str(exc))
                 metrics['candidate_failures'] = failures[-12:]

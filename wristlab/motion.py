@@ -764,9 +764,8 @@ class Motion:
                 if reason:
                     raise ValueError(phase.name+': native STOP settling: '+reason)
 
-    def check_pick_entry(self, path, target, world):
-        phase = Phase('enter',path,jaw_contact=True)
-        plan = ExtractionPlan(world.scene.revision,target,(phase,),None,None,())
+    def check_pick_phase(self, phase, payload, target, world):
+        plan = ExtractionPlan(world.scene.revision,target,(phase,),payload,None,())
         self.check_path(plan,world)
 
     def check_path(self, plan, world):

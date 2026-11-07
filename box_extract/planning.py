@@ -288,7 +288,7 @@ class TunedExtractionPlanner(ExtractionPlanner):
                 rejections.append(str(exc))
         raise ValueError('no collision-free measured grasp and placement: ' + ('; '.join(rejections[-3:]) or 'IK/jaw geometry rejected all face pairs'))
 
-    def _candidate(self, scene, current, target_id, cube, grasp, closed, world, *, check_entry=None):
+    def _candidate(self, scene, current, target_id, cube, grasp, closed, world, *, check_pick=None):
         policy = {'target': target_id, 'jaw_contact': True}
         frame = self.model.frames(grasp)['gripper_frame_link']
         local = (cube.vertices_m-frame[:3, 3]) @ frame[:3, :3]
@@ -297,8 +297,9 @@ class TunedExtractionPlanner(ExtractionPlanner):
         # The cube only has to clear the rim: its lowest point, not its corner radius, sets the lift.
         rise = max(.025, rim+scene.box.clearance_m+self.rim_margin_m+cube.side_m/2-cube.center_m[2])
         entry_up = self.vertical_center(grasp, rise, local.mean(0), world, **policy)
-        if check_entry is not None:
-            check_entry(tuple(entry_up[::-1]))
+        enter = Phase('enter',entry_up[::-1],jaw_contact=True)
+        if check_pick is not None:
+            check_pick(enter,None)
         failure = self._tracking_robust(entry_up, world, **policy)
         if failure:
             raise ValueError('enter is not robust to arm tracking error: '+failure)
@@ -329,6 +330,9 @@ class TunedExtractionPlanner(ExtractionPlanner):
         closure = [*closure, held]
         flush = flush_local(local)
         lift = self.vertical_center(held, rise, flush.mean(0), world, payload_local=flush, **policy)
+        extract = Phase('extract_vertical',lift,True,True)
+        if check_pick is not None:
+            check_pick(extract,flush)
         # Select a point from the measured support polygon, then verify the
         # complete cube footprint; no nominal table coordinates are used.
         patch = scene.placement
@@ -363,10 +367,8 @@ class TunedExtractionPlanner(ExtractionPlanner):
             failure = self._tracking_robust(path, world, closing=closing, **policy)
             if failure:
                 raise ValueError(f'{name} is not robust to arm tracking error: {failure}')
-        phases = (Phase('open', open_path), Phase('approach', approach_path),
-                  Phase('enter', entry_up[::-1], jaw_contact=True),
-                  Phase('grasp', closure, jaw_contact=True),
-                  Phase('extract_vertical', lift, True, True),
+        phases = (Phase('open', open_path), Phase('approach', approach_path), enter,
+                  Phase('grasp', closure, jaw_contact=True),extract,
                   Phase('transfer', transfer, True, True),
                   Phase('lower_to_support', lowering, True, True, True),
                   Phase('release', release, True, True, True),

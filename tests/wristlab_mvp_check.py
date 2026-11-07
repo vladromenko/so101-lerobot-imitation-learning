@@ -84,11 +84,37 @@ def action_contract():
     return obj,rt,action,placement,plan,alignment
 
 
+def proposed_grasp(plan):
+    def choose(*args, verify_plan, **kwargs):
+        world = NS()
+        return None,plan,world,verify_plan(plan,world)
+    return choose
+
+
 class RelocateContract(unittest.TestCase):
+    def test_full_cycle_refusal_tries_another_grasp_at_the_same_destination(self):
+        from dataclasses import replace
+        from wristlab.grasp import choose_grasp
+        obj,rt,_,placement,plan,_ = action_contract()
+        scene = replace(rt.scene.native_scene(obj.id,placement),placement=NS(
+            polygon_xy_m=np.array([[.2,0.],[.3,0.],[.3,.1],[.2,.1]]),height_m=0.,uncertainty_m=0.))
+        second = replace(plan,scene_revision='second')
+        planner = NS(timings={},last_clamp_deg=15.,placement_pose=Mock(return_value=Q),
+                     _command_pose=dict,_candidate=Mock(side_effect=[plan,second]))
+        world = NS(reason=Mock(return_value=None))
+        park = object()
+        verify = Mock(side_effect=[ValueError('retreat: wall clearance'),park])
+        grasps = [NS(native=(dict(Q),15.)),NS(native=(dict(Q,shoulder_pan=Q['shoulder_pan']+1.),15.))]
+        with patch('wristlab.grasp.generate_grasps',return_value=iter(grasps)):
+            selected = choose_grasp(obj,scene,rt.robot,planner,Q,rt.check_cancel,world,verify_plan=verify)
+        self.assertIs(selected[1],second)
+        self.assertIs(selected[3],park)
+        self.assertEqual(planner._candidate.call_count,2)
+
     def test_active_perception_is_bounded_and_replans_approach(self):
         setup=action_contract();obj,rt,action,placement,plan,alignment=setup
         rt.refine_object=Mock(return_value=obj)
-        with patch('wristlab.actions.choose_grasp',return_value=(None,plan,NS())) as choose,patch(
+        with patch('wristlab.actions.choose_grasp',side_effect=proposed_grasp(plan)) as choose,patch(
             'wristlab.actions.visual_alignment',side_effect=[ValueError('view occluded'),alignment]):
             result=action.relocate(obj.id,placement)
         self.assertTrue(result.success,result.reason)
@@ -99,7 +125,7 @@ class RelocateContract(unittest.TestCase):
     def test_active_perception_does_not_repeat_same_failed_alignment(self):
         setup=action_contract();obj,rt,action,placement,plan,_=setup
         rt.refine_object=Mock(return_value=obj)
-        with patch('wristlab.actions.choose_grasp',return_value=(None,plan,NS())),patch(
+        with patch('wristlab.actions.choose_grasp',side_effect=proposed_grasp(plan)),patch(
             'wristlab.actions.visual_alignment',side_effect=ValueError('target still occluded')):
             result=action.relocate(obj.id,placement)
         self.assertFalse(result.success)
@@ -108,7 +134,7 @@ class RelocateContract(unittest.TestCase):
         rt.stop.assert_not_called()
     def invoke(self, setup, **options):
         obj,rt,action,placement,plan,alignment = setup
-        with patch('wristlab.actions.choose_grasp',return_value=(None,plan,NS())),patch('wristlab.actions.visual_alignment',return_value=alignment):
+        with patch('wristlab.actions.choose_grasp',side_effect=proposed_grasp(plan)),patch('wristlab.actions.visual_alignment',return_value=alignment):
             result = action.relocate(obj.id,placement,**options)
         return result
 
@@ -195,7 +221,7 @@ class RelocateContract(unittest.TestCase):
 
     def test_missing_visual_target_after_approach_does_not_latch_hardware_fault(self):
         setup = action_contract();obj,rt,action,placement,plan,_ = setup
-        with patch('wristlab.actions.choose_grasp',return_value=(None,plan,NS())),patch('wristlab.actions.visual_alignment',side_effect=ValueError('wrist target is missing')):
+        with patch('wristlab.actions.choose_grasp',side_effect=proposed_grasp(plan)),patch('wristlab.actions.visual_alignment',side_effect=ValueError('wrist target is missing')):
             result = action.relocate(obj.id,placement)
         self.assertFalse(result.success)
         self.assertEqual(result.evidence['failure_kind'],'PLANNING_OR_OBSERVATION')
@@ -475,7 +501,7 @@ class GeometryPolicy(unittest.TestCase):
     def test_incomplete_exit_blocks_before_any_actuator_call(self):
         setup=action_contract();obj,rt,action,placement,plan,_=setup
         rt.motion.preflight_cycle.side_effect=ValueError('retreat: no safe Park route')
-        with patch('wristlab.actions.choose_grasp',return_value=(None,plan,NS())):
+        with patch('wristlab.actions.choose_grasp',side_effect=proposed_grasp(plan)):
             result=action.relocate(obj.id,placement)
         self.assertFalse(result.success)
         rt.motion.execute_trajectory.assert_not_called()
