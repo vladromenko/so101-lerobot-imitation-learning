@@ -99,8 +99,10 @@ class Actions:
                     except ValueError as exc:
                         plan = None
                         failures.append(str(exc))
+                        rt.metrics.setdefault('placement_refusals',[]).append({
+                            'object_id':object_id,'center_m':choice.object_pose[:3,3].tolist(),'reason':str(exc)})
             if plan is None:
-                raise ValueError('; '.join(failures[-3:]))
+                raise ValueError('; '.join(dict.fromkeys(failures)))
             stage = 'path_check'
             rt.last_plan = plan
             if resume_held:
