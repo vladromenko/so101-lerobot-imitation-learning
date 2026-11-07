@@ -157,6 +157,27 @@ class TunedExtractionPlanner(ExtractionPlanner):
                 return path
             except ValueError as exc:
                 failures.append(str(exc))
+        if getattr(self,'check_retreat',None) is not None:
+            # Empty fingers need no stable payload orientation. Reuse native
+            # placement IK, accepting a seed only after its entire exit passes.
+            checked = []
+            def accept_exit(goal):
+                try:
+                    path = self.edge(release_goal,goal,world,**policy)
+                    self.check_retreat(Phase('retract',path,jaw_contact=True,placed_cube=policy['placed_cube']),world,policy['target'])
+                    checked.append(tuple(path))
+                    return True
+                except ValueError as exc:
+                    failures.append(str(exc))
+                    return False
+            target = frame[:3,3]+frame[:3,:3]@center_local+separation+rise
+            try:
+                self.placement_pose(release_goal,np.asarray(center_local)[None,:],policy['placed_cube'],target,
+                                    stable_face=False,accept_pose=accept_exit)
+                self.separation_waypoints = len(checked[0])
+                return checked[0]
+            except ValueError as exc:
+                failures.append(str(exc))
         raise ValueError('no checked empty-jaw exit: '+'; '.join(failures))
 
     separation_waypoints = 0
