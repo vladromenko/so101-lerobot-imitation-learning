@@ -53,7 +53,7 @@ class Actions:
         started, motion_started = time.monotonic(), False
         executing,last_phase = False,None
         stage = 'observe'
-        plan = world = None
+        plan = world = park = None
         aligned,active_refined = False,False
         try:
             obj = self.scene.state.objects[object_id] if resume_held else self.observe_object(object_id)
@@ -68,7 +68,8 @@ class Actions:
             rt.report(stage,object_id)
             if not dry:
                 rt.ensure_driver()
-            start = self.robot.read_state()['positions']
+            start_state = self.robot.read_state()
+            start = start_state['positions']
             choices = [placement]
             if placement.support_surface in self.scene.state.boxes and not resume_held:
                 for patch in self.scene.find_free_box_slots(placement.support_surface,obj.dimensions):
@@ -91,7 +92,7 @@ class Actions:
                     world = self.motion.make_world(native_scene)
                     try:
                         candidate,plan,world = choose_grasp(obj,native_scene,self.robot,self.motion.planner,start,rt.check_cancel,world)
-                        self.motion.preflight_cycle(plan,world)
+                        park = self.motion.preflight_cycle(plan,world)
                         placement = choice
                     except ValueError as exc:
                         plan = None
@@ -101,10 +102,15 @@ class Actions:
             stage = 'path_check'
             rt.last_plan = plan
             if resume_held:
-                self.motion.preflight_cycle(plan,world,require_pick=False)
+                park = self.motion.preflight_cycle(plan,world,require_pick=False)
             if dry:
+                phases = (*plan.phases,park)
                 return ActionResult(True,'geometric path checked; no actuator commands',object_id,self.scene.state,
-                                    {'physical_verified':False,'motion_started':False})
+                    {'physical_verified':False,'motion_started':False,'scene_revision':plan.scene_revision,
+                     'start_feedback_at':start_state['timestamp'],'destination':placement.support_surface,
+                     'placement_center_m':plan.placement_center_m.tolist(),
+                     'checked_phases':[{'name':p.name,'waypoints':len(p.joints),'carrying':p.carrying,
+                                        'start_deg':p.joints[0],'goal_deg':p.joints[-1]} for p in phases]})
             approached = not resume_held and not self.motion.contact_free_passed
             if approached:
                 motion_started = True
@@ -249,12 +255,17 @@ class Actions:
                     'observed_pose_m':observed.tolist(),'error_m':(observed[:3,3]-placement.object_pose[:3,3]).tolist(),
                     'position_sigma_m':measured.evidence['position_sigma_m']})
             parked = False
-            observed_scene = replace(native_scene,cubes=native_scene.cubes|{object_id:self.scene.native_object(object_id)})
+            placed_cube = self.scene.native_object(object_id)
+            observed_scene = replace(native_scene,cubes=native_scene.cubes|{object_id:placed_cube})
             observed_world = self.motion.make_world(observed_scene)
-            self.motion.plan,self.motion.world = plan,observed_world
+            # Park collision policies may override the world's target cube
+            # with the release phase's geometry. Rebind both to the observation.
+            observed_plan = replace(plan,phases=tuple(replace(p,placed_cube=placed_cube) if p.placed_cube is not None else p
+                                                       for p in plan.phases))
+            self.motion.plan,self.motion.world = observed_plan,observed_world
             if rt.mode=='relocate' and rt.park_qualified_file.exists():
                 stage = 'park'
-                rt.park_arm(plan,observed_world)
+                rt.park_arm(observed_plan,observed_world)
                 parked = True
             rt.physical_relocate_count += 1
             rt.metrics['cycle_s'] = time.monotonic()-started

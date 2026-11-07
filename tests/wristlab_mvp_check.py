@@ -50,21 +50,26 @@ def action_contract():
     cube = SpatialCube(obj.pose[:3,3],SIDE,np.eye(3),vertices,dict(obj.evidence))
     scene = Scene(NS());scene.state = SceneState({obj.id:obj})
     scene.native_scene = Mock(return_value=ExtractionScene('recorded',time.time(),NS(),{obj.id:cube},NS(),(),True))
-    scene.native_object = Mock(return_value=cube)
-    state = {'positions':dict(Q),'gripper':Q['gripper']}
+    offset = np.array([.001,0.,0.])
+    observed_cube = SpatialCube(cube.center_m+offset,SIDE,np.eye(3),vertices+offset,dict(obj.evidence))
+    scene.native_object = Mock(return_value=observed_cube)
+    state = {'positions':dict(Q),'gripper':Q['gripper'],'timestamp':time.time()}
     robot = NS(read_state=Mock(return_value=state),arm=NS(read=Mock(return_value=(dict(Q),{},{}))),
         backend=NS(model=NS(frames=lambda q:{'gripper_frame_link':np.eye(4)})))
     local = vertices-vertices.mean(0)
     def phase(name):
-        return Phase(name,(dict(Q),dict(Q)),name in ('extract_vertical','release'))
-    plan = ExtractionPlan('recorded',obj.id,tuple(phase(s) for s in ('open','approach','enter','grasp')),
+        return Phase(name,(dict(Q),dict(Q)),name in ('extract_vertical','release'),
+                     placed_cube=cube if name=='retract' else None)
+    remainder = ('extract_vertical','transfer','lower_to_support','release','retract')
+    plan = ExtractionPlan('recorded',obj.id,tuple(phase(s) for s in ('open','approach','enter','grasp')+remainder),
                           local,np.array([.3,0.,SIDE/2]),())
-    rest = ExtractionPlan('recorded',obj.id,tuple(phase(s) for s in ('extract_vertical','transfer','release','retract')),
+    rest = ExtractionPlan('recorded',obj.id,tuple(phase(s) for s in remainder),
                           local,np.array([.3,0.,SIDE/2]),())
     driver = NS(confirm_grasp=Mock(return_value=local),release_confirmed=Mock(),confirm_retention=Mock(),retention=NS(armed=True))
     motion = NS(qualification_reasons=Mock(return_value=[]),make_world=Mock(return_value=NS()),
         check_path=Mock(),contact_free_passed=True,driver=driver,planner=NS(),execute_trajectory=Mock(),
-        replan_held=Mock(return_value=(rest,NS())),preflight_cycle=Mock(),state_is_valid=Mock(return_value=None))
+        replan_held=Mock(return_value=(rest,NS())),preflight_cycle=Mock(return_value=phase('safe_park')),
+        state_is_valid=Mock(return_value=None))
     rt = NS(scene=scene,robot=robot,motion=motion,metrics={},report=Mock(),refresh=Mock(),
         check_cancel=Mock(),wait_pause=Mock(),ensure_driver=Mock(),stop=Mock(),recovery=Recovery(),
         mode='relocate',physical_relocate_count=0,cameras=NS(check=Mock()),stop_event=threading.Event(),
@@ -72,7 +77,8 @@ def action_contract():
     action = Actions(rt)
     action.capture_grip_view = Mock(return_value={'frame_id':'anchor'})
     action.verify_pick = Mock(return_value=True)
-    action.verify_placement = Mock(return_value=(True,obj.pose.copy()))
+    observed_pose = obj.pose.copy();observed_pose[:3,3] += offset
+    action.verify_placement = Mock(return_value=(True,observed_pose))
     placement = Placement(obj.pose.copy(),'box-1')
     alignment = {'observed_top_m':(obj.pose[:3,3]+[0.,0.,SIDE/2]).tolist()}
     return obj,rt,action,placement,plan,alignment
@@ -118,6 +124,8 @@ class RelocateContract(unittest.TestCase):
         self.assertGreaterEqual(rt.motion.preflight_cycle.call_count,2)
         rt.park_arm.assert_called_once()
         self.assertIs(rt.motion.make_world.call_args.args[0].cubes[obj.id],rt.scene.native_object.return_value)
+        park_plan = rt.park_arm.call_args.args[0]
+        self.assertIs(next(p.placed_cube for p in park_plan.phases if p.name=='retract'),rt.scene.native_object.return_value)
         self.assertTrue(result.evidence['retreat_completed'])
         self.assertTrue(result.evidence['parked'])
         self.assertEqual(rt.physical_relocate_count,1)
@@ -157,6 +165,8 @@ class RelocateContract(unittest.TestCase):
         result = self.invoke(setup,dry=True)
         self.assertTrue(result.success)
         self.assertFalse(result.evidence['physical_verified'])
+        self.assertEqual([p['name'] for p in result.evidence['checked_phases']][-2:],['retract','safe_park'])
+        self.assertEqual(result.evidence['checked_phases'][-1]['goal_deg'],Q)
         rt.ensure_driver.assert_not_called()
         rt.motion.execute_trajectory.assert_not_called()
         rt.motion.driver.confirm_grasp.assert_not_called()
