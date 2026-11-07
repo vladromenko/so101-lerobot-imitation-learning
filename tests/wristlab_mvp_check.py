@@ -252,6 +252,22 @@ class GeometryPolicy(unittest.TestCase):
             rt.prepare_overview_clearance({'operator_at_stop':True,'proposal_checked_at':3.})
         rt.refresh.assert_not_called()
 
+    def test_encoder_drift_invalidates_an_overview_proposal_before_actuation(self):
+        rt=Runtime.__new__(Runtime);rt.stop_generation=2;rt.overview_preview={'checked_at':1.}
+        rt.config={'poll_interval_s':1.};rt.report=Mock();rt.refresh=Mock();rt.monitor_motors=Mock()
+        rt.scene=NS(state=NS(boxes={'observed':object()}));rt.geometry=NS()
+        rt.cameras=NS(check=Mock(),record_state=Mock())
+        health={j:{'goal':q,'status_raw':0,'torque_enabled':True} for j,q in Q.items()}
+        state={'positions':Q,'motor_health':health,'timestamp':time.time(),'q':np.zeros(5),'gripper':Q['gripper']}
+        changed=state|{'positions':Q|{'gripper':Q['gripper']+100./1511.}}
+        rt.robot=NS(owns_lease=lambda:True,read_state=Mock(side_effect=[state,changed]),
+                    read_motor_health=Mock(return_value=health),arm=NS(follow=Mock()))
+        rt.motion=NS(overview_clear_path=Mock(return_value=((Q,Q),NS(),{'hardware_goals':Q})))
+        with self.assertRaisesRegex(ValueError,'changed during overview calculation'):
+            rt.prepare_overview_clearance({'dry':True})
+        self.assertIsNone(rt.overview_preview)
+        rt.robot.arm.follow.assert_not_called()
+
     def test_placement_cannot_be_proved_by_retained_or_old_metric_coordinates(self):
         scene=Scene(NS(wrist=None))
         obj=object_at('target','green',.25,0.)

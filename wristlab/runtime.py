@@ -417,18 +417,34 @@ class Runtime:
         if not dry and (previous is None or payload.get('operator_at_stop') is not True or
                         payload.get('proposal_checked_at')!=previous['checked_at'] or generation!=previous['stop_generation']):
             raise ValueError('a current checked overview route and explicit attended approval are required')
+        self.overview_preview = None
+        last_feedback = 0.
         def check():
+            nonlocal last_feedback
             if generation!=self.stop_generation or not self.robot.owns_lease():
                 raise RuntimeError('STOP or hardware ownership changed during overview check')
             if not dry:
                 self.check_cancel()
             self.cameras.check()
+            if time.monotonic()-last_feedback>=self.config['poll_interval_s']:
+                feedback = self.robot.read_state()
+                self.cameras.record_state(feedback['timestamp'],feedback['q'],feedback['gripper'])
+                self.monitor_motors()
+                last_feedback = time.monotonic()
+                if any(m['status_raw'] or not m['torque_enabled'] for m in feedback['motor_health'].values()):
+                    raise RuntimeError('overview check lost a healthy powered hold')
         check()
         self.refresh()
         if not self.scene.state.boxes:
             raise ValueError('no current box outlines for a checked view change')
         self.report('checking','noncontact overview clearance from fresh geometry')
         path,world,mapping = self.motion.overview_clear_path(self.scene,self.geometry,check)
+        check()
+        state = self.robot.read_state()
+        health = self.robot.read_motor_health(force=True)
+        if (state['positions']!=path[0] or any(m['status_raw'] or not m['torque_enabled'] for m in health.values()) or
+            {j:m['goal'] for j,m in health.items()}!=mapping['hardware_goals']):
+            raise ValueError('encoders or holding targets changed during overview calculation; obtain a fresh route')
         proposal = {'start':path[0],'goal':path[-1],'checked_at':time.time(),'stop_generation':generation,
                     'partial_cube_clearance_m':world.partial_clearance.copy(),
                     'holding_hardware_goals':mapping['hardware_goals'],'stop_policy':mapping['supported_stop_policy'],
@@ -455,8 +471,10 @@ class Runtime:
         reason = world.reason(final)
         if reason or abs(final['shoulder_pan']-path[-1]['shoulder_pan'])>self.motion.planner.tracking_error_deg:
             raise RuntimeError('overview move endpoint: '+str(reason or 'tracking error'))
+        settled_at = time.time()
+        for camera in ('overview','wrist'):
+            self.cameras.wait_for_frame(camera,settled_at,self.check_cancel)
         self.refresh()
-        self.overview_preview = None
         self.report('prepared','overview view reached; '+('obstacles remain unresolved' if self.scene.state.obstacles else 'all visible cubes localized'))
         return proposal|{'actual':final,'physical_verified':True,'actuator_commands_sent':True,
                          'remaining_obstacles':self.scene.state.obstacles}
