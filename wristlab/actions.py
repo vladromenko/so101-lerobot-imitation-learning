@@ -92,6 +92,7 @@ class Actions:
                     world = self.motion.make_world(native_scene)
                     try:
                         candidate,plan,world = choose_grasp(obj,native_scene,self.robot,self.motion.planner,start,rt.check_cancel,world)
+                        self.motion.check_entry_transition(plan,world,start)
                         park = self.motion.preflight_cycle(plan,world)
                         placement = choice
                     except ValueError as exc:
@@ -103,6 +104,8 @@ class Actions:
             rt.last_plan = plan
             if resume_held:
                 park = self.motion.preflight_cycle(plan,world,require_pick=False)
+            else:
+                self.motion.check_entry_transition(plan,world,start)
             if dry:
                 phases = (*plan.phases,park)
                 return ActionResult(True,'geometric path checked; no actuator commands',object_id,self.scene.state,
@@ -166,6 +169,7 @@ class Actions:
                         candidate,plan,world = choose_grasp(obj,native_scene,self.robot,self.motion.planner,current,rt.check_cancel,world)
                         stage = 'path_check'
                         self.motion.preflight_cycle(plan,world)
+                        self.motion.check_entry_transition(plan,world,current)
                         queue = list(plan.phases)
                         aligned = observation is not None
                         phase = None

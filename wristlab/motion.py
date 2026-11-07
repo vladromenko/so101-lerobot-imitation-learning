@@ -186,7 +186,20 @@ class Motion:
         frame = scene.frames['overview']
         world = StartupWorld(self.robot,scene,geometry,start,start,self.attachment_path,strict=True)
         if not world.partial_cubes:
-            raise ValueError('no bounded partially visible cube requires a new overview')
+            from types import SimpleNamespace
+            from .scene import BoxUnion
+            from so101_pick_place.experiments.box_extraction.scene import ExtractionScene
+            if not scene.state.evidence.get('coverage_verified') or self.qualification_reasons(geometry):
+                raise ValueError('powered entry requires fully measured current collision geometry')
+            boxes = [box.evidence['native_box'] for box in scene.state.boxes.values()
+                     if box.evidence.get('metric_qualified') or box.evidence.get('collision_qualified')]
+            if not boxes or len(boxes)!=len(scene.state.boxes):
+                raise ValueError('powered entry requires collision geometry for every visible box')
+            cubes = {key:scene.native_object(key) for key in scene.state.objects}
+            table = SimpleNamespace(height_m=float(model.table_z),uncertainty_m=0.)
+            world.metric_world = self.make_world(ExtractionScene(
+                str(scene.state.version),scene.state.timestamp,BoxUnion(boxes[0],boxes),cubes,table,(),True))
+            return self.powered_entry_path(world,mapping,check)
         visible = np.zeros(frame.image.shape[:2],np.uint8)
         for _,_,_,rectangle in world.partial_cubes:
             cv2.fillConvexPoly(visible,rectangle,255)
@@ -230,6 +243,53 @@ class Motion:
                 if len(rejected)==2:
                     break
         raise ValueError('no checked overview change: '+str(first_refusal or 'cube remains occluded'))
+
+    def powered_entry_path(self, world, mapping, check):
+        """Move an empty tool away from a limit before taking up native compensation."""
+        start,hold = world.start,mapping['hardware_goals']
+        model = self.robot.backend.model
+        steps = self.robot.encoder_steps()
+        sag = mapping['sag']
+        native = lambda q:self.robot.quantized_command(self.robot.backend.driver_command_goal(q,sag))
+        nominal = native(start)
+        stopped = self.robot.quantized_command(start)
+        goal = dict(start)
+        from so101_pick_place.kinematics.so101_backend import ARM_JOINTS
+        for name,(low,high) in zip(ARM_JOINTS,model.ranges):
+            # A move is required only when the actual hold, ordinary goal,
+            # or factory STOP would consume the existing working margin.
+            excursions = [0.,nominal[name]-hold[name],stopped[name]-hold[name],stopped[name]-nominal[name]]
+            reserve = self.planner.tracking_error_deg+steps[name]
+            lower = low+model.margin-min(excursions)+reserve
+            upper = high-model.margin-max(excursions)-reserve
+            if lower>upper:
+                raise ValueError(name+': insufficient range for the measured holding transition')
+            goal[name] = float(np.clip(start[name],lower,upper))
+        if goal==start:
+            raise ValueError('all cubes visible and no powered entry adjustment is required')
+        world.goal = goal
+        self.recovery_mapping = mapping
+        command = self.robot.quantized_command(self.robot.synchronized_command(goal,mapping))
+        world.command_bounds = hold,command
+        path = tuple(self.robot.native_edge_samples(start,goal))
+        for q in path:
+            check()
+            for sample in self.recovery_envelope(start,q,hold):
+                reason = world.reason(sample)
+                if reason:
+                    raise ValueError('powered entry tracking envelope: '+reason)
+            reason = world.reason(self.robot.synchronized_command(q,mapping),command=True)
+            if reason:
+                raise ValueError('powered entry command: '+reason)
+        for q in self.recovery_envelope(start,goal,hold,settled=True):
+            normal = native(q)
+            frozen = self.robot.quantized_command(q)
+            for goals,reference in ((normal,command),(frozen,command),(frozen,normal)):
+                response = {j:q[j]+goals[j]-reference[j] for j in q}
+                reason = world.reason(response)
+                if reason:
+                    raise ValueError('powered entry endpoint transition: '+reason)
+        return path,world,mapping
 
     def qualification_blockers(self, geometry):
         blockers = []
@@ -630,6 +690,35 @@ class Motion:
             payload_local=plan.payload_local if phase.carrying else None,support_contact=phase.support_contact,
             placed_cube=phase.placed_cube)
 
+    def check_entry_transition(self, plan, world, planned_start):
+        """Check the response to taking over the actual powered motor goals."""
+        self.check_cancel()
+        state = self.robot.read_state()
+        health = self.robot.read_motor_health(force=True)
+        actual = state['positions']
+        if actual!=planned_start:
+            raise ValueError('encoders changed during planning; replan from fresh feedback')
+        if (time.time()-state['timestamp']>.5 or health.keys()!=actual.keys() or
+            any(not m['torque_enabled'] or m['status_raw'] or m['moving'] for m in health.values())):
+            raise ValueError('first command requires fresh, stationary, fault-free powered feedback')
+        phase = plan.phases[0]
+        if not phase.joints or phase.joints[0]!=planned_start or phase.carrying or phase.jaw_contact:
+            raise ValueError('first phase does not start with the empty tool at the measured pose')
+        opening = phase.joints if phase.name=='open' else phase.joints[:1]
+        if phase.name=='open' and any(q[j]!=actual[j] for q in opening for j in actual if j!='gripper'):
+            raise ValueError('jaw opening must start with a stationary arm')
+        previous = actual
+        for q in opening:
+            command = self.robot.quantized_command(self.planner._command_pose(q))
+            response = {j:actual[j]+command[j]-health[j]['goal'] for j in actual}
+            for sample in self.robot.native_edge_samples(previous,response):
+                self.check_cancel()
+                reason = self.state_is_valid(sample,phase,plan,world)
+                if reason:
+                    change = ', '.join(f'{j} {response[j]-actual[j]:+.2f}°' for j in actual if j!='gripper' and response[j]!=actual[j])
+                    raise ValueError(f'{phase.name}: native holding transition: {reason}; predicted joint changes: {change}')
+            previous = response
+
     def edge_is_valid(self, start, goal, phase, plan, world):
         if self.planner.command_sag is None:
             raise ValueError('native gravity-compensation setting has not been read')
@@ -936,6 +1025,7 @@ class Motion:
         if not outward or any(p.carrying or p.jaw_contact for p in outward):
             raise ValueError('contact-free trial must contain only clear approach phases')
         self.check_path(replace(plan,phases=outward),world)
+        self.check_entry_transition(plan,world,start)
         world.cache_enabled = False
         world.cache.clear()
         self.driver.phase,self.driver.plan,self.driver.world = outward[0],plan,world
@@ -1076,6 +1166,7 @@ class StartupWorld:
         self.partial_clearance = {}
         self.command_bounds = None
         self.cache = {}
+        self.metric_world = None
 
     @staticmethod
     def bound_partial_cubes(scene,geometry):
@@ -1132,6 +1223,8 @@ class StartupWorld:
             allowance = 2. if name=='elbow_flex' else .8
             if not low-allowance<=value<=high+.8:
                 return name+': outside bounded startup corridor'
+        if self.metric_world is not None:
+            return self.metric_world.reason(q)
         pose = model.pose(q)
         problems = model.problems(pose) if self.strict else model.problems(pose,margin=0.)
         if problems:

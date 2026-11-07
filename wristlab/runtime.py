@@ -445,7 +445,8 @@ class Runtime:
         if (state['positions']!=path[0] or any(m['status_raw'] or not m['torque_enabled'] for m in health.values()) or
             {j:m['goal'] for j,m in health.items()}!=mapping['hardware_goals']):
             raise ValueError('encoders or holding targets changed during overview calculation; obtain a fresh route')
-        proposal = {'start':path[0],'goal':path[-1],'checked_at':time.time(),'stop_generation':generation,
+        purpose = 'overview' if world.partial_cubes else 'powered_entry'
+        proposal = {'start':path[0],'goal':path[-1],'checked_at':time.time(),'stop_generation':generation,'purpose':purpose,
                     'partial_cube_clearance_m':world.partial_clearance.copy(),
                     'holding_hardware_goals':mapping['hardware_goals'],'stop_policy':mapping['supported_stop_policy'],
                     'success':True,'physical_verified':False,'actuator_commands_sent':False}
@@ -453,23 +454,23 @@ class Runtime:
             self.overview_preview = proposal
             self.report('checked','overview view change checked; no actuator commands')
             return proposal
-        if any(previous[key]!=proposal[key] for key in ('start','goal','holding_hardware_goals')):
+        if any(previous[key]!=proposal[key] for key in ('purpose','start','goal','holding_hardware_goals')):
             raise ValueError('the approved overview route or holding goals changed; recalculate before execution')
         check()
         self.motion.startup_world = world
         self.motion.executing_recovery = True
         self.motion.recovery_mapping = mapping
         try:
-            travel = abs(path[-1]['shoulder_pan']-path[0]['shoulder_pan'])
-            self.report('moving','checked noncontact overview view')
+            travel = max(abs(path[-1][j]-path[0][j]) for j in path[0])
+            self.report('moving','checked noncontact '+purpose)
             with self.robot.synchronized_follow(mapping):
-                self.robot.arm.follow(path,duration=max(1.,1.875*travel/2.),settle=1.,within=.7,lead=False,step='overview_clearance')
+                self.robot.arm.follow(path,duration=max(1.,1.875*travel/2.),settle=1.,within=.7,lead=False,step=purpose+'_clearance')
         finally:
             self.motion.startup_world = None
             self.motion.executing_recovery = False
         final = self.robot.read_state()['positions']
         reason = world.reason(final)
-        if reason or abs(final['shoulder_pan']-path[-1]['shoulder_pan'])>self.motion.planner.tracking_error_deg:
+        if reason or max(abs(final[j]-path[-1][j]) for j in final)>self.motion.planner.tracking_error_deg:
             raise RuntimeError('overview move endpoint: '+str(reason or 'tracking error'))
         settled_at = time.time()
         for camera in ('overview','wrist'):
@@ -762,10 +763,67 @@ class Runtime:
             raise ValueError('overview measurements did not come from three fresh distinct frames')
         return sources
 
+    @staticmethod
+    def measure_opening_series(samples, calibration, params, methods=('native','rim_edges')):
+        from box_extract.opening_fallback import OpeningTracker,estimate_opening
+        from box_extract.scene_builder import measure_box
+        # Do not mix a native opening on one frame with a rim-edge opening
+        # on another. An unfolded lid can be a convincing native proposal.
+        for source in methods:
+            observations = []
+            for image,scan in samples:
+                if source=='rim_edges':
+                    bodies = [d for d in scan['detections'] if d['label']=='box']
+                    opening,evidence = estimate_opening(image,scan|{'detections':bodies},tracker=OpeningTracker())
+                    if opening is None or evidence.get('remembered'):
+                        break
+                    scan = scan|{'detections':[*bodies,opening]}
+                try:
+                    observations.append(measure_box(scan,calibration,params,len(samples)))
+                except ValueError:
+                    break
+            if len(observations)==len(samples) and observations:
+                centers = np.array([b.base_from_box[:2,3] for b in observations])
+                spread = float(np.linalg.norm(np.ptp(centers,axis=0)))
+                if spread<=params.max_box_spread_m:
+                    native = observations[-1]
+                    native.evidence.update(opening_series=source,opening_center_spread_m=spread)
+                    return native
+        return None
+
+    def reobserve_rim(self, box_id, body, stationary, params, count):
+        """Reacquire independent rim frames if a native scan missed the edge."""
+        samples = []
+        after = time.time()
+        prior = self.scene.state.boxes[box_id].evidence['polygon']
+        for _ in range(2*count):
+            self.cameras.wait_for_frame('overview',after,self.check_cancel)
+            self.refresh()
+            frame = self.scene.frames['overview']
+            after = np.nextafter(frame.capture_interval[1],float('inf'))
+            observed = self.scene.state.boxes.get(box_id)
+            state = self.robot.read_state()
+            self.monitor_motors()
+            self.check_cancel()
+            if (state['positions']!=stationary or self.scene.state.obstacles or observed is None or
+                observed.evidence.get('frame_id')!=frame.frame_id or observed.evidence.get('visibility')!='observed'):
+                raise ValueError(box_id+': scene or encoder coverage changed while measuring the rim')
+            polygon = observed.evidence['polygon']
+            if np.linalg.norm(np.mean(polygon,axis=0)-np.mean(prior,axis=0))>=4.:
+                raise ValueError(box_id+': box moved while measuring the rim')
+            # The verified body contour bounds the search; only the fresh
+            # image can supply the interior rim edges.
+            samples.append((frame.image,{'detections':[body]}))
+            if len(samples)>=count:
+                native = self.measure_opening_series(samples[-count:],self.geometry.calibration,params,('rim_edges',))
+                if native is not None:
+                    native.evidence['opening_series'] = 'fresh_rim_edges'
+                    return native
+        return None
+
     def prepare_overhead(self, attendance, recovery=False):
         """Restore the successful overview pipeline, without a wrist transform."""
-        from box_extract.scene_builder import SceneParameters,measure_box,spatial_cube,merge_cubes
-        from box_extract.opening_fallback import estimate_opening,OpeningTracker
+        from box_extract.scene_builder import SceneParameters,spatial_cube,merge_cubes
         from so101_pick_place.vision.calibration_control import validate_overview_control
         self.check_cancel()
         state = self.robot.read_state()
@@ -814,8 +872,7 @@ class Runtime:
         params = SceneParameters()
         measured = {}
         for box_id,box in self.scene.state.boxes.items():
-            observations = []
-            tracker = OpeningTracker()
+            samples = []
             for scan in sources:
                 image = cv2.imread(str(Path(scan['artifacts'])/'frame.jpg'))
                 bodies = [d for d in scan['detections'] if d['label']=='box']
@@ -828,15 +885,11 @@ class Runtime:
                     raise ValueError(box_id+': current box contour differs from the measured observations')
                 openings = [d for d in scan['detections'] if d['label']=='box_opening' and
                             cv2.pointPolygonTest(outline,tuple(d['center_px']),False)>=0]
-                subset = dict(scan,detections=[body]+openings)
-                if not openings:
-                    opening,detail = estimate_opening(image,subset,tracker=tracker)
-                    if opening is None:
-                        raise ValueError(box_id+': '+str(detail))
-                    subset['detections'].append(opening)
-                observations.append(measure_box(subset,self.geometry.calibration,params,len(sources)))
-            centers = np.array([b.base_from_box[:2,3] for b in observations])
-            if np.linalg.norm(np.ptp(centers,axis=0))>params.max_box_spread_m:
+                samples.append((image,dict(scan,detections=[body]+openings)))
+            native = self.measure_opening_series(samples,self.geometry.calibration,params)
+            if native is None and not recovery:
+                native = self.reobserve_rim(box_id,body,state['positions'],params,len(samples))
+            if native is None:
                 from .scene import BoxKeepout
                 polygon = np.asarray(box.evidence['polygon'])
                 points = np.array([self.geometry.intersect_ray_with_plane(self.geometry.pixel_ray_in_base(p,frame),
@@ -848,7 +901,6 @@ class Runtime:
                                     reason='opening is not repeatable; entry and placement are prohibited')
                 box.pose = native.base_from_box.copy()
             else:
-                native = observations[-1]
                 box.evidence.update(metric_qualified=True,native_box=native,geometry_mode='overhead_grasp',
                                     support_assumptions=native.evidence['floor_assumption'])
                 box.pose = native.base_from_box.copy()

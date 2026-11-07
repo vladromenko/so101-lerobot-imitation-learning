@@ -67,7 +67,7 @@ def action_contract():
                           local,np.array([.3,0.,SIDE/2]),())
     driver = NS(confirm_grasp=Mock(return_value=local),release_confirmed=Mock(),confirm_retention=Mock(),retention=NS(armed=True))
     motion = NS(qualification_reasons=Mock(return_value=[]),make_world=Mock(return_value=NS()),
-        check_path=Mock(),contact_free_passed=True,driver=driver,planner=NS(),execute_trajectory=Mock(),
+        check_path=Mock(),check_entry_transition=Mock(),contact_free_passed=True,driver=driver,planner=NS(),execute_trajectory=Mock(),
         replan_held=Mock(return_value=(rest,NS())),preflight_cycle=Mock(return_value=phase('safe_park')),
         state_is_valid=Mock(return_value=None))
     rt = NS(scene=scene,robot=robot,motion=motion,metrics={},report=Mock(),refresh=Mock(),
@@ -170,6 +170,28 @@ class RelocateContract(unittest.TestCase):
         rt.ensure_driver.assert_not_called()
         rt.motion.execute_trajectory.assert_not_called()
         rt.motion.driver.confirm_grasp.assert_not_called()
+
+    def test_powered_goal_transition_rejects_outward_elbow_step_before_motion(self):
+        setup = action_contract();_,rt,_,_,plan,_ = setup
+        state = rt.robot.read_state()
+        state['timestamp'] = time.time()
+        actual = state['positions']
+        rt.robot.read_motor_health = Mock(return_value={
+            name:{'goal':value-(1.32 if name=='elbow_flex' else 0.),'torque_enabled':True,'status_raw':0,'moving':False}
+            for name,value in actual.items()})
+        rt.robot.quantized_command = dict
+        rt.robot.native_edge_samples = Robot.native_edge_samples
+        rt.motion.robot = rt.robot
+        rt.motion.planner._command_pose = dict
+        rt.motion.check_cancel = rt.check_cancel
+        rt.motion.state_is_valid.side_effect = lambda q,*_: (
+            'elbow_flex outside its range' if q['elbow_flex']>actual['elbow_flex']+.2 else None)
+        rt.motion.check_entry_transition.side_effect = lambda *args: Motion.check_entry_transition(rt.motion,*args)
+        result = self.invoke(setup)
+        self.assertFalse(result.success)
+        self.assertIn('native holding transition: elbow_flex outside its range',result.reason)
+        rt.motion.preflight_cycle.assert_not_called()
+        rt.motion.execute_trajectory.assert_not_called()
 
     def test_missing_visual_target_after_approach_does_not_latch_hardware_fault(self):
         setup = action_contract();obj,rt,action,placement,plan,_ = setup
