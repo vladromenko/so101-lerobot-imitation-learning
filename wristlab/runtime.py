@@ -61,6 +61,7 @@ class Runtime:
         self.recovery = Recovery(self.config['max_recovery_attempts'])
         self.actions = Actions(self)
         self.running,self.initialized = False,False
+        self.encoder_hold_tick = None
         self.phase,self.detail = 'initializing','Загрузка калибровки и детекторов'
         self.mode = None
         self.metrics = {key:None for key in ('first_command_s','vision_s','grasp_planning_s','ik_s',
@@ -279,7 +280,9 @@ class Runtime:
         self.check_cancel()
         self.cameras.check()
         self.robot.read_motor_health()
-        self.motion.guarded_tick(record)
+        encoder_hold_tick = getattr(self,'encoder_hold_tick',None)
+        if encoder_hold_tick is None:
+            self.motion.guarded_tick(record)
         stamp = time.time()
         self.robot.last_state = {'timestamp':stamp,'positions':dict(record['pos']),
             'loads':dict(record['load']),'currents':dict(record['ma']),
@@ -288,6 +291,9 @@ class Runtime:
         self.parked = False
         self.monitor_motors()
         self.cameras.record_state(stamp,self.robot.from_native(record['pos']),record['pos']['gripper'])
+        if encoder_hold_tick is not None:
+            self.check_cancel()
+            encoder_hold_tick(record)
 
     def monitor_motors(self):
         warnings,critical = [],[]
@@ -359,6 +365,10 @@ class Runtime:
                 self.robot.first_command_at = None
                 self.results = [self.preview_invalid_start() if payload.get('dry') is True else self.execute_invalid_start(payload)]
                 return
+            if payload.get('mode')=='ENCODER_HOLD_TRIAL':
+                self.results = [self.verify_stationary_encoder_hold(dry=payload.get('dry') is True)]
+                self.report('checked','Проверено удержание пустой руки; захват кубика не выполнялся')
+                return
             self.check_cancel()
             self.cameras.check()
             self.refresh()
@@ -413,6 +423,86 @@ class Runtime:
             self.running = False
             self.preparing_scene = False
             self.persist()
+
+    def verify_stationary_encoder_hold(self, dry=False):
+        """Test only a stationary, empty tool, with the existing goal registers."""
+        from so101ik import Fault
+        self.check_cancel()
+        self.cameras.check()
+        self.refresh()
+        robot = self.robot
+        if self.scene.held is not None or robot.arm is None or not robot.arm.torque:
+            raise ValueError('encoder hold trial requires a powered arm with an empty gripper')
+        raw = robot.arm.raw
+        if not hasattr(raw,'encoder_hold') or not hasattr(raw,'stop_encoder_hold'):
+            raise ValueError('encoder hold binding is not installed')
+        world = self.motion.stationary_world(self.scene)
+        state = robot.read_state()
+        health = robot.read_motor_health(force=True)
+        start = state['positions']
+        if (not robot.audit_state(state)['planning_valid'] or health.keys()!=start.keys()
+            or any(m['moving'] or m['status_raw'] or not m['torque_enabled'] for m in health.values())
+            or state['loads']['gripper'] or state['currents']['gripper']):
+            raise ValueError('stationary, empty-tool feedback was not verified')
+        self.monitor_motors()
+        self.check_cancel()
+        mapping = robot.synchronize_reference(state|{'motor_health':health},raw.sag)
+        goals,reference = mapping['hardware_goals'],mapping['reference']
+        steps = robot.encoder_steps()
+        centers = {j:goals[j]+steps[j]/2 for j in goals}
+        frozen = robot.quantized_command(start)
+        factory = {j:start[j]+frozen[j]-goals[j] for j in start}
+        # Both the commanded hold and the unchanged factory fallback must be
+        # clear in this work area. The native trial window is one exact packet.
+        for end in (goals,reference,factory):
+            for pose in robot.native_edge_samples(start,end):
+                self.check_cancel()
+                if reason := world.reason(pose):
+                    raise ValueError('stationary hold or factory fallback: '+reason)
+        evidence = {'success':True,'status':'ENCODER_HOLD_CHECKED','physical_verified':False,
+                    'physical_hold_verified':False,'positions_before':start,'goals_before':goals,
+                    'factory_settling_estimate':factory}
+        if dry:
+            return evidence
+        self.check_cancel()
+        if robot.read_state()['positions']!=start or any(m['moving'] or m['goal']!=goals[j]
+                                                        for j,m in robot.read_motor_health(force=True).items()):
+            raise ValueError('powered hold changed after the check')
+        requested = False
+
+        def request_after_feedback(record):
+            nonlocal requested
+            if (requested or robot.quantized_command(robot.backend.driver_command_goal(record['goal'],raw.sag))!=goals
+                or any(abs(record['pos'][j]-start[j])>steps[j] for j in start)):
+                raise RuntimeError('stationary native feedback differs from the checked hold')
+            raw.stop_encoder_hold()
+            requested = True
+
+        raw.encoder_hold(mapping['offset'],centers,centers)
+        self.encoder_hold_tick = request_after_feedback
+        try:
+            try:
+                raw.follow([reference,reference],duration=.5,settle=0.,lead=False,step='stationary_encoder_hold_trial')
+            except Fault as exc:
+                self.check_cancel()
+                if not requested or str(exc)!='stop asked for':
+                    raise
+            else:
+                raise RuntimeError('the scoped STOP did not terminate the native follower')
+        finally:
+            self.encoder_hold_tick = None
+            raw.supported_stop(None)
+        self.cameras.wait_for_frame('overview',time.time(),self.check_cancel)
+        end = robot.read_state()
+        targets = {j:m['goal'] for j,m in robot.read_motor_health(force=True).items()}
+        self.monitor_motors()
+        self.check_cancel()
+        if targets!=goals or any(abs(end['positions'][j]-start[j])>steps[j] for j in start):
+            raise RuntimeError('stationary stop did not preserve the checked powered hold')
+        evidence.update(status='ENCODER_HOLD_OBSERVED',physical_hold_verified=True,
+                        positions_after=end['positions'],goals_after=targets)
+        (self.output/'stationary-encoder-hold-trial.json').write_text(json.dumps(evidence,indent=2))
+        return evidence
 
     def prepare_overview_clearance(self,payload):
         dry = payload.get('dry') is True
