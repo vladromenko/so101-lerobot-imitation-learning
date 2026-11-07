@@ -3,7 +3,7 @@ from dataclasses import replace
 import time
 import numpy as np
 from so101_pick_place.experiments.box_extraction.planner import Phase
-from .grasp import choose_grasp, visual_alignment
+from .grasp import SourceRejected, choose_grasp, visual_alignment
 from .types import ActionResult
 
 
@@ -112,7 +112,11 @@ class Actions:
                         plan = None
                         failures.append(str(exc))
                         rt.metrics.setdefault('placement_refusals',[]).append({
-                            'object_id':object_id,'center_m':choice.object_pose[:3,3].tolist(),'reason':str(exc)})
+                            'object_id':object_id,'center_m':choice.object_pose[:3,3].tolist(),'reason':str(exc),
+                            'stage':'source' if isinstance(exc,SourceRejected) else 'placement'})
+                        if isinstance(exc,SourceRejected):
+                            rt.report('checking','source grasp set rejected: '+str(exc))
+                            raise
                         rt.report('checking','placement candidate rejected: '+str(exc))
             if plan is None:
                 raise ValueError('; '.join(dict.fromkeys(failures)))

@@ -34,10 +34,15 @@ def rank_grasps(candidates):
     return sorted(candidates,key=lambda c:c.score)
 
 
+class SourceRejected(ValueError):
+    """Changing the destination cannot clear the current source endpoints."""
+
+
 def choose_grasp(obj, scene, robot, planner, current, check_cancel, world, *, check_pick=None,
                  stopped_pose=None, verify_plan=None):
     from box_extract.planning import flush_local
     failures = []
+    source_available = False
     metrics = getattr(planner,'timings',{})
     started = time.perf_counter()
     try:
@@ -46,12 +51,16 @@ def choose_grasp(obj, scene, robot, planner, current, check_cancel, world, *, ch
             grasp,closed = candidate.native
             begin = time.perf_counter()
             try:
-                # Reject an unreachable destination before constructing and
-                # checking hundreds of approach/closure/lift waypoints.
                 cube = scene.cubes[obj.id]
-                frame = robot.backend.model.frames(grasp)['gripper_frame_link']
-                local = flush_local((cube.vertices_m-frame[:3,3])@frame[:3,:3])
-                held = dict(grasp,gripper=min(closed,planner.last_clamp_deg))
+                source = None
+                if check_pick is not None:
+                    source = planner.pick_endpoints(obj.id,cube,grasp,closed,world,check_pick)
+                    held,local = source[-2:]
+                else:
+                    frame = robot.backend.model.frames(grasp)['gripper_frame_link']
+                    local = flush_local((cube.vertices_m-frame[:3,3])@frame[:3,:3])
+                    held = dict(grasp,gripper=min(closed,planner.last_clamp_deg))
+                source_available = True
                 patch = scene.placement
                 center = np.r_[np.mean(patch.polygon_xy_m,axis=0),
                                patch.height_m+patch.uncertainty_m+cube.side_m/2+.001]
@@ -60,7 +69,7 @@ def choose_grasp(obj, scene, robot, planner, current, check_cancel, world, *, ch
                     reason = world.reason(pose,target=obj.id,jaw_contact=True,payload_local=local,support_contact=True)
                     if reason:
                         raise ValueError('placement pose: '+reason)
-                plan = planner._candidate(scene,current,obj.id,scene.cubes[obj.id],grasp,closed,world,check_pick=check_pick)
+                plan = planner._candidate(scene,current,obj.id,cube,grasp,closed,world,check_pick=check_pick,source=source)
                 park = verify_plan(plan,world) if verify_plan is not None else None
                 return candidate,plan,world,park
             except ValueError as exc:
@@ -68,7 +77,8 @@ def choose_grasp(obj, scene, robot, planner, current, check_cancel, world, *, ch
                 metrics['candidate_failures'] = failures[-12:]
             finally:
                 metrics['motion_planning_s'] = (metrics.get('motion_planning_s',0.) or 0.)+time.perf_counter()-begin
-        raise ValueError('no full-arm grasp/approach/lift/placement path: '+('; '.join(dict.fromkeys(failures)) or 'no admissible opposing-face grasp'))
+        error = SourceRejected if check_pick is not None and not source_available else ValueError
+        raise error('no full-arm grasp/approach/lift/placement path: '+('; '.join(dict.fromkeys(failures)) or 'no admissible opposing-face grasp'))
     finally:
         metrics['grasp_planning_s'] = (metrics.get('grasp_planning_s',0.) or 0.)+time.perf_counter()-started
 

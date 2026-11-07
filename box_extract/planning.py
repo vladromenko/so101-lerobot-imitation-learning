@@ -289,14 +289,10 @@ class TunedExtractionPlanner(ExtractionPlanner):
                 rejections.append(str(exc))
         raise ValueError('no collision-free measured grasp and placement: ' + ('; '.join(rejections[-3:]) or 'IK/jaw geometry rejected all face pairs'))
 
-    def _candidate(self, scene, current, target_id, cube, grasp, closed, world, *, check_pick=None):
+    def pick_endpoints(self, target_id, cube, grasp, closed, world, check_pick):
         policy = {'target': target_id, 'jaw_contact': True}
         frame = self.model.frames(grasp)['gripper_frame_link']
         local = (cube.vertices_m-frame[:3, 3]) @ frame[:3, :3]
-        rim = (scene.box.base_from_box @ np.r_[0., 0., scene.box.obstacle_top_m, 1.])[2]
-        radius = float(np.linalg.norm(cube.vertices_m-cube.center_m, axis=1).max())
-        # The cube only has to clear the rim: its lowest point, not its corner radius, sets the lift.
-        rise = max(.025, rim+scene.box.clearance_m+self.rim_margin_m+cube.side_m/2-cube.center_m[2])
         if check_pick is not None:
             check_pick(Phase('enter',(grasp,),jaw_contact=True),None)
         # The existing contact-band estimate initializes the aperture. Refine
@@ -323,6 +319,15 @@ class TunedExtractionPlanner(ExtractionPlanner):
         flush = flush_local(local)
         if check_pick is not None:
             check_pick(Phase('extract_vertical',(held,),True,True),flush)
+        return frame,local,closure,held,flush
+
+    def _candidate(self, scene, current, target_id, cube, grasp, closed, world, *, check_pick=None, source=None):
+        policy = {'target': target_id, 'jaw_contact': True}
+        frame,local,closure,held,flush = (source if source is not None else
+            self.pick_endpoints(target_id,cube,grasp,closed,world,check_pick))
+        rim = (scene.box.base_from_box @ np.r_[0., 0., scene.box.obstacle_top_m, 1.])[2]
+        # The cube only has to clear the rim: its lowest point, not its corner radius, sets the lift.
+        rise = max(.025, rim+scene.box.clearance_m+self.rim_margin_m+cube.side_m/2-cube.center_m[2])
         entry_up = self.vertical_center(grasp, rise, local.mean(0), world, **policy)
         enter = Phase('enter',entry_up[::-1],jaw_contact=True)
         if check_pick is not None:

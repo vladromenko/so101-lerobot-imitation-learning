@@ -92,6 +92,18 @@ def proposed_grasp(plan):
 
 
 class RelocateContract(unittest.TestCase):
+    def test_unsafe_source_is_rejected_before_placement_ik(self):
+        from wristlab.grasp import choose_grasp, SourceRejected
+        obj,rt,_,placement,_,_ = action_contract()
+        scene = rt.scene.native_scene(obj.id,placement)
+        planner = NS(timings={},placement_pose=Mock(),
+                     pick_endpoints=Mock(side_effect=ValueError('extract_vertical: native STOP settling: table')))
+        candidate = NS(native=(dict(Q),15.))
+        with patch('wristlab.grasp.generate_grasps',return_value=iter([candidate])):
+            with self.assertRaisesRegex(SourceRejected,'native STOP settling: table'):
+                choose_grasp(obj,scene,rt.robot,planner,Q,rt.check_cancel,NS(),check_pick=Mock())
+        planner.placement_pose.assert_not_called()
+
     def test_park_falls_back_to_a_checked_lower_load_pose(self):
         motion=Motion.__new__(Motion)
         motion.check_cancel=Mock()
