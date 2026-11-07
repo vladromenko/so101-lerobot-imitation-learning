@@ -27,6 +27,7 @@ class Scene:
         self.metric_boxes = {}
         self.measured_surfaces = []
         self.boxes_semantically_seeded = False
+        self.box_edge_reference = None
         self.attachment_hypothesis = None
         self.passive_measurements = None
 
@@ -57,19 +58,29 @@ class Scene:
         self.state.evidence['boxes_at'] = captured
         self.frames['overview'] = Frame('overview','native:'+str(scan['frame']['sequence']),image,captured,time.time(),(captured,captured))
         self.boxes_semantically_seeded = True
+        self.box_edge_reference = None
 
     def track_box_edges(self, frame):
         previous = self.frames.get('overview')
         if previous is None or not self.state.boxes:
             return None
-        gray0 = cv2.cvtColor(previous.image,cv2.COLOR_BGR2GRAY)
+        if self.box_edge_reference is None:
+            gray0 = cv2.cvtColor(previous.image,cv2.COLOR_BGR2GRAY)
+            edges = {}
+            for box_id,box in self.state.boxes.items():
+                polygon = np.asarray(box.evidence['polygon'],np.float32)
+                mask = np.zeros(gray0.shape,np.uint8)
+                cv2.polylines(mask,[np.int32(polygon)],True,255,18)
+                points = cv2.goodFeaturesToTrack(gray0,40,.01,6,mask=mask)
+                if points is None or len(points)<6:
+                    return None
+                edges[box_id] = polygon,points
+            self.box_edge_reference = gray0,edges
+        gray0,edges = self.box_edge_reference
         gray1 = cv2.cvtColor(frame.image,cv2.COLOR_BGR2GRAY)
         proposed = []
-        for box in self.state.boxes.values():
-            polygon = np.asarray(box.evidence['polygon'],np.float32)
-            mask = np.zeros(gray0.shape,np.uint8)
-            cv2.polylines(mask,[np.int32(polygon)],True,255,18)
-            points = cv2.goodFeaturesToTrack(gray0,40,.01,6,mask=mask)
+        for box_id,box in self.state.boxes.items():
+            polygon,points = edges.get(box_id,(None,None))
             if points is None or len(points)<6:
                 return None
             tracked,status,error = cv2.calcOpticalFlowPyrLK(gray0,gray1,points,None,winSize=(21,21),maxLevel=2)

@@ -79,6 +79,23 @@ def action_contract():
 
 
 class RelocateContract(unittest.TestCase):
+    def test_box_tracking_does_not_accumulate_previous_frame_errors(self):
+        from wristlab.types import BoxState
+        scene = Scene(None)
+        image = np.random.default_rng(1).integers(0,256,(96,96,3),dtype=np.uint8)
+        polygon = np.array([[20,20],[75,20],[75,75],[20,75]])
+        box = BoxState('box',np.eye(4),np.ones(3),.1,evidence={'polygon':polygon.tolist()})
+        scene.state.boxes[box.id] = box
+        scene.frames['overview'] = Frame('overview','anchor',image,1.,1.,(1.,1.))
+        moved = cv2.warpAffine(image,np.float32([[1,0,2],[0,1,0]]),(96,96))
+        first = scene.track_box_edges(Frame('overview','moved',moved,2.,2.,(2.,2.)))
+        self.assertIsNotNone(first)
+        box.evidence['polygon'] = first[0]['polygon']
+        scene.frames['overview'] = Frame('overview','obscured',np.zeros_like(image),3.,3.,(3.,3.))
+        second = scene.track_box_edges(Frame('overview','clear',image,4.,4.,(4.,4.)))
+        self.assertIsNotNone(second)
+        np.testing.assert_allclose(second[0]['polygon'],polygon,atol=.1)
+
     def test_active_perception_is_bounded_and_replans_approach(self):
         setup=action_contract();obj,rt,action,placement,plan,alignment=setup
         rt.refine_object=Mock(return_value=obj)

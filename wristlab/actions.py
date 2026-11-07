@@ -87,6 +87,10 @@ class Actions:
                 motion_started = True
             for choice in choices:
                 if plan is None:
+                    # Native IK may outlast a frame's validity. Observe again
+                    # before building the next candidate's scene snapshot.
+                    rt.check_cancel()
+                    rt.refresh()
                     native_scene = self.scene.native_scene(object_id,choice)
                     world = self.motion.make_world(native_scene)
                     try:
