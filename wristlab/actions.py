@@ -90,7 +90,8 @@ class Actions:
                     native_scene = self.scene.native_scene(object_id,choice)
                     world = self.motion.make_world(native_scene)
                     try:
-                        candidate,plan,world = choose_grasp(obj,native_scene,self.robot,self.motion.planner,start,rt.check_cancel,world)
+                        candidate,plan,world = choose_grasp(obj,native_scene,self.robot,self.motion.planner,start,rt.check_cancel,world,
+                                                          validate_cycle=self.motion.preflight_cycle)
                         self.motion.preflight_cycle(plan,world)
                         placement = choice
                     except ValueError as exc:
@@ -157,7 +158,8 @@ class Actions:
                         current = self.robot.read_state()['positions']
                         world = self.motion.make_world(native_scene)
                         stage = 'grasp_planning'
-                        candidate,plan,world = choose_grasp(obj,native_scene,self.robot,self.motion.planner,current,rt.check_cancel,world)
+                        candidate,plan,world = choose_grasp(obj,native_scene,self.robot,self.motion.planner,current,rt.check_cancel,world,
+                                                          validate_cycle=self.motion.preflight_cycle)
                         stage = 'path_check'
                         self.motion.preflight_cycle(plan,world)
                         queue = list(plan.phases)

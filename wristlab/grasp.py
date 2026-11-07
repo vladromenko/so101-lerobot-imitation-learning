@@ -25,7 +25,7 @@ def rank_grasps(candidates):
     return sorted(candidates,key=lambda c:c.score)
 
 
-def choose_grasp(obj, scene, robot, planner, current, check_cancel, world):
+def choose_grasp(obj, scene, robot, planner, current, check_cancel, world, validate_cycle=None):
     from box_extract.planning import flush_local
     failures = []
     metrics = getattr(planner,'timings',{})
@@ -51,6 +51,10 @@ def choose_grasp(obj, scene, robot, planner, current, check_cancel, world):
                     if reason:
                         raise ValueError('placement pose: '+reason)
                 plan = planner._candidate(scene,current,obj.id,scene.cubes[obj.id],grasp,closed,world)
+                # A feasible placement alone is insufficient: a rejected exit
+                # must advance to the next grasp, not discard the whole slot.
+                if validate_cycle is not None:
+                    validate_cycle(plan,world)
                 return candidate,plan,world
             except ValueError as exc:
                 failures.append(str(exc))

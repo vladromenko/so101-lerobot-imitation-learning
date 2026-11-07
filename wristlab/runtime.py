@@ -966,8 +966,7 @@ class Runtime:
     def execute(self, payload):
         try:
             self.check_cancel()
-            if self.robot.arm is None:
-                self.robot.read_state()
+            self.robot.read_state()
             self.refresh()
             selected = payload.get('object_id') or self.selected
             destination = payload.get('destination') or self.destination

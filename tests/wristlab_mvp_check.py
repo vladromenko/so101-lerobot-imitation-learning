@@ -570,5 +570,28 @@ class GeometryPolicy(unittest.TestCase):
         self.assertGreaterEqual(refresh.call_count,3)
 
 
+class CompleteGraspSelection(unittest.TestCase):
+    def test_failed_retreat_tries_next_grasp_in_same_slot(self):
+        from wristlab.grasp import choose_grasp
+        obj=NS(id='target')
+        cube=NS(vertices_m=np.array([[0.,0.,0.],[.03,.03,.03]]),side_m=.03)
+        scene=NS(cubes={obj.id:cube},placement=NS(polygon_xy_m=np.zeros((4,2)),height_m=0.,uncertainty_m=0.))
+        candidates=[NS(native=({'gripper':20.,'wrist_roll':roll},10.)) for roll in (0.,90.)]
+        robot=NS(backend=NS(model=NS(frames=lambda q:{'gripper_frame_link':np.eye(4)})))
+        planner=NS(last_clamp_deg=12.,timings={},placement_pose=lambda *a:{'gripper':10.},
+                   _command_pose=lambda q:q,_candidate=Mock(side_effect=['blocked_exit','clear_exit']))
+        world=NS(reason=lambda *a,**kw:None)
+        checked=[]
+        def validate(plan,actual_world):
+            checked.append(plan)
+            if plan=='blocked_exit':
+                raise ValueError('retract: finger intersects released cube')
+        with patch('wristlab.grasp.generate_grasps',return_value=iter(candidates)):
+            candidate,plan,_=choose_grasp(obj,scene,robot,planner,{},lambda:None,world,validate)
+        self.assertEqual(checked,['blocked_exit','clear_exit'])
+        self.assertEqual(plan,'clear_exit')
+        self.assertIs(candidate,candidates[1])
+
+
 if __name__=='__main__':
     unittest.main(verbosity=2)
