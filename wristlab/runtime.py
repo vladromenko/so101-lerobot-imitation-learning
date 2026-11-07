@@ -1286,12 +1286,12 @@ class Runtime:
                     self.park_arm(self.motion.plan,self.motion.world)
                 except ValueError as exc:
                     self.park_error = str(exc)
-            self.report('completed' if ok else 'blocked' if self.stop_event.is_set() else 'recovering' if self.scene.held is not None else 'failed',
-                'Все запрошенные переносы подтверждены' if ok else self.results[-1].reason)
+            self.report(('checked' if payload['dry'] else 'completed') if ok else 'blocked' if self.stop_event.is_set() else 'recovering' if self.scene.held is not None else 'failed',
+                ('Геометрия проверена; команд приводам не было' if payload['dry'] else 'Все запрошенные переносы подтверждены') if ok else self.results[-1].reason)
         except Exception as exc:
             self.report('blocked' if self.stop_event.is_set() or self.blockers() else 'failed',f'{type(exc).__name__}: {exc}')
             self.results = [{'success':False,'reason':str(exc),'physical_verified':False}]
-            if not self.stop_event.is_set() and self.scene.held is None and self.park_qualified_file.exists():
+            if not payload['dry'] and not self.stop_event.is_set() and self.scene.held is None and self.park_qualified_file.exists():
                 try:
                     self.park_arm(self.motion.plan,self.motion.world)
                 except ValueError as park_error:

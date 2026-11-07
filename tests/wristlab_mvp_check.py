@@ -205,6 +205,18 @@ class RelocateContract(unittest.TestCase):
 
 
 class GeometryPolicy(unittest.TestCase):
+    def test_dry_preflight_failure_never_moves_to_a_qualified_park(self):
+        rt=Runtime.__new__(Runtime)
+        rt.stop_event=threading.Event();rt.scene=NS(held=None)
+        rt.robot=NS(arm=object(),first_command_at=None);rt.park_qualified_file=NS(exists=lambda:True)
+        rt.motion=NS(plan=object(),world=object());rt.park_arm=Mock();rt.persist=Mock()
+        rt.report=Mock();rt.check_cancel=Mock();rt.blockers=Mock(return_value=[])
+        rt.refresh=Mock(side_effect=ValueError('scene changed before dry preflight'))
+        rt.last_plan=None;rt.started=time.monotonic();rt.metrics={}
+        rt.execute({'mode':'relocate','dry':True})
+        self.assertFalse(rt.results[0]['success'])
+        rt.park_arm.assert_not_called()
+
     def test_overview_measurement_rejects_repeated_frame_during_monitored_hold(self):
         rt = Runtime.__new__(Runtime)
         rt.stop_event = threading.Event()
