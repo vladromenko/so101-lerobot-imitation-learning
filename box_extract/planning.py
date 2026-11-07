@@ -223,6 +223,7 @@ class TunedExtractionPlanner(ExtractionPlanner):
                                 and np.linalg.norm(error[3:6])/30. <= np.sin(np.deg2rad(2.)) and actual[2, 2] < -self.min_tool_down)
                         return (joints if good else None), result.x
                     for pitch, roll in seeds:
+                        self.check_cancel()
                         target_tip = center-desired@np.array([-(cube.side_m/2.+self.fixed_jaw_gap_m), 0., contact_z])
                         solve_started = time.perf_counter()
                         try:

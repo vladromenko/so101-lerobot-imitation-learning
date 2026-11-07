@@ -56,6 +56,8 @@ class Runtime:
         if previous.get('stop_latched'):
             self.stop_event.set()
         self.motion = Motion(self.robot,self.check_cancel,self.report,self.root/self.config['qualification_file'])
+        self.motion.planner.check_cancel = self.check_planning
+        self.motion.check_planning = self.check_planning
         self.recovery = Recovery(self.config['max_recovery_attempts'])
         self.actions = Actions(self)
         self.running,self.initialized = False,False
@@ -632,22 +634,27 @@ class Runtime:
         self.cameras.check()
         if self.scene.held is not None:
             raise ValueError('Park: object held; finish a separately checked relocate to a safe support before parking')
-        if previous is None and self.motion.plan is not None and self.motion.world is not None:
-            previous,world = self.motion.plan,self.motion.world
-        if previous is None:
-            path = self.output/'released-placement.pkl'
-            if not path.exists():
-                raise ValueError('Park has no verified current manipulation scene')
-            saved = self.read_release_checkpoint()
-            if saved['calibration_sha256']!=self.geometry.fingerprint:
-                raise ValueError('Park checkpoint calibration differs')
-            previous = saved['plan']
-            world = self.motion.make_world(saved['native_scene'])
         state = self.robot.read_state()
+        if previous is None:
+            from so101_pick_place.experiments.box_extraction.planner import ExtractionPlan
+            if self.pending_grasp is not None or state['loads']['gripper'] or state['currents']['gripper']:
+                raise ValueError('Park: empty gripper is not confirmed by feedback')
+            self.refresh()
+            state = self.robot.read_state()
+            reasons = self.motion.qualification_reasons(self.geometry)
+            if reasons:
+                raise ValueError('Park: '+'; '.join(reasons))
+            world = self.motion.stationary_world(self.scene)
+            previous = ExtractionPlan(world.scene.revision,'',(),None,None,())
         phase = self.motion.plan_park(state['positions'],previous,world)
+        from dataclasses import replace
+        self.motion.check_entry_transition(replace(previous,phases=(phase,)),world,state['positions'])
         if expected_goal is not None and any(abs(expected_goal[j]-phase.joints[-1][j])>self.robot.encoder_steps()[j] for j in expected_goal):
             raise ValueError('Park destination changed; show a new preview before execution')
+        model = self.robot.backend.model
+        load = [np.asarray(model.pose(q).torque)[1:3].tolist() for q in (phase.joints[0],phase.joints[-1])]
         proposal = {'status':'PARK_CHECKED','start':state['positions'],'goal':phase.joints[-1],
+            'path_waypoints':len(phase.joints),'modeled_shoulder_elbow_torque_nm':load,
             'actuator_commands_sent':False,'requires_attended_trial':not self.park_qualified_file.exists(),
             'success':True,'reason':'Park path checked; no actuator commands','physical_verified':False}
         if dry:
@@ -1125,6 +1132,16 @@ class Runtime:
             raise RuntimeError('STOP')
         if self.robot.arm is not None and not self.robot.owns_lease():
             raise RuntimeError('exclusive hardware lease lost')
+
+    def check_planning(self):
+        """Refresh held-arm telemetry on the same worker that owns the bus."""
+        self.check_cancel()
+        last = self.robot.last_state
+        if self.robot.arm is not None and (last is None or time.time()-last['timestamp']>=self.config['poll_interval_s']):
+            state = self.robot.read_state()
+            self.cameras.record_state(state['timestamp'],state['q'],state['gripper'])
+            self.monitor_motors()
+            self.check_cancel()
 
     def wait_pause(self):
         while self.pause_event.is_set():

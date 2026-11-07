@@ -76,6 +76,7 @@ RecoveryCollisionWorld.reason = _native_recovery_reason()
 class Motion:
     def __init__(self, robot, check_cancel, report, qualification_file):
         self.robot, self.check_cancel, self.report = robot, check_cancel, report
+        self.check_planning = check_cancel
         self.planner = TunedExtractionPlanner(robot.backend,check_cancel=check_cancel)
         self.metrics = {}
         self.planner.timings = self.metrics
@@ -170,6 +171,24 @@ class Motion:
     def qualification_reasons(self, geometry):
         return [item['reason'] for item in self.qualification_blockers(geometry)]
 
+    def stationary_world(self, scene):
+        """Current collision world with all measured objects stationary."""
+        from types import SimpleNamespace
+        from .scene import BoxUnion
+        from so101_pick_place.experiments.box_extraction.scene import ExtractionScene
+        with scene.lock:
+            state = scene.state
+            if not state.evidence.get('coverage_verified') or state.obstacles:
+                raise ValueError('stationary scene coverage is not confirmed')
+            boxes = [box.evidence['native_box'] for box in state.boxes.values()
+                     if box.evidence.get('metric_qualified') or box.evidence.get('collision_qualified')]
+            if not boxes or len(boxes)!=len(state.boxes):
+                raise ValueError('stationary world requires collision geometry for every visible box')
+            cubes = {key:scene.native_object(key) for key in state.objects}
+            table = SimpleNamespace(height_m=float(self.robot.backend.model.table_z),uncertainty_m=0.)
+            native = ExtractionScene(str(state.version),state.timestamp,BoxUnion(boxes[0],boxes),cubes,table,(),True)
+        return self.make_world(native)
+
     def overview_clear_path(self, scene, geometry, check):
         """Select the shortest checked base rotation that exposes an occluded cube."""
         from box_extract.scene_builder import robot_mask
@@ -186,24 +205,12 @@ class Motion:
         frame = scene.frames['overview']
         world = StartupWorld(self.robot,scene,geometry,start,start,self.attachment_path,strict=True)
         if not world.partial_cubes:
-            from types import SimpleNamespace
-            from .scene import BoxUnion
-            from so101_pick_place.experiments.box_extraction.scene import ExtractionScene
             check()
             self.robot.read_state()
             blockers = self.qualification_reasons(geometry)
             if blockers:
                 raise ValueError('powered entry: '+'; '.join(blockers))
-            if not scene.state.evidence.get('coverage_verified'):
-                raise ValueError('powered entry requires fully measured current collision geometry')
-            boxes = [box.evidence['native_box'] for box in scene.state.boxes.values()
-                     if box.evidence.get('metric_qualified') or box.evidence.get('collision_qualified')]
-            if not boxes or len(boxes)!=len(scene.state.boxes):
-                raise ValueError('powered entry requires collision geometry for every visible box')
-            cubes = {key:scene.native_object(key) for key in scene.state.objects}
-            table = SimpleNamespace(height_m=float(model.table_z),uncertainty_m=0.)
-            world.metric_world = self.make_world(ExtractionScene(
-                str(scene.state.version),scene.state.timestamp,BoxUnion(boxes[0],boxes),cubes,table,(),True))
+            world.metric_world = self.stationary_world(scene)
             return self.powered_entry_path(world,mapping,check)
         visible = np.zeros(frame.image.shape[:2],np.uint8)
         for _,_,_,rectangle in world.partial_cubes:
@@ -728,7 +735,7 @@ class Motion:
         if self.planner.command_sag is None:
             raise ValueError('native gravity-compensation setting has not been read')
         for q in self.robot.native_edge_samples(start,goal):
-            self.check_cancel()
+            getattr(self,'check_planning',self.check_cancel)()
             command = self.robot.synchronized_command(q,self.recovery_mapping) if phase.name.startswith('RECOVERY_') else self.planner._command_pose(q)
             for kind,pose in (('pose',q),('native command',command)):
                 reason = self.state_is_valid(pose,phase,plan,world)
@@ -755,13 +762,22 @@ class Motion:
         # before doing the more expensive interpolation on a rejected phase.
         if not phase.name.startswith('RECOVERY_'):
             for q in phase.joints:
-                self.check_cancel()
+                getattr(self,'check_planning',self.check_cancel)()
                 settled = self.stop_settled_pose(q)
                 reason = self.state_is_valid(settled,phase,plan,world)
                 intended = reason in {'gripper_link: cube '+plan.target_id,'moving_jaw_so101_v1_link: cube '+plan.target_id}
                 if intended and phase.name=='grasp' and phase.jaw_contact:
                     reason = world.grasp_contact_reason(settled,plan.target_id)
                 if reason:
+                    if phase.carrying and reason=='payload intersects measured table support':
+                        backend = self.robot.backend
+                        def bottom(joints):
+                            frame = backend.model.frames(joints)['gripper_frame_link']
+                            return float(backend._transform_points(frame,plan.payload_local)[:,2].min())
+                        self.metrics.setdefault('payload_stop_refusals',{})[plan.target_id] = {
+                            'phase':phase.name,'pose_deg':dict(q),'settled_deg':settled,
+                            'table_z_m':float(backend.model.table_z),'planned_bottom_m':bottom(q),
+                            'stopped_bottom_m':bottom(settled),'physical_measurement':False}
                     raise ValueError(phase.name+': native STOP settling: '+reason)
 
     def check_pick_phase(self, phase, payload, target, world):

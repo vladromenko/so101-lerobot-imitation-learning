@@ -92,6 +92,24 @@ def proposed_grasp(plan):
 
 
 class RelocateContract(unittest.TestCase):
+    def test_stationary_planning_refreshes_motor_telemetry(self):
+        rt=Runtime.__new__(Runtime)
+        rt.config={'poll_interval_s':.35}
+        old={'timestamp':time.time()-1.}
+        state={'timestamp':time.time(),'q':np.zeros(5),'gripper':22.}
+        rt.robot=NS(arm=object(),last_state=old,read_state=Mock(return_value=state))
+        rt.cameras=NS(record_state=Mock())
+        rt.check_cancel=Mock()
+        rt.monitor_motors=Mock()
+        rt.check_planning()
+        rt.robot.read_state.assert_called_once()
+        rt.cameras.record_state.assert_called_once_with(state['timestamp'],state['q'],state['gripper'])
+        rt.monitor_motors.assert_called_once()
+        self.assertEqual(rt.check_cancel.call_count,2)
+        rt.robot.last_state=state
+        rt.check_planning()
+        rt.robot.read_state.assert_called_once()
+
     def test_box_tracking_does_not_accumulate_previous_frame_errors(self):
         from wristlab.types import BoxState
         scene = Scene(None)
