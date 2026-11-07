@@ -125,13 +125,28 @@ class TunedExtractionPlanner(ExtractionPlanner):
         raise reason
 
     def _retract_path(self, release_goal, center_local, world, **policy):
-        """Fixed jaw away from the released cube first (it is flush against it), then straight up."""
-        frame = self.model.frames(release_goal)['gripper_frame_link']
-        away = self.translated(release_goal, frame[:3, 0]*self.release_separation_m)
-        first = self.edge(release_goal, away, world, **policy)
-        up = self.vertical_center(away, .03, center_local, world, **policy)
-        self.separation_waypoints = len(first)
-        return tuple(first)+tuple(up)[1:]
+        """Try native translations, validating the complete empty-jaw exit."""
+        frames = self.model.frames(release_goal)
+        frame = frames['gripper_frame_link']
+        separation = frame[:3, 0]*self.release_separation_m
+        bottom = min(float(self.backend._transform_points(frames[link],self.backend.meshes[link])[:,2].min())
+                     for link in ('gripper_link','moving_jaw_so101_v1_link'))
+        rise = np.array([0.,0.,max(.03,float(policy['placed_cube'].vertices_m[:,2].max())+self.model.gap-bottom)])
+        failures = []
+        for direction in (separation,rise,separation+rise):
+            try:
+                away = self.translated(release_goal, direction)
+                first = self.edge(release_goal, away, world, **policy)
+                remaining = max(0.,rise[2]-direction[2])
+                up = self.vertical_center(away,remaining,center_local,world,**policy) if remaining>1e-9 else (away,)
+                path = tuple(first)+tuple(up)[1:]
+                if getattr(self,'check_retreat',None) is not None:
+                    self.check_retreat(Phase('retract',path,jaw_contact=True,placed_cube=policy['placed_cube']),world,policy['target'])
+                self.separation_waypoints = len(first)
+                return path
+            except ValueError as exc:
+                failures.append(str(exc))
+        raise ValueError('no checked empty-jaw exit: '+'; '.join(failures))
 
     separation_waypoints = 0
     grasp_pitches_deg = (-90., -70., -50.)      # tool pitch seeds of the grasp search

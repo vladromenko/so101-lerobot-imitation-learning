@@ -75,6 +75,7 @@ class Motion:
         self.robot, self.check_cancel, self.report = robot, check_cancel, report
         self.check_planning = check_cancel
         self.planner = TunedExtractionPlanner(robot.backend,check_cancel=check_cancel)
+        self.planner.check_retreat = self.check_retreat
         self.metrics = {}
         self.planner.timings = self.metrics
         self.driver = None
@@ -484,6 +485,9 @@ class Motion:
             finally:
                 world.release_origin = None
         return True
+
+    def check_retreat(self, phase, world, target):
+        return self.check_path(ExtractionPlan(world.scene.revision,target,(phase,),None,None,()),world)
 
     def preflight_cycle(self, plan, world, require_pick=True):
         """A release is admitted only with an empty-tool exit and safe wait path."""

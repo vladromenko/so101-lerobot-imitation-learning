@@ -588,6 +588,21 @@ class GeometryPolicy(unittest.TestCase):
 
 
 class CompleteGraspSelection(unittest.TestCase):
+    def test_retreat_tries_another_direction_after_full_check_fails(self):
+        from box_extract.planning import TunedExtractionPlanner
+        planner=TunedExtractionPlanner.__new__(TunedExtractionPlanner)
+        frames={k:np.eye(4) for k in ('gripper_frame_link','gripper_link','moving_jaw_so101_v1_link')}
+        planner.model=NS(frames=lambda q:frames,gap=.008)
+        planner.backend=NS(meshes={k:np.zeros((2,3)) for k in frames},_transform_points=lambda t,v:v)
+        planner.translated=lambda q,delta:dict(q,shift=tuple(delta))
+        planner.edge=lambda a,b,*args,**kw:(a,b)
+        planner.vertical_center=lambda q,*args,**kw:(q,)
+        planner.check_retreat=Mock(side_effect=[ValueError('finger presses released cube'),True])
+        cube=NS(vertices_m=np.array([[0.,0.,0.],[.03,.03,.03]]))
+        path=planner._retract_path({'gripper':45.},np.zeros(3),NS(),target='cube',placed_cube=cube)
+        self.assertEqual(planner.check_retreat.call_count,2)
+        np.testing.assert_allclose(path[-1]['shift'],[0.,0.,.038])
+
     def test_release_tries_smaller_native_aperture_if_command_hits_wall(self):
         from box_extract.planning import TunedExtractionPlanner
         planner=TunedExtractionPlanner.__new__(TunedExtractionPlanner)
