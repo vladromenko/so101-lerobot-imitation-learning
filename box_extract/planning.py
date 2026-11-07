@@ -169,7 +169,7 @@ class TunedExtractionPlanner(ExtractionPlanner):
         frame = self.model.frames(joints)['gripper_frame_link']
         return float(-((cube.vertices_m - frame[:3, 3]) @ frame[:3, :3])[:, 0].max())
 
-    def grasp_candidates(self, scene, cube, current, *, contact_center=None, stopped_pose=None):
+    def grasp_candidates(self, scene, cube, current, *, contact_center=None):
         """Solve opposing measured cube faces against the real jaw frame.
 
         The fixed jaw's stand-off is sized per candidate so that the gravity-compensated register command
@@ -241,12 +241,10 @@ class TunedExtractionPlanner(ExtractionPlanner):
                         joints, x = fit(seed, self.fixed_jaw_gap_m)
                         if joints is None:
                             continue
-                        # Size the stand-off against the register goal and the
-                        # predicted factory STOP response, when available.
+                        # Size the stand-off against the actual register goal.
                         cmd = self._command_pose(joints)
-                        probe = (cmd,stopped_pose(joints)) if stopped_pose is not None else (cmd,)
                         gap = self.fixed_jaw_gap_m + max(0., self._fixed_jaw_clearance(joints, cube)
-                            - min(self._fixed_jaw_clearance(q,cube) for q in probe)) + .001
+                            - self._fixed_jaw_clearance(cmd,cube)) + .001
                         if gap > self.max_standoff_m:
                             continue
                         if gap > self.fixed_jaw_gap_m + .0005:
@@ -261,8 +259,7 @@ class TunedExtractionPlanner(ExtractionPlanner):
                             continue
                         joints = dict(joints, gripper=open_angle)
                         signature = tuple(np.round(self.vector(joints), 1))
-                        stop_clear = stopped_pose is None or self._fixed_jaw_clearance(stopped_pose(joints),cube)>=.0015
-                        if stop_clear and signature not in seen:
+                        if signature not in seen:
                             seen.add(signature)
                             self.last_clamp_deg = clamp
                             yield joints, angle_for(cube.side_m+gap)

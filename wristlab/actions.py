@@ -105,7 +105,6 @@ class Actions:
                         world = self.motion.make_world(native_scene)
                         candidate,plan,world,park = choose_grasp(obj,native_scene,self.robot,self.motion.planner,start,rt.check_cancel,world,
                             check_pick=lambda phase,payload:self.motion.check_pick_phase(phase,payload,obj.id,world),
-                            stopped_pose=lambda q:self.motion.stop_settled_pose(q),
                             verify_plan=lambda p,w:self.verify_candidate(p,w,start))
                         placement = choice
                     except ValueError as exc:
@@ -188,7 +187,6 @@ class Actions:
                         stage = 'grasp_planning'
                         candidate,plan,world,park = choose_grasp(obj,native_scene,self.robot,self.motion.planner,current,rt.check_cancel,world,
                             check_pick=lambda phase,payload:self.motion.check_pick_phase(phase,payload,obj.id,world),
-                            stopped_pose=lambda q:self.motion.stop_settled_pose(q),
                             verify_plan=lambda p,w:self.verify_candidate(p,w,current))
                         self.motion.check_entry_transition(plan,world,current)
                         queue = list(plan.phases)

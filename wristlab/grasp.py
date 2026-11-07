@@ -6,18 +6,14 @@ from so101_pick_place.experiments.box_extraction.planner import Phase
 from .types import GraspCandidate
 
 
-def generate_grasps(object_state, native_scene, robot, planner, current, world, *, stopped_pose=None):
+def generate_grasps(object_state, native_scene, robot, planner, current, world):
     cube = native_scene.cubes[object_state.id]
-    centers = [cube.center_m]
-    if stopped_pose is not None:
-        up = cube.rotation[:,np.argmax(np.abs(cube.rotation[2,:]))]
-        top = cube.center_m+up*np.sign(up[2])*cube.side_m/2
-        # The upper half of the measured side offers a second contact band
-        # when the nominal mid-face approach has no floor clearance at STOP.
-        centers.append((top+cube.center_m)/2)
+    up = cube.rotation[:,np.argmax(np.abs(cube.rotation[2,:]))]
+    top = cube.center_m+up*np.sign(up[2])*cube.side_m/2
+    # Both contact bands come from the measured side face.
+    centers = [cube.center_m,(top+cube.center_m)/2]
     for center in centers:
-        options = {} if stopped_pose is None else {'contact_center':center,'stopped_pose':stopped_pose}
-        for grasp,closed in planner.grasp_candidates(native_scene,cube,current,**options):
+        for grasp,closed in planner.grasp_candidates(native_scene,cube,current,contact_center=center):
             reason = world.reason(grasp,target=object_state.id,jaw_contact=True)
             if reason is None:
                 pose = robot.backend.model.frames(grasp)['gripper_frame_link']
@@ -39,14 +35,14 @@ class SourceRejected(ValueError):
 
 
 def choose_grasp(obj, scene, robot, planner, current, check_cancel, world, *, check_pick=None,
-                 stopped_pose=None, verify_plan=None):
+                 verify_plan=None):
     from box_extract.planning import flush_local
     failures = []
     source_available = False
     metrics = getattr(planner,'timings',{})
     started = time.perf_counter()
     try:
-        for candidate in generate_grasps(obj,scene,robot,planner,current,world,stopped_pose=stopped_pose):
+        for candidate in generate_grasps(obj,scene,robot,planner,current,world):
             check_cancel()
             grasp,closed = candidate.native
             begin = time.perf_counter()

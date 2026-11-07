@@ -752,39 +752,6 @@ class Motion:
                     return kind+': '+reason
         return None
 
-    def stop_settled_pose(self, q):
-        """Static bias-removal estimate, not a measured stopping trajectory."""
-        command = self.robot.quantized_command(self.planner._command_pose(q))
-        frozen = self.robot.quantized_command(q)
-        return {j:frozen[j]+q[j]-command[j] for j in q}
-
-    def check_stop_settling(self, phase, plan, world):
-        # Factory STOP removes gravity bias. This extrapolation identifies
-        # an unresolved stopping risk; it is not evidence of real penetration.
-        # The recorded wall STOP confirms settling, but does not calibrate
-        # its transient response for other poses, payloads or support contacts.
-        if not phase.name.startswith('RECOVERY_'):
-            for q in phase.joints:
-                getattr(self,'check_planning',self.check_cancel)()
-                settled = self.stop_settled_pose(q)
-                reason = self.state_is_valid(settled,phase,plan,world)
-                intended = reason in {'gripper_link: cube '+plan.target_id,'moving_jaw_so101_v1_link: cube '+plan.target_id}
-                if intended and phase.name=='grasp' and phase.jaw_contact:
-                    reason = world.grasp_contact_reason(settled,plan.target_id)
-                if reason:
-                    if phase.carrying and reason=='payload intersects measured table support':
-                        backend = self.robot.backend
-                        def bottom(joints):
-                            frame = backend.model.frames(joints)['gripper_frame_link']
-                            return float(backend._transform_points(frame,plan.payload_local)[:,2].min())
-                        self.metrics.setdefault('payload_stop_refusals',{})[plan.target_id] = {
-                            'phase':phase.name,'pose_deg':dict(q),'settled_deg':settled,
-                            'table_z_m':float(backend.model.table_z),'planned_bottom_m':bottom(q),
-                            'stopped_bottom_m':bottom(settled),'physical_measurement':False,
-                            'estimate_model':'static gravity-bias subtraction',
-                            'qualified_transient_model':False,'support_contact':phase.support_contact}
-                    raise ValueError(phase.name+': native STOP settling: '+reason)
-
     def check_pick_phase(self, phase, payload, target, world):
         plan = ExtractionPlan(world.scene.revision,target,(phase,),payload,None,())
         self.check_path(plan,world)
@@ -796,7 +763,6 @@ class Motion:
                 raise ValueError(phase.name+': empty trajectory')
             world.release_origin = phase.joints[0] if phase.name=='retract' and phase.placed_cube is not None else None
             try:
-                self.check_stop_settling(phase,plan,world)
                 edges = zip(phase.joints,phase.joints[1:]) if len(phase.joints)>1 else [(phase.joints[0],phase.joints[0])]
                 for start,goal in edges:
                     reason = self.edge_is_valid(start,goal,phase,plan,world)
@@ -879,7 +845,7 @@ class Motion:
                     path = []
                     for q in self.robot.native_edge_samples(start,pose(fit.x)):
                         getattr(self,'check_planning',self.check_cancel)()
-                        reason = next((r for p in (q,self.planner._command_pose(q),self.stop_settled_pose(q))
+                        reason = next((r for p in (q,self.planner._command_pose(q))
                                        if (r:=world.reason(p,**policy)) is not None),None)
                         if reason:
                             break

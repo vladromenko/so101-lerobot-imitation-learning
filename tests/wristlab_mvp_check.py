@@ -146,10 +146,10 @@ class RelocateContract(unittest.TestCase):
         obj,rt,_,placement,_,_ = action_contract()
         scene = rt.scene.native_scene(obj.id,placement)
         planner = NS(timings={},placement_pose=Mock(),
-                     pick_endpoints=Mock(side_effect=ValueError('extract_vertical: native STOP settling: table')))
+                     pick_endpoints=Mock(side_effect=ValueError('extract_vertical: pose: camera intersects wall')))
         candidate = NS(native=(dict(Q),15.))
         with patch('wristlab.grasp.generate_grasps',return_value=iter([candidate])):
-            with self.assertRaisesRegex(SourceRejected,'native STOP settling: table'):
+            with self.assertRaisesRegex(SourceRejected,'pose: camera intersects wall'):
                 choose_grasp(obj,scene,rt.robot,planner,Q,rt.check_cancel,NS(),check_pick=Mock())
         planner.placement_pose.assert_not_called()
 
@@ -157,7 +157,6 @@ class RelocateContract(unittest.TestCase):
         motion=Motion.__new__(Motion)
         motion.check_cancel=Mock()
         motion.check_path=Mock()
-        motion.stop_settled_pose=dict
         motion.planner=NS(_command_pose=dict)
         model=NS(ranges=[(-100.,100.)]*5,margin=5.,
                  pose=lambda q:NS(torque=[0.,q['shoulder_lift']/100.,q['elbow_flex']/100.]))
@@ -703,15 +702,24 @@ class GeometryPolicy(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError,'measured clearance decreases'):
             motion.check_recovery_feedback({'q':0.},world)
 
-    def test_future_release_is_rejected_if_factory_stop_reaches_a_wall(self):
+    def test_path_checks_actual_commands_without_a_hypothetical_bias_removal(self):
         recorded=json.loads((ROOT/'runtime/retreat-park-before-restart.json').read_text())
         robot=Robot('/home/jetsonnx/Projects/so101_autonomous_pick_place',ROOT/'runtime/unit')
         motion=Motion(robot,lambda:None,lambda *args:None,ROOT/'runtime/qualification.json')
         motion.planner.command_sag=3.7;q=recorded['pos']
         phase=Phase('release',(q,),jaw_contact=True)
         plan=NS(target_id='released',payload_local=None,phases=(phase,))
-        world=NS(reason=lambda pose,**policy:'camera: wall' if pose['shoulder_lift']>q['shoulder_lift']+.5 else None)
-        with self.assertRaisesRegex(ValueError,'native STOP settling: camera: wall'):
+        world=NS(reason=Mock(side_effect=lambda pose,**policy:'camera: wall' if pose['shoulder_lift']>q['shoulder_lift']+.5 else None))
+        self.assertTrue(motion.check_path(plan,world))
+        checked=[call.args[0] for call in world.reason.call_args_list]
+        self.assertIn(q,checked)
+        self.assertIn(motion.planner._command_pose(q),checked)
+        world.reason.side_effect=lambda pose,**policy:'camera: wall' if pose==q else None
+        with self.assertRaisesRegex(ValueError,'release: pose: camera: wall'):
+            motion.check_path(plan,world)
+        command=motion.planner._command_pose(q)
+        world.reason.side_effect=lambda pose,**policy:'camera: wall' if pose==command else None
+        with self.assertRaisesRegex(ValueError,'release: native command: camera: wall'):
             motion.check_path(plan,world)
         self.assertIsNone(robot.arm)
 
