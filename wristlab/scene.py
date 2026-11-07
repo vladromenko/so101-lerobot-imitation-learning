@@ -120,6 +120,10 @@ class Scene:
                 objects.append(obj)
             except ValueError as exc:
                 rejected.append({'color': detection['color'], 'reason': str(exc)})
+        seen_colors = {d['color'] for d in detected}
+        wrist_only = {d['color'] for d in wrist_detections}-seen_colors
+        for color in sorted(wrist_only):
+            rejected.append({'color':color,'reason':'wrist-visible cube has no current overview localization'})
         for obj in objects:
             matches = [] if obj.evidence.get('metric_qualified') else [(key,cube) for key,cube in self.metric_objects.items() if np.linalg.norm(cube.center_m[:2]-obj.pose[:2,3]) < .006]
             if len(matches)==1:

@@ -27,6 +27,7 @@ class Runtime:
         self.config = json.loads((self.root/'wristlab/config.yaml').read_text())
         self.output = self.root/'runtime'
         self.output.mkdir(exist_ok=True)
+        self.boot_id = Path('/proc/sys/kernel/random/boot_id').read_text().strip()
         self.pending_grasp_file = self.output/'pending-supported-grasp.json'
         self.pending_grasp = json.loads(self.pending_grasp_file.read_text()) if self.pending_grasp_file.exists() else None
         self.geometry = Geometry(self.config['native_root'])
@@ -75,6 +76,8 @@ class Runtime:
         self.native_stop_ack = None
         self.native_stop_seen = None
         self.camera_error = None
+        self.cameras_initialized = False
+        self.camera_retry_at = 0.
         self.scene_error = None
         self.scene_lock = self.scene.lock
         self.preparing_scene = False
@@ -90,8 +93,10 @@ class Runtime:
         self.park_error = None
         self.park_preview = None
         self.idle_park_attempted_at = 0.
-        proposal = self.output/'invalid-start-proposal.json'
-        self.recovery_proposal = json.loads(proposal.read_text()) if proposal.exists() else None
+        # A physical proposal belongs to this executor instance, even when
+        # the old report is still on disk for diagnosis.
+        self.recovery_proposal = None
+        self.overview_preview = None
         self.physical_progress = {}
         progress = self.output/'physical-progress.json'
         if progress.exists():
@@ -130,34 +135,50 @@ class Runtime:
             (self.output/'robot-audit.json').write_text(json.dumps(audit,indent=2))
         except Exception as exc:
             self.hardware_error = str(exc)
-        try:
-            self.metrics['camera_controls'] = self.cameras.apply_controls()
-            self.cameras.start_capture()
-            self.cameras.on_native_stop = self.native_stop
-            self.cameras.on_frames = self.background_refresh
-            # The line-only detector confused table/cable edges with boxes in
-            # this scene. Reuse the already-loaded native model once, before
-            # Ready; experiments only track the resulting current observation.
-            self.scene.boxes_semantically_seeded = True
-            box_started = time.perf_counter()
-            try:
-                scan = self.cameras.json('/api/scan-hybrid',{},timeout=30.)
-                self.scene.install_box_proposals(scan)
-                (self.output/'box-observation.json').write_text(json.dumps(scan))
-            finally:
-                self.metrics['box_detection_startup_s'] = time.perf_counter()-box_started
-            wrist_path = self.output/'wrist-camera-calibration.json'
-            if wrist_path.exists():
-                self.geometry.install_wrist_calibration(json.loads(wrist_path.read_text()),self.robot)
-            self.refresh(measure_attachment=True)
-        except Exception as exc:
-            self.report('blocked',str(exc))
+        self.initialize_cameras()
         self.initialized = True
         reasons = self.blockers()
         if not reasons:
             self.ensure_driver()
         self.report('blocked' if reasons else 'ready','; '.join(reasons) if reasons else 'Ready')
         self.persist()
+
+    def initialize_cameras(self):
+        try:
+            if 'camera_controls' not in self.metrics:
+                self.metrics['camera_controls'] = self.cameras.apply_controls()
+            self.cameras.on_native_stop = self.native_stop
+            self.cameras.start_capture()
+            # The line-only detector confused table/cable edges with boxes in
+            # this scene. Reuse the already-loaded native model once, before
+            # Ready; experiments only track the resulting current observation.
+            if not self.scene.boxes_semantically_seeded:
+                box_started = time.perf_counter()
+                scan = self.cameras.json('/api/scan-hybrid',{},timeout=30.)
+                with self.scene_lock:
+                    self.scene.install_box_proposals(scan)
+                (self.output/'box-observation.json').write_text(json.dumps(scan))
+                self.metrics['box_detection_startup_s'] = time.perf_counter()-box_started
+            wrist_path = self.output/'wrist-camera-calibration.json'
+            if wrist_path.exists():
+                self.geometry.install_wrist_calibration(json.loads(wrist_path.read_text()),self.robot)
+            self.refresh(measure_attachment=True)
+            self.cameras_initialized = True
+            self.cameras.on_frames = self.background_refresh
+        except Exception as exc:
+            self.camera_error = str(exc)
+            self.camera_retry_at = time.monotonic()+2.
+
+    def read_release_checkpoint(self):
+        import pickle
+        path = self.output/'released-placement.pkl'
+        # A power cycle can move the arm and the scene while the runtime is
+        # absent. Historical release geometry cannot authorize a new retreat.
+        with path.open('rb') as handle:
+            checkpoint = pickle.load(handle)
+        if checkpoint.get('boot_id')!=self.boot_id:
+            raise ValueError('released placement is not from this boot; observe a new scene')
+        return checkpoint
 
     def refresh(self, measure_attachment=False):
         begin = time.monotonic()
@@ -213,6 +234,10 @@ class Runtime:
             add('BOX_MISSING','GEOMETRY','коробки не обнаружены','актуальное наблюдение содержит целевую коробку')
         elif any(not (b.evidence.get('metric_qualified') or b.evidence.get('collision_qualified')) for b in self.scene.state.boxes.values()):
             add('BOX_GEOMETRY','QUALIFICATION','геометрия дна/бортов коробок не квалифицирована','все видимые коробки имеют текущий метрический обзор дна и стенок')
+        if self.scene.state.obstacles:
+            add('SCENE_OBSTACLES','GEOMETRY','есть объекты без подтверждённой геометрии: '+
+                ', '.join(sorted({o.get('color','unknown') for o in self.scene.state.obstacles})),
+                'актуальные наблюдения подтверждают положение и размеры всех видимых препятствий')
         if self.scene.held is not None and not self.running:
             add('PAYLOAD_HELD','RECOVERY','после ошибки планирования предмет удерживается',
                 'предмет установлен по отдельно проверенному плану восстановления; автоматическое раскрытие запрещено')
@@ -295,11 +320,13 @@ class Runtime:
             if self.running or not self.commands.empty():
                 raise ValueError('another task is running or queued')
             preview_recovery = payload.get('mode')=='RECOVERY_FROM_INVALID_START' and payload.get('dry') is True
-            if not preview_recovery:
+            preview_folded = payload.get('mode')=='FOLDED_STARTUP' and payload.get('dry') is True
+            preview_view = payload.get('mode')=='OVERVIEW_CLEARANCE' and payload.get('dry') is True
+            if not (preview_recovery or preview_folded or preview_view):
                 self.check_cancel()
             if not self.initialized or (self.scene.held is not None and not payload.get('resume_supported_grasp')):
                 raise ValueError('startup requires initialized feedback and an empty hand')
-            if not preview_recovery and payload.get('cable_and_hidden_surfaces_clear') is not True:
+            if not (preview_recovery or preview_folded or preview_view) and payload.get('cable_and_hidden_surfaces_clear') is not True:
                 raise ValueError('operator observation is required for this attended startup')
             self.running = True
             self.commands.put_nowait(dict(payload,control='prepare'))
@@ -307,6 +334,22 @@ class Runtime:
     def perform_prepare(self, payload):
         self.preparing_scene = True
         try:
+            self.started = time.monotonic()
+            self.robot.first_command_at = None
+            if payload.get('mode')=='OVERVIEW_CLEARANCE':
+                self.results = [self.prepare_overview_clearance(payload)]
+                return
+            if payload.get('mode')=='FOLDED_STARTUP' and payload.get('dry') is True:
+                generation = self.stop_generation
+                def check_preview():
+                    if generation!=self.stop_generation or not self.robot.owns_lease():
+                        raise RuntimeError('new STOP or hardware ownership lost during folded-start preview')
+                    self.cameras.check()
+                check_preview()
+                self.refresh()
+                self.results = [self.motion.prepare_ready(self.scene,self.geometry,{},dry=True,planning_check=check_preview)]
+                self.report('checked','folded exit geometry checked; STOP retained; no motion')
+                return
             if payload.get('mode')=='RECOVERY_FROM_INVALID_START':
                 self.started = time.monotonic()
                 self.robot.first_command_at = None
@@ -367,9 +410,59 @@ class Runtime:
             self.preparing_scene = False
             self.persist()
 
+    def prepare_overview_clearance(self,payload):
+        dry = payload.get('dry') is True
+        previous = self.overview_preview
+        generation = self.stop_generation
+        if not dry and (previous is None or payload.get('operator_at_stop') is not True or
+                        payload.get('proposal_checked_at')!=previous['checked_at'] or generation!=previous['stop_generation']):
+            raise ValueError('a current checked overview route and explicit attended approval are required')
+        def check():
+            if generation!=self.stop_generation or not self.robot.owns_lease():
+                raise RuntimeError('STOP or hardware ownership changed during overview check')
+            if not dry:
+                self.check_cancel()
+            self.cameras.check()
+        check()
+        self.refresh()
+        if not self.scene.state.boxes:
+            raise ValueError('no current box outlines for a checked view change')
+        self.report('checking','noncontact overview clearance from fresh geometry')
+        path,world,mapping = self.motion.overview_clear_path(self.scene,self.geometry,check)
+        proposal = {'start':path[0],'goal':path[-1],'checked_at':time.time(),'stop_generation':generation,
+                    'partial_cube_clearance_m':world.partial_clearance.copy(),
+                    'holding_hardware_goals':mapping['hardware_goals'],'stop_policy':mapping['supported_stop_policy'],
+                    'success':True,'physical_verified':False,'actuator_commands_sent':False}
+        if dry:
+            self.overview_preview = proposal
+            self.report('checked','overview view change checked; no actuator commands')
+            return proposal
+        if any(previous[key]!=proposal[key] for key in ('start','goal','holding_hardware_goals')):
+            raise ValueError('the approved overview route or holding goals changed; recalculate before execution')
+        check()
+        self.motion.startup_world = world
+        self.motion.executing_recovery = True
+        self.motion.recovery_mapping = mapping
+        try:
+            travel = abs(path[-1]['shoulder_pan']-path[0]['shoulder_pan'])
+            self.report('moving','checked noncontact overview view')
+            with self.robot.synchronized_follow(mapping):
+                self.robot.arm.follow(path,duration=max(1.,1.875*travel/2.),settle=1.,within=.7,lead=False,step='overview_clearance')
+        finally:
+            self.motion.startup_world = None
+            self.motion.executing_recovery = False
+        final = self.robot.read_state()['positions']
+        reason = world.reason(final)
+        if reason or abs(final['shoulder_pan']-path[-1]['shoulder_pan'])>self.motion.planner.tracking_error_deg:
+            raise RuntimeError('overview move endpoint: '+str(reason or 'tracking error'))
+        self.refresh()
+        self.overview_preview = None
+        self.report('prepared','overview view reached; '+('obstacles remain unresolved' if self.scene.state.obstacles else 'all visible cubes localized'))
+        return proposal|{'actual':final,'physical_verified':True,'actuator_commands_sent':True,
+                         'remaining_obstacles':self.scene.state.obstacles}
+
     def preview_invalid_start(self):
         """Read-only recovery diagnosis is permitted with the STOP latch set."""
-        import pickle
         generation = self.stop_generation
         last_feedback = 0.
         def planning_cancel():
@@ -383,11 +476,12 @@ class Runtime:
                 self.monitor_motors()
                 last_feedback = time.monotonic()
         planning_cancel()
-        with (self.output/'released-placement.pkl').open('rb') as handle:
-            saved = pickle.load(handle)
+        saved = self.read_release_checkpoint()
         if saved['calibration_sha256']!=self.geometry.fingerprint or self.scene.held is not None:
             raise ValueError('no matching released-cube checkpoint')
         state = self.robot.read_state()
+        if not self.robot.arm.torque or not all(m['torque_enabled'] for m in state['motor_health'].values()):
+            raise ValueError('retreat recovery requires an uninterrupted powered hold')
         if (abs(state['loads']['gripper']) or abs(state['currents']['gripper']) or
             state['gripper']<saved['release_actual']['gripper']-self.robot.encoder_steps()['gripper']):
             raise ValueError('empty jaws are not confirmed by current feedback')
@@ -419,7 +513,6 @@ class Runtime:
 
     def execute_invalid_start(self, payload):
         """Execute only a specifically approved, complete recovery proposal."""
-        import pickle
         from dataclasses import replace
         from so101_pick_place.experiments.box_extraction.planner import Phase
         self.check_cancel()
@@ -431,8 +524,7 @@ class Runtime:
             raise ValueError('a complete checked Retreat/Park and explicit attended approval are required')
         if proposal['stop_generation']!=self.stop_generation or proposal['calibration_sha256']!=self.geometry.fingerprint:
             raise ValueError('STOP or calibration changed after the recovery calculation')
-        with (self.output/'released-placement.pkl').open('rb') as handle:
-            saved = pickle.load(handle)
+        saved = self.read_release_checkpoint()
         state = self.robot.read_state()
         self.robot.read_motor_health(force=True)
         state['motor_health'] = self.robot.motor_health
@@ -517,7 +609,6 @@ class Runtime:
 
     def park_arm(self, previous=None, world=None, *, dry=False, attended=False, expected_goal=None):
         """Shared Park entry: the STOP latch is checked before any planning or motion."""
-        import pickle
         self.check_cancel()
         self.cameras.check()
         if self.scene.held is not None:
@@ -528,8 +619,7 @@ class Runtime:
             path = self.output/'released-placement.pkl'
             if not path.exists():
                 raise ValueError('Park has no verified current manipulation scene')
-            with path.open('rb') as handle:
-                saved = pickle.load(handle)
+            saved = self.read_release_checkpoint()
             if saved['calibration_sha256']!=self.geometry.fingerprint:
                 raise ValueError('Park checkpoint calibration differs')
             previous = saved['plan']
@@ -838,12 +928,10 @@ class Runtime:
 
     def resume_released_placement(self, attendance):
         """Finish only the empty-jaw retreat and verification after release."""
-        import pickle
         from dataclasses import replace
         from .types import ActionResult
         from so101_pick_place.experiments.box_extraction.planner import Phase
-        with (self.output/'released-placement.pkl').open('rb') as handle:
-            saved = pickle.load(handle)
+        saved = self.read_release_checkpoint()
         if saved['calibration_sha256']!=self.geometry.fingerprint or self.scene.held is not None:
             raise ValueError('released-placement recovery has no matching empty-hand checkpoint')
         state = self.robot.read_state()
@@ -1238,7 +1326,6 @@ class Runtime:
 
     def loop(self):
         self.initialize()
-        last_vision = 0.
         last_persist = 0.
         while True:
             try:
@@ -1251,9 +1338,11 @@ class Runtime:
                         self.monitor_motors()
                         if self.scene.held is not None and self.motion.driver is not None:
                             self.motion.driver.retention.check(state['loads']['gripper'],state['currents']['gripper'])
-                    if self.cameras.on_frames is None and time.monotonic()-last_vision >= self.config['poll_interval_s']:
-                        self.refresh()
-                        last_vision = time.monotonic()
+                    if not self.cameras_initialized and time.monotonic()>=self.camera_retry_at:
+                        self.initialize_cameras()
+                        if self.cameras_initialized:
+                            reasons = self.blockers()
+                            self.report('blocked' if reasons else 'ready','; '.join(reasons) if reasons else 'Ready')
                     native = self.cameras.json('/api/status')
                     state = native.get('state')
                     if state=='EMERGENCY_STOP':

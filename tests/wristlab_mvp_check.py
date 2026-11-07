@@ -195,6 +195,38 @@ class RelocateContract(unittest.TestCase):
 
 
 class GeometryPolicy(unittest.TestCase):
+    def test_release_checkpoint_cannot_cross_a_reboot(self):
+        import pickle
+        with tempfile.TemporaryDirectory() as directory:
+            rt=Runtime.__new__(Runtime);rt.output=Path(directory);rt.boot_id='current'
+            path=rt.output/'released-placement.pkl'
+            path.write_bytes(pickle.dumps({'boot_id':'previous'}))
+            with self.assertRaisesRegex(ValueError,'not from this boot'):
+                rt.read_release_checkpoint()
+            path.write_bytes(pickle.dumps({'boot_id':'current','release_actual':Q}))
+            self.assertEqual(rt.read_release_checkpoint()['release_actual'],Q)
+
+    def test_camera_initialization_can_retry_after_native_api_starts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            rt=Runtime.__new__(Runtime);rt.output=Path(directory);rt.metrics={}
+            rt.scene=NS(boxes_semantically_seeded=True);rt.refresh=Mock()
+            rt.cameras_initialized=False;rt.camera_retry_at=0.
+            rt.cameras=NS(apply_controls=Mock(side_effect=[OSError('connection refused'),{}]),start_capture=Mock())
+            rt.initialize_cameras()
+            self.assertFalse(rt.cameras_initialized)
+            self.assertGreater(rt.camera_retry_at,time.monotonic())
+            rt.initialize_cameras()
+            self.assertTrue(rt.cameras_initialized)
+            rt.cameras.start_capture.assert_called_once()
+
+    def test_overview_view_requires_attended_approval_for_that_proposal(self):
+        rt=Runtime.__new__(Runtime);rt.stop_generation=2
+        rt.overview_preview={'checked_at':1.,'stop_generation':2}
+        rt.refresh=Mock()
+        with self.assertRaisesRegex(ValueError,'explicit attended approval'):
+            rt.prepare_overview_clearance({'operator_at_stop':True,'proposal_checked_at':3.})
+        rt.refresh.assert_not_called()
+
     def test_placement_cannot_be_proved_by_retained_or_old_metric_coordinates(self):
         scene=Scene(NS(wrist=None))
         obj=object_at('target','green',.25,0.)

@@ -219,7 +219,8 @@ class Actions:
                             released = replace(native_scene,cubes=native_scene.cubes|{object_id:placed})
                             checkpoint = {'plan':plan,'native_scene':released,'object':obj,'placement':placement,
                                 'start':start,'release_actual':self.robot.read_state()['positions'],
-                                'boxes':dict(self.scene.metric_boxes),'calibration_sha256':self.scene.geometry.fingerprint}
+                                'boxes':dict(self.scene.metric_boxes),'calibration_sha256':self.scene.geometry.fingerprint,
+                                'boot_id':rt.boot_id}
                             temporary = rt.output/'released-placement.tmp'
                             with temporary.open('wb') as handle:
                                 pickle.dump(checkpoint,handle)

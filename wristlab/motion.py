@@ -94,7 +94,7 @@ class Motion:
         self.recovery_mapping = None
         self.executing_recovery = False
 
-    def prepare_ready(self, scene, geometry, attendance, dry=False):
+    def prepare_ready(self, scene, geometry, attendance, dry=False, planning_check=None):
         """Leave the folded soft-margin violation through an attended opening corridor.
 
         This does not qualify an unknown cable or enable manipulation. The human
@@ -102,8 +102,9 @@ class Motion:
         before and during the motion. Ordinary task margins remain unchanged.
         """
         from box_extract.mounted_arm import validated_segments
-        self.check_cancel()
-        if attendance.get('cable_and_hidden_surfaces_clear') is not True:
+        check = planning_check if dry and planning_check is not None else self.check_cancel
+        check()
+        if not dry and attendance.get('cable_and_hidden_surfaces_clear') is not True:
             raise ValueError('attended startup requires the operator observation')
         state = self.robot.read_state()
         if not self.robot.audit_state(state)['hard_valid']:
@@ -124,7 +125,7 @@ class Motion:
         # its corners, rather than extrapolating past the stationary start.
         import itertools
         for q in path:
-            self.check_cancel()
+            check()
             lag_deg = self.planner.tracking_error_deg
             for lift,elbow in itertools.product((max(start['shoulder_lift'],q['shoulder_lift']-lag_deg),q['shoulder_lift']),
                                                (min(start['elbow_flex'],q['elbow_flex']+lag_deg),q['elbow_flex'])):
@@ -140,9 +141,9 @@ class Motion:
                     'ordinary_margin_deg':model.margin,'ordinary_gap_m':model.gap,
                     'initial_sample_gap_m':world.initial_gap,'physical_completed':False}
         output = self.qualification_file.parent/'startup-trial.json'
-        output.write_text(json.dumps(evidence,indent=2,ensure_ascii=False))
         if dry:
             return evidence
+        output.write_text(json.dumps(evidence,indent=2,ensure_ascii=False))
         self.startup_world = world
         self.report('moving','attended_prepare_ready: coordinated shoulder/elbow opening; wrist held')
         try:
@@ -169,6 +170,67 @@ class Motion:
     def qualification_reasons(self, geometry):
         return [item['reason'] for item in self.qualification_blockers(geometry)]
 
+    def overview_clear_path(self, scene, geometry, check):
+        """Select the shortest checked base rotation that exposes an occluded cube."""
+        from box_extract.scene_builder import robot_mask
+        state = self.robot.read_state()
+        start = state['positions']
+        if not self.robot.audit_state(state)['planning_valid'] or not self.robot.arm.torque:
+            raise ValueError('a powered ordinary working pose is required for a new view')
+        if state['loads']['gripper'] or state['currents']['gripper']:
+            raise ValueError('view change requires an empty gripper')
+        mapping = self.robot.synchronize_reference(state,self.robot.arm.raw.sag)
+        if not mapping['supported_stop_packet_checked']:
+            raise ValueError('preservation of the last checked holding goals was not confirmed')
+        model = self.robot.backend.model
+        frame = scene.frames['overview']
+        world = StartupWorld(self.robot,scene,geometry,start,start,self.attachment_path,strict=True)
+        if not world.partial_cubes:
+            raise ValueError('no bounded partially visible cube requires a new overview')
+        visible = np.zeros(frame.image.shape[:2],np.uint8)
+        for _,_,_,rectangle in world.partial_cubes:
+            cv2.fillConvexPoly(visible,rectangle,255)
+        limits = model.ranges[0][0]+model.margin,model.ranges[0][1]-model.margin
+        pan = 'shoulder_pan'
+        candidates = sorted((q for limit in limits for q in self.robot.native_edge_samples(start,dict(start,**{pan:limit}))
+                             if q[pan]!=start[pan]),key=lambda q:abs(q[pan]-start[pan]))
+        first_refusal = None
+        rejected = set()
+        for goal in candidates:
+            check()
+            # Require the whole visible fragment, not just its centre, to be
+            # clear in the prospective image. The new frame must then localize it.
+            side = np.sign(goal[pan]-start[pan])
+            occlusion = robot_mask(self.robot.backend,goal,geometry.calibration,visible.shape) if side not in rejected else visible
+            if not np.any((occlusion>0)&(visible>0)):
+                world.goal = goal
+                world.cache.clear()
+                world.partial_clearance = {}
+                path = tuple(self.robot.native_edge_samples(start,goal))
+                self.recovery_mapping = mapping
+                holding = mapping['hardware_goals']
+                world.command_bounds = holding,self.robot.synchronized_command(goal,mapping)
+                reason = None
+                for q in path:
+                    check()
+                    for sample in self.recovery_envelope(start,q,holding):
+                        reason = world.reason(sample)
+                        if reason:
+                            break
+                    command = self.robot.synchronized_command(q,mapping)
+                    if not reason:
+                        reason = world.reason(command,command=True)
+                    if reason:
+                        break
+                if not reason:
+                    return path,world,mapping
+                first_refusal = first_refusal or reason
+                # A farther rotation on this side contains the same failed edge.
+                rejected.add(side)
+                if len(rejected)==2:
+                    break
+        raise ValueError('no checked overview change: '+str(first_refusal or 'cube remains occluded'))
+
     def qualification_blockers(self, geometry):
         blockers = []
         def add(code,category,reason,condition):
@@ -187,7 +249,8 @@ class Motion:
             if audit['zero_gap_sample_contact']:
                 add('MODEL_CONTACT','GEOMETRY',audit['zero_gap_sample_contact'],'подтверждено отсутствие контакта всей руки; нулевой порог не обходить')
             if audit['hard_valid'] and not audit['planning_valid']:
-                released = (self.qualification_file.parent/'released-placement.pkl').exists()
+                released = (any(m['torque_enabled'] for m in state.get('motor_health',{}).values()) and
+                            (self.qualification_file.parent/'released-placement.pkl').exists())
                 add('RETREAT_CLEARANCE' if released else 'STARTUP_PREPARATION','GEOMETRY' if released else 'STARTUP',
                     'после release фактическая поза не проходит рабочий запас; требуется проверенный выход пустого захвата' if released else
                     'штатная стартовая поза требует prepare_ready до применения рабочих запасов 5°/8 мм; это не отказ калибровки суставов',
@@ -802,9 +865,11 @@ class Motion:
         if self.executing_recovery:
             record = dict(record,goal=self.robot.control_reference(record['goal'],self.recovery_mapping,inverse=True))
         if self.startup_world is not None:
+            command = (self.robot.synchronized_command(record['goal'],self.recovery_mapping) if self.executing_recovery else
+                       self.robot.backend.driver_command_goal(record['goal'],self.robot.arm.raw.sag))
             for kind,q in (('goal',record['goal']),('pos',record['pos']),
-                           ('command',self.robot.backend.driver_command_goal(record['goal'],self.robot.arm.raw.sag))):
-                reason = self.startup_world.reason(q)
+                           ('command',command)):
+                reason = self.startup_world.reason(q,command=kind=='command')
                 if reason:
                     raise RuntimeError('startup '+kind+': '+reason)
             return
@@ -986,11 +1051,12 @@ class Motion:
 
 class StartupWorld:
     """Checked, pose-bounded exit; never used as a manipulation collision world."""
-    def __init__(self,robot,scene,geometry,start,goal,profile_path):
+    def __init__(self,robot,scene,geometry,start,goal,profile_path,strict=False):
         from scipy.spatial import ConvexHull
         from .diagnostics import minimum_clearance
         from so101_pick_place.experiments.box_extraction.mesh_collision import load_collision_meshes
         self.robot,self.geometry = robot,geometry
+        self.strict = strict
         self.initial_gap = minimum_clearance(robot.backend.model,start)
         self.start,self.goal = dict(start),dict(goal)
         self.meshes = load_collision_meshes(str(robot.root/'vendor/SO101/so101_new_calib.urdf'))
@@ -1006,30 +1072,71 @@ class StartupWorld:
         for obj in scene.state.objects.values():
             self.mask[obj.mask>0] = 255
         self.mask = cv2.dilate(self.mask,np.ones((25,25),np.uint8))
+        self.partial_cubes = self.bound_partial_cubes(scene,geometry)
+        self.partial_clearance = {}
+        self.command_bounds = None
         self.cache = {}
 
-    def reason(self,q,**policy):
-        key = tuple(q[j] for j in self.start)
+    @staticmethod
+    def bound_partial_cubes(scene,geometry):
+        """Bound an occluded known-size tabletop cube without guessing its centre."""
+        from .vision import color_masks
+        from box_extract.scene_builder import SceneParameters
+        frame = scene.frames['overview']
+        masks = color_masks(frame.image)
+        bounds = []
+        side = float(geometry.known_cube['cube_size_m'])
+        table = geometry.table_z
+        limits = SceneParameters()
+        for color in sorted({o.get('color','unknown') for o in scene.state.obstacles}):
+            if color not in masks:
+                raise ValueError('unclassified obstacle in the observed workspace')
+            contours,_ = cv2.findContours(masks[color],cv2.RETR_EXTERNAL,cv2.CHAIN_APPROX_SIMPLE)
+            def in_workspace(contour):
+                center = np.mean(contour.reshape(-1,2),axis=0)
+                point = geometry.intersect_ray_with_plane(geometry.pixel_ray_in_base(center,frame),([0,0,1],-table))
+                return point[0]>=limits.workspace_min_x_m and np.linalg.norm(point[:2])<=limits.workspace_max_radius_m
+            contours = [c for c in contours if cv2.contourArea(c)>450. and in_workspace(c)]
+            if len(contours)!=1 or any(o.color==color for o in scene.state.objects.values()):
+                raise ValueError(color+': no unique overview fragment to bound the occluded cube')
+            pixels = cv2.convexHull(contours[0]).reshape(-1,2)
+            # Box-contained fragments cannot use the tabletop height. Boxes
+            # are already opaque keepouts, but do not silently infer a cube pose.
+            if any(cv2.pointPolygonTest(np.float32(b.evidence['polygon']),tuple(map(float,p)),False)>=0
+                   for b in scene.state.boxes.values() for p in pixels):
+                raise ValueError(color+': fragment may be supported by a box')
+            points = np.array([[geometry.intersect_ray_with_plane(geometry.pixel_ray_in_base(p,frame),([0,0,1],-z))
+                               for z in (table,table+side)] for p in pixels])
+            diameter = np.sqrt(2.)*side
+            lo = np.r_[points.min(1).max(0)[:2]-diameter,table]
+            hi = np.r_[points.max(1).min(0)[:2]+diameter,table+side]
+            x,y,w,h = cv2.boundingRect(contours[0])
+            bounds.append((color,lo,hi,np.int32([[x,y],[x+w,y],[x+w,y+h],[x,y+h]])))
+        return bounds
+
+    def reason(self,q,command=False,**policy):
+        key = (command,)+tuple(q[j] for j in self.start)
         if key not in self.cache:
             if len(self.cache)>8192:
                 self.cache.clear()
-            self.cache[key] = self._reason(q)
+            self.cache[key] = self._reason(q,command)
         return self.cache[key]
 
-    def _reason(self,q):
+    def _reason(self,q,command):
         from so101_pick_place.experiments.box_extraction.mesh_collision import mesh_box_overlap
         robot,model = self.robot,self.robot.backend.model
+        start,goal = self.command_bounds if command and self.command_bounds is not None else (self.start,self.goal)
         for name,value in q.items():
-            low,high = sorted((self.start[name],self.goal[name]))
+            low,high = sorted((start[name],goal[name]))
             # Native sag can move the elbow inwards; no outward range override.
             allowance = 2. if name=='elbow_flex' else .8
             if not low-allowance<=value<=high+.8:
                 return name+': outside bounded startup corridor'
         pose = model.pose(q)
-        problems = model.problems(pose,margin=0.)
+        problems = model.problems(pose) if self.strict else model.problems(pose,margin=0.)
         if problems:
             return 'hard constraints: '+str(problems)
-        collision = model.collides(pose,gap=max(0.,self.initial_gap-.0002))
+        collision = model.collides(pose) if self.strict else model.collides(pose,gap=max(0.,self.initial_gap-.0002))
         if collision:
             return 'startup closes existing sampled separation: '+collision
         frames = model.frames(q)
@@ -1049,13 +1156,24 @@ class StartupWorld:
             frames[part['name']] = parent
         for name,local in bodies.items():
             points = robot.backend._transform_points(frames[name],local)
-            if name not in ('base_link','shoulder_link') and points[:,2].min()<model.table_z+.004:
+            lo,hi = points.min(0),points.max(0)
+            if name not in ('base_link','shoulder_link') and lo[2]<model.table_z+(model.gap if self.strict else .004):
                 return name+': table clearance'
+            for color,lower,upper,_ in self.partial_cubes:
+                gap = float(np.maximum(lower-hi,lo-upper).max())
+                self.partial_clearance[color] = min(self.partial_clearance.get(color,float('inf')),gap)
+                if gap<model.gap:
+                    return name+': partially visible '+color+' cube clearance'
             hull = cv2.convexHull(np.float32(self.geometry.project(points))).astype(np.int32)
-            mask = np.zeros_like(self.mask)
-            cv2.fillConvexPoly(mask,hull,255)
-            if np.any((mask>0)&(self.mask>0)):
-                return name+': projected cube/box keepout'
+            x,y,w,h = cv2.boundingRect(hull)
+            x0,y0 = max(0,x),max(0,y)
+            x1,y1 = min(self.mask.shape[1],x+w),min(self.mask.shape[0],y+h)
+            region = self.mask[y0:y1,x0:x1] if x1>x0 and y1>y0 else None
+            if region is not None and np.any(region):
+                mask = np.zeros_like(region)
+                cv2.fillConvexPoly(mask,hull-np.int32([x0,y0]),255)
+                if np.any(cv2.bitwise_and(mask,region)):
+                    return name+': projected cube/box keepout'
         return None
 
 

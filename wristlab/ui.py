@@ -73,7 +73,8 @@ def reset():
 def prepare(payload: dict):
     try:
         runtime.prepare(payload)
-        return {'queued':True,'scope':'read-only retreat recovery; STOP retained' if payload.get('mode')=='RECOVERY_FROM_INVALID_START' else
+        return {'queued':True,'scope':'noncontact overview clearance' if payload.get('mode')=='OVERVIEW_CLEARANCE' else
+                'read-only retreat recovery; STOP retained' if payload.get('mode')=='RECOVERY_FROM_INVALID_START' and payload.get('dry') is True else
                 'attended overhead geometry' if payload.get('grasp_mode')=='overhead_grasp' else 'attended folded exit only'}
     except (ValueError,RuntimeError) as exc:
         raise HTTPException(409,str(exc)) from exc
