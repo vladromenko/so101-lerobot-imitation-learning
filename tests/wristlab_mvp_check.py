@@ -92,6 +92,27 @@ def proposed_grasp(plan):
 
 
 class RelocateContract(unittest.TestCase):
+    def test_park_falls_back_to_a_checked_lower_load_pose(self):
+        motion=Motion.__new__(Motion)
+        motion.check_cancel=Mock()
+        motion.check_path=Mock()
+        motion.stop_settled_pose=dict
+        motion.planner=NS(_command_pose=dict)
+        model=NS(ranges=[(-100.,100.)]*5,margin=5.,
+                 pose=lambda q:NS(torque=[0.,q['shoulder_lift']/100.,q['elbow_flex']/100.]))
+        motion.robot=NS(backend=NS(model=model),from_native=Robot.from_native,
+                        native_edge_samples=Robot.native_edge_samples)
+        start=dict(Q,shoulder_lift=0.,elbow_flex=10.)
+        world=NS(reason=lambda q,**policy:'wall' if q['elbow_flex']<5. else None)
+        previous=ExtractionPlan('current','',(),None,None,())
+        with tempfile.TemporaryDirectory() as directory:
+            motion.qualification_file=Path(directory)/'qualification.json'
+            phase=motion.plan_park(start,previous,world)
+        self.assertEqual(phase.joints[0],start)
+        self.assertGreaterEqual(phase.joints[-1]['elbow_flex'],5.)
+        self.assertLess(phase.joints[-1]['elbow_flex'],10.)
+        motion.check_path.assert_called_once()
+
     def test_stationary_planning_refreshes_motor_telemetry(self):
         rt=Runtime.__new__(Runtime)
         rt.config={'poll_interval_s':.35}

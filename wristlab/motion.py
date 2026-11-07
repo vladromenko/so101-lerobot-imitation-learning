@@ -843,9 +843,9 @@ class Motion:
         def cost(q):
             torque = np.asarray(self.robot.backend.model.pose(q).torque)[1:3]
             return float(torque@torque),float(np.linalg.norm(self.robot.from_native(q)-self.robot.from_native(start)))
-        if not candidates:
+        if not candidates and recovery:
             raise ValueError('Park: no physically checked waiting configuration is recorded')
-        if cost(start)[0]<=min(cost(q)[0] for q in candidates):
+        if candidates and cost(start)[0]<=min(cost(q)[0] for q in candidates):
             candidates.append(start)
         failures = []
         for goal in sorted(candidates,key=cost):
@@ -860,6 +860,36 @@ class Motion:
                     return phase
                 except ValueError as exc:
                     failures.append(str(exc))
+        if not recovery:
+            model = self.robot.backend.model
+            from scipy.optimize import minimize
+            paths = []
+            for axes in ((1,2),(1,),(2,)):
+                names = tuple(('shoulder_lift','elbow_flex')[axis-1] for axis in axes)
+                def pose(values):
+                    return dict(start,**dict(zip(names,map(float,values))))
+                bounds = [(model.ranges[i][0]+model.margin,model.ranges[i][1]-model.margin) for i in axes]
+                fit = minimize(lambda values:cost(pose(values))[0],[start[j] for j in names],bounds=bounds)
+                if fit.success and cost(pose(fit.x))[0]<cost(start)[0]:
+                    path = []
+                    for q in self.robot.native_edge_samples(start,pose(fit.x)):
+                        getattr(self,'check_planning',self.check_cancel)()
+                        reason = next((r for p in (q,self.planner._command_pose(q),self.stop_settled_pose(q))
+                                       if (r:=world.reason(p,**policy)) is not None),None)
+                        if reason:
+                            break
+                        path.append(q)
+                    if len(path)>1 and cost(path[-1])[0]<cost(start)[0]:
+                        paths.append(path)
+            for path in sorted(paths,key=lambda p:cost(p[-1])):
+                while len(path)>1 and cost(path[-1])[0]<cost(start)[0]:
+                    phase = Phase('safe_park',tuple(path),placed_cube=placed)
+                    try:
+                        self.check_path(replace(previous,phases=(phase,)),world)
+                        return phase
+                    except ValueError as exc:
+                        failures.append(str(exc))
+                        path = path[:len(path)//2]
         raise ValueError('no safe low-load Park transition: '+'; '.join(failures[-3:]))
 
     def park_arm(self, previous, world, phase=None):
