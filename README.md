@@ -42,9 +42,9 @@ and evaluate an ACT or SmolVLA policy.
   retrained on all 50 episodes with image augmentation.
 - The final ACT checkpoint reached 30,000 updates. With its original weights,
   matched image preprocessing, and the restored LeRobot execution profile of
-  50 actions per prediction, it physically picked up a cube and carried it
-  almost to the box. One grasp was confirmed by the operator. Box placement,
-  release, and repeatability remain to be verified.
+  50 actions per prediction, the robot picked up the blue cube and got it into
+  the white box. The operator confirmed this first physical success. Placement
+  precision and repeatability still need to be measured.
 - The final SmolVLA checkpoint reached 15,000 updates. This final fit has a
   training result; a successful physical grasp from it is unverified.
 

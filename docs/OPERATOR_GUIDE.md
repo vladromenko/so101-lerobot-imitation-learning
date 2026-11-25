@@ -282,9 +282,10 @@ input configuration.
 
 The Homebrain final-fit ACT run is
 `aed3d3bcab144b7482693cc7167a9c45/checkpoints/step_00030000`. Its training
-loss was about 0.1744. After the execution correction the operator confirmed a
-grasp and transfer almost to the box. Accurate placement and repeatability
-remain unverified. The final SmolVLA run is
+loss was about 0.1744. After the execution correction the operator confirmed
+that the robot picked up the blue cube and got it into the white box in one
+physical trial. Placement precision and repeatability still need to be
+measured. The final SmolVLA run is
 `118a1aee7f6242b9aebbb0a68e9db34b/checkpoints/step_00015000`. Its training loss
 was about 0.1242. A successful physical grasp from that checkpoint is unverified.
 
