@@ -14,12 +14,11 @@ Homebrain environment. The SAM 3 entry points to a local checkout, and the CUDA
 wheel suffixes require a compatible package source. A default PyPI install
 alone does not reproduce this environment.
 
-From the clone, create a private environment and install the matched PyTorch and
+Follow the [clone commands in the README](../README.md#quick-start-record-your-first-demonstration).
+From the checkout, create a private environment and install the matched PyTorch and
 torchvision wheels. Then install the rest of the locked packages and the lab:
 
 ```bash
-git clone https://github.com/vladromenko/so101-lerobot-imitation-learning.git so101_ai_learning
-cd so101_ai_learning
 python3.12 -m venv .venv
 # Install the Jetson-compatible torch and torchvision wheels here first.
 awk '!/^(sam3 @ |torch==|torchvision==)/' config/requirements.lock.txt |
@@ -34,8 +33,9 @@ For CUDA training the last value should be `True`. The shipped systemd units,
 `/home/jetsonnx/Projects/so101_ai_learning`. Use that path when reproducing the
 Homebrain installation or adapt those paths for the new host.
 
-Provision model assets under the service user's normal caches before starting
-offline training:
+You can go straight to [hardware setup](#2-connect-and-check-the-hardware)
+to record your first demonstrations. Provision model assets under the service
+user's normal caches before running annotation or starting offline training:
 
 | Feature | Required local assets |
 | --- | --- |
@@ -64,13 +64,14 @@ preflight, which checks the whole installation.
 2. Verify that `/dev/so101-leader` and `/dev/so101-follower` resolve to the correct
    serial devices. On a new machine, use local udev rules to create stable
    aliases from each controller's USB identity. Ensure the service user has
-   serial and video access. Compare `ls -l /dev/serial/by-id /dev/v4l/by-id` with
-   the defaults in [hardware.py](../src/so101_lab/hardware.py). Match camera
-   identities on a different rig before using it. The verified recording
+   serial and video access. Use `ls -l /dev/serial/by-id /dev/v4l/by-id` to
+   identify the devices. If your cameras have different USB IDs, update
+   `DEFAULT_CAMERAS` in [hardware.py](../src/so101_lab/hardware.py) in your
+   checkout to use your stable video paths. The verified recording
    setup is 640 × 480 at 30 FPS, YUYV for wrist and MJPG for overhead.
 3. Use calibrations measured for the actual leader and follower. Homebrain's
    existing files in `config/calibration_snapshots/` are specific to its arms.
-   For different arms, use the standard LeRobot calibration procedure with
+   For different arms, use the [LeRobot SO-101 calibration procedure](https://huggingface.co/docs/lerobot/so101) with
    IDs `so101_leader` and `so101_follower`. Keep the follower calibration in the
    LeRobot cache for the official rollout. Copy the corresponding files into
    the lab as `leader.json` and `follower.json`. Set their SHA-256 values in
@@ -97,6 +98,30 @@ Run the last line after copying the measured calibration files. Use the resultin
 hashes in the manifest. Homebrain's working arms already have their calibrations.
 
 ### Start Studio and MLflow
+
+To start Studio from a clone in any directory, run this from its root:
+
+```bash
+mkdir -p runtime logs models data/mlflow-artifacts
+PYTHONPATH="$PWD/src" HF_HUB_OFFLINE=1 TOKENIZERS_PARALLELISM=false \
+  .venv/bin/python -m uvicorn so101_lab.app:app --host 0.0.0.0 --port 8020
+```
+
+Leave that terminal running. Open `http://<jetson-address>:8020` on a trusted
+LAN or use `http://localhost:8020` from the robot host. Opening Studio gives
+you the existing recording interface and the Leader → Follower controls.
+MLflow is optional for the first recording. To use it, run this in another
+terminal from the same directory:
+
+```bash
+.venv/bin/python -m mlflow server --host 0.0.0.0 --port 5020 --workers 1 \
+  --backend-store-uri "sqlite:///$PWD/runtime/mlflow.db" \
+  --artifacts-destination "$PWD/data/mlflow-artifacts" \
+  --allowed-hosts "localhost:*,127.0.0.1:*,$(hostname):*"
+```
+
+To open MLflow from another computer, include the Jetson IP or DNS name in
+`--allowed-hosts`. Failed deliveries are spooled under `runtime/mlflow-spool/`.
 
 On the existing Homebrain installation with the user units already installed:
 
