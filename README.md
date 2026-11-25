@@ -1,165 +1,51 @@
-# SO-101 AI Learning Lab
+# SO-101 LeRobot Imitation Learning
 
-Независимая локальная лаборатория для записи демонстраций SO-101, разметки,
-обучения ACT/SmolVLA и запуска обученной политики на роботе. Приложение работает
-на Homebrain (Jetson), не открывает камеры или шины моторов при старте сервера и
-не использует LLM в цикле управления.
+Record teleoperated SO-101 demonstrations, validate and export them as LeRobot
+datasets, train ACT and SmolVLA on a Jetson, track runs in MLflow, and evaluate
+checkpoints on the physical follower. The browser manages the workflow. Models,
+data, and robot control run locally on Homebrain.
 
-Актуальный снимок проекта и история проблем описаны в
-[docs/HOMEBRAIN_FINAL_STATE_RU.md](docs/HOMEBRAIN_FINAL_STATE_RU.md). Краткий
-хронологический журнал сохранён в [STATUS.md](STATUS.md).
+**Start here: [English setup and operator guide](docs/OPERATOR_GUIDE.md).**
+It covers the Jetson environment, USB and calibration setup, how to record
+repeatable demonstrations, dataset splits, training settings, and physical
+evaluation.
 
-## Текущее состояние
+## What was tested
 
-- Веб-интерфейс: `http://192.168.0.168:8020` по LAN или
-  `http://100.95.83.3:8020` через Tailscale.
-- MLflow: те же адреса, порт `5020`.
-- Запись: две камеры либо только wrist-камера, calibrated leader → follower,
-  lossless PNG и фактические состояния/команды суставов.
-- Датасет: 50 реальных wrist-only эпизодов задачи «синий кубик → белая коробка».
-- Обучение: ACT и SmolVLA, независимые train/validation/test-сессии,
-  checkpoints, resume и локальные метрики MLflow.
-- Запуск: предварительная загрузка checkpoint без движения и отдельный явный
-  физический Start через штатный LeRobot rollout.
-- Физический итог на 14 ноября 2026: после восстановления штатного исполнения
-  50-шагового ACT chunk оператор подтвердил первый автономный захват кубика и
-  перенос почти до коробки. Точная укладка ещё не подтверждена. Завершение
-  процесса с кодом `0` само по себе означает только штатное окончание программы.
+- Recorded 50 wrist-only demonstrations (18,960 frames) of picking up a blue
+  cube and placing it in a white box. Demonstrations use calibrated
+  leader-to-follower teleoperation and store RGB, measured joints, and the
+  commands sent to the follower.
+- Trained ACT and SmolVLA with a held-out session split. Both were later
+  retrained on all 50 episodes with image augmentation.
+- The final ACT checkpoint reached 30,000 updates. With its original weights,
+  matched image preprocessing, and the restored LeRobot execution profile of
+  50 actions per prediction, it physically picked up a cube and carried it
+  almost to the box. One grasp was confirmed by the operator. Box placement,
+  release, and repeatability remain to be verified.
+- The final SmolVLA checkpoint reached 15,000 updates. This final fit has a
+  training result; a successful physical grasp from it is unverified.
 
-Raw-данные, checkpoints, MLflow DB и логи остаются только на Homebrain и не
-входят в Git.
+## Project layout
 
-## Что реализовано
+| Path | Purpose |
+| --- | --- |
+| [static/](static/) | SO-101 Studio browser interface |
+| [src/so101_lab/](src/so101_lab/) | Teleoperation, recording, dataset validation, training, and policy rollout |
+| [src/so101_lab/lerobot_plugin/](src/so101_lab/lerobot_plugin/) | LeRobot image preprocessing and rollout diagnostics |
+| [config/](config/) | Environment snapshot, hardware calibration snapshots, and service definitions |
+| [scripts/](scripts/) | Dataset export, service startup, and checkpoint maintenance |
 
-### Запись и управление
+Studio uses port `8020` and MLflow uses port `5020`. Live controls should stay
+on the local machine or a trusted LAN/VPN. The services start with robot
+movement disabled until an explicit operator action.
 
-- Предпросмотр камер не включает torque.
-- Телеоперация и запись используют сохранённые калибровки leader/follower.
-- Камеры открываются одним владельцем и переиспользуются preview/recording.
-- Wrist-only режим не записывает и не показывает фиктивную обзорную камеру.
-- STOP прекращает команды, а незавершённый эпизод переносит в quarantine. В
-  train попадает только явно сохранённый эпизод.
-- Сессию можно продолжить до сохранённого целевого числа эпизодов.
-- Удаление датасета, повтор эпизода, архивный просмотр и проверка raw доступны в
-  интерфейсе.
+Raw demonstrations, checkpoints, logs, and the MLflow database are local
+artifacts. A usable checkpoint transfer includes its entire directory, with
+weights, configuration, and processors. See the [operator guide](docs/OPERATOR_GUIDE.md#artifacts-and-troubleshooting)
+for local paths.
 
-### Данные и разметка
-
-- Каждый кадр содержит монотонные timestamps, актуальное состояние робота,
-  реально отправленную action-команду и хэши файлов.
-- PNG пишутся асинхронно с ограниченной очередью; полная синхронизация диска
-  выполняется при завершении эпизода, а не в 30 FPS контуре.
-- SAM3 работает как фоновая разметка сохранённых кадров и не находится в
-  realtime-контуре моторов.
-- Маски, категории, цвета, причинные track IDs и provenance привязаны к точному
-  исходному кадру.
-- Есть валидация raw и официальный экспорт, читаемый LeRobot 0.6.1.
-
-### Обучение и запуск
-
-- Политики ACT и SmolVLA.
-- Разделение train/validation/test целыми сессиями, чтобы соседние эпизоды одной
-  записи не утекали в разные выборки.
-- Настраиваемые steps, batch size, LR, scheduler, AMP, gradient accumulation,
-  интервалы validation/checkpoint и число сохраняемых checkpoints.
-- Проверка памяти, диска и владения GPU/устройствами до запуска задачи.
-- Worker-процессы не зависят от вкладки; MLflow имеет durable spool и replay.
-- Для ACT зарегистрирован тот же centered letterbox 256×256, который использован
-  при обучении; скрипт исправляет старые checkpoints с неполным preprocessor.
-- Перед официальным rollout стартовая конфигурация выводится из train-сессий.
-- Диагностический plugin пишет action/state и редкие wrist-кадры, не меняя
-  командный путь LeRobot.
-
-## Структура
-
-```text
-src/so101_lab/
-  app.py                 FastAPI, REST/WebSocket, координация ресурсов
-  hardware.py            камеры, leader/follower, калибровки и шины
-  preview.py             camera-only preview
-  teleoperation.py       отдельное calibrated following
-  recording.py           датасеты, эпизоды, writer, recovery/quarantine
-  annotations.py         SAM3 и валидация разметки
-  lerobot_export.py      проверка и экспорт в официальный формат LeRobot
-  training_options.py    параметры и session-level split
-  training.py            ACT/SmolVLA, checkpoint/resume/evaluation
-  inference.py           проверка checkpoint и физический rollout
-  policies.py            конфигурация моделей и centered letterbox
-  jobs.py/resources.py   фоновые задачи и leases ресурсов
-  telemetry.py           MLflow со spool/replay
-  lerobot_plugin/        регистрация processor и rollout trace
-static/                   интерфейс Studio
-config/systemd/           user services UI, MLflow и replay timer
-scripts/                  запуск служб, обслуживание и проверки
-tests/                    Python и DOM-тесты без открытия аппаратуры
-```
-
-## Службы
-
-```bash
-cd /home/jetsonnx/Projects/so101_ai_learning
-./scripts/start_services.sh
-curl -fsS http://127.0.0.1:8020/api/status
-curl -fsS http://127.0.0.1:5020/
-```
-
-Для диагностики:
-
-```bash
-systemctl --user status so101-ai-learning-ui so101-ai-learning-mlflow
-journalctl --user -u so101-ai-learning-ui -n 100
-```
-
-Сервер стартует без подключения к моторам. Камеры, torque, запись и политика
-включаются только отдельными действиями пользователя в UI.
-
-## Проверка кода без робота
-
-```bash
-cd /home/jetsonnx/Projects/so101_ai_learning
-PYTHONPATH=src .venv/bin/pytest -q
-npm test
-node --check static/app.js
-```
-
-Эти команды не должны открывать USB-камеры и motor bus. Физическую проверку
-выполняют только из интерфейса при освобождённых устройствах.
-
-## Локальные артефакты
-
-```text
-data/ds_<id>/              raw episodes, quarantine, annotations, exports
-models/<job-id>/           checkpoints, split, lineage, result
-runtime/jobs/              состояние фоновых задач
-runtime/mlflow.db          локальная база MLflow
-runtime/mlflow-spool/      недоставленные метрики
-data/mlflow-artifacts/     MLflow artifacts
-logs/                      worker и rollout logs/traces
-```
-
-Эти каталоги исключены через `.gitignore`. Для переноса работающей модели нужно
-копировать всю папку checkpoint, а не только файл весов.
-
-## Ограничения
-
-- Текущий wrist-only датасет покрывает одну сцену и одну формулировку задачи;
-  он недостаточен для универсальных команд, сортировки и новых предметов.
-- Коробка не видна wrist-камере в начале части эпизодов и появляется после
-  поворота руки. Явная метрическая геометрия цели в baseline не подаётся.
-- SAM3 полезен для контроля данных и object features, но сам по себе не
-  гарантирует захват и не исправляет недостаточное разнообразие демонстраций.
-- В физических rollout наблюдались промахи, дрожание/запаздывание и периодические
-  провалы частоты цикла. Следующий этап — сопоставить wrist-наблюдение, action
-  trace и train-распределение в момент промаха.
-- Геометрическая автономная система Wristlab и этот imitation-learning проект —
-  разные репозитории и разные исполнительные контуры.
-
-## Дополнительные материалы
-
-- [Финальное состояние Homebrain](docs/HOMEBRAIN_FINAL_STATE_RU.md)
-- [Настройки обучения](docs/TRAINING_CONTROLS.md)
-- [Инструкция записи](RECORDING_GUIDE.md)
-- [Надёжность записи](RECORDING_RELIABILITY_REVIEW.md)
-- [Контракт данных](docs/CONTRACT.md)
-- [Экспорт LeRobot](docs/LEROBOT_EXPORT.md)
-- [Разметка](docs/ANNOTATIONS.md)
+Wristlab is the separate geometry-based manipulation project. Its history lives
+on the [Wristlab branch](https://github.com/vladromenko/so101-lerobot-imitation-learning/tree/codex/so101-wristlab).
+[Historical Homebrain notes in Russian](README_RU.md) preserve earlier
+implementation details and diagnostics.
